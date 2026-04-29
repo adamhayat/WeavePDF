@@ -5,7 +5,11 @@
 
 ## Current State
 
-**Status:** **V1.0028 — Unified Print Preview panel (silent printing, no second dialog) + split rotate (CW/CCW) + Finder duplicate-menu fix.** Three changes:
+**Status:** **V1.0029 — Restore WeavePDF parent submenu in Finder right-click.** V1.0028's "remove explicit WeavePDF parent" change was wrong: macOS does NOT auto-wrap the items, so they got sprinkled directly into the top-level right-click menu (and into Quick Actions). User wants exactly: right-click → **WeavePDF →** submenu with the 6 options. Restored the parent + submenu pattern V1.0005..V1.0027 had.
+
+If the user still sees a duplicate "WeavePDF →" entry after this update, they should toggle the extension off/on in System Settings → Login Items & Extensions → Finder. The duplicate is a stale-pkd state from rapid install/replace cycles, not caused by the menu code.
+
+**V1.0028 base (carried forward):** Unified Print Preview panel (silent printing, no second dialog) + split rotate (CW/CCW) + Finder duplicate-menu fix.** Three changes:
 
 1. **Unified Print Preview panel.** V1.0021..V1.0027 had a two-stage flow: our preview → macOS native dialog with duplicate Layout/Orientation controls. V1.0028 collapses both into one panel: **left rail with every setting** (printer, copies, pages range, paper size, layout/N-up, orientation, color, two-sided), **right pane with a live preview** that rebuilds whenever a setting that affects rendering changes (paper / layout / orientation / pages range — copies, color, duplex don't trigger rebuild). Print button calls `printPdfBytes` with `silent: true` — every setting is pre-chosen, so the macOS dialog never appears as a second stage. Architecture follows the design agent's spec (PrintControlsRail / PreviewPane / PagePager / usePrintReducer).
 2. **Rotate split into Clockwise / Counter-clockwise** in the Finder right-click submenu. The single "Rotate 90°" became two items routed to `rotate-cw` (90°) and `rotate-ccw` (270°). Legacy "rotate" verb still works as an alias for clockwise (back-compat with V1.0014..V1.0027 cached URL routings).
@@ -504,6 +508,22 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0029: restore WeavePDF parent submenu (revert V1.0028's flatten)
+
+User: "this right click menu is all wrong now. Before it was good when it was one menu WeavePDF and a submenu with options. Now you've sprinkled options in quick actions and without a submenu. I want all of that removed and I only want a submenu item — Right Click > WeavePDF > Options. THATS IT."
+
+**What V1.0028 got wrong:** I removed the explicit `WeavePDF` parent NSMenuItem from `menu(for:)` on the assumption macOS would auto-wrap the items under a parent named after the bundle's display name. It does not. The 6 items rendered directly into the top-level right-click menu (Compress, Combine into PDF, Convert to PDF, Extract first page, Rotate clockwise, Rotate counterclockwise) AND macOS Sequoia separately mirrored them inside its built-in "Quick Actions" submenu — so the user saw the same items twice in two different places, neither of which was the requested submenu.
+
+**Fix:** restore the explicit `WeavePDF` parent NSMenuItem with submenu — exactly the V1.0005..V1.0027 layout the user knows. Items live inside `WeavePDF →`, nothing else gets sprinkled.
+
+**Note on the duplicate "WeavePDF →" entry that prompted V1.0028's wrong fix:** that's a separate macOS-pkd cache issue — `pluginkit -mAD` consistently shows ONE registered extension, but multiple rapid install/replace cycles can leave pkd thinking two instances are alive. The reliable workaround is for the user to toggle the extension off then on in **System Settings → Login Items & Extensions → Finder**. That destroys both ghost instances and re-registers cleanly. Documented in the Status note. Not addressable from the extension's own code.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.29`.
+- Bumped V1.0028 → V1.0029 per Critical Rule #12.
+
+**Files touched:** [resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift) (restored parent + submenu), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0028: unified Print Preview panel + split rotate + Finder duplicate-menu fix
 

@@ -5,6 +5,11 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0029: restore WeavePDF parent submenu in Finder right-click (2026-04-29)
+- **Reverted V1.0028's incorrect "flatten" of the FinderSync menu.** Removing the explicit `WeavePDF` parent NSMenuItem caused the 6 actions to render directly in the top-level right-click menu AND mirror inside macOS Sequoia's built-in Quick Actions submenu — neither of which is the requested layout. Restored the V1.0005..V1.0027 pattern: a single `WeavePDF →` entry whose submenu contains all 6 options. Nothing else sprinkles.
+- **Re: duplicate "WeavePDF →"** that V1.0028 was trying to fix: that's a stale macOS pkd cache from rapid install cycles, not caused by the menu code. If still visible, toggle the extension off/on in System Settings → Login Items & Extensions → Finder.
+- **Bumped V1.0028 → V1.0029** per Critical Rule #12.
+
 ### Added + Fixed — V1.0028: unified Print Preview + split rotate + Finder duplicate-menu fix (2026-04-29)
 - **Unified Print Preview panel** ([src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) + [src/renderer/components/PrintPreviewModal/usePrintReducer.ts](src/renderer/components/PrintPreviewModal/usePrintReducer.ts)). One panel with every print setting (printer, copies, pages range, paper, layout/N-up, orientation, color, two-sided) on the left rail and a live preview on the right. Preview rebuilds on every setting that affects rendering (paper / layout / orientation / pages range), with 120 ms debounce + cancel-token + sequenced pdf.js loading to dodge the worker race. Footer shows total-sheets math (e.g. "12 sheets × 3 = 36"). Print is silent — `webContents.print({ silent: true, deviceName, color, copies, duplexMode, landscape })` — so the macOS native dialog is bypassed entirely. No more two-stage flow with duplicate Layout/Orientation controls.
 - **New IPC `print:list-printers`** ([src/shared/ipc.ts](src/shared/ipc.ts), [src/main/main.ts](src/main/main.ts)) — `webContents.getPrintersAsync()` exposed to the renderer for the Printer dropdown.

@@ -61,20 +61,27 @@ class FinderSync: FIFinderSync {
         let pdfCount = ok.filter { $0.pathExtension.lowercased() == "pdf" }.count
         let imgCount = ok.filter { FinderSync.imageOnly.contains($0.pathExtension.lowercased()) }.count
 
-        // V1.0028: return items directly into the menu macOS provides for our
-        // extension. Previously we added an extra parent NSMenuItem titled
-        // "WeavePDF" with a submenu — but macOS already auto-creates a
-        // "WeavePDF" entry from the extension's bundle display name and
-        // routes our items into ITS submenu. The explicit parent caused a
-        // visible duplicate "WeavePDF →" in the right-click menu (one with
-        // empty submenu, one with our items).
-        addItem(m, "Compress", #selector(compressAction(_:)), enabled: pdfCount > 0)
-        addItem(m, "Combine into PDF", #selector(combineAction(_:)), enabled: ok.count >= 2)
-        addItem(m, "Convert to PDF", #selector(convertAction(_:)), enabled: imgCount > 0)
-        addItem(m, "Extract first page", #selector(extractAction(_:)), enabled: pdfCount > 0)
-        addItem(m, "Rotate clockwise", #selector(rotateClockwiseAction(_:)), enabled: pdfCount > 0)
-        addItem(m, "Rotate counterclockwise", #selector(rotateCounterclockwiseAction(_:)), enabled: pdfCount > 0)
+        // V1.0029: restore explicit "WeavePDF" parent NSMenuItem with a
+        // submenu. V1.0028 tried removing this on the assumption macOS would
+        // auto-wrap the items, but instead the items were sprinkled
+        // directly into the top-level right-click menu (and into Quick
+        // Actions). The user wants exactly: Right-click → WeavePDF →
+        // submenu with the six options. This is what V1.0005..V1.0027
+        // had, and the duplicate "WeavePDF →" reported earlier was a
+        // separate macOS extension-cache state, not caused by this code.
+        let parent = NSMenuItem(title: "WeavePDF", action: nil, keyEquivalent: "")
+        let sub = NSMenu(title: "WeavePDF")
+        sub.autoenablesItems = false
 
+        addItem(sub, "Compress", #selector(compressAction(_:)), enabled: pdfCount > 0)
+        addItem(sub, "Combine into PDF", #selector(combineAction(_:)), enabled: ok.count >= 2)
+        addItem(sub, "Convert to PDF", #selector(convertAction(_:)), enabled: imgCount > 0)
+        addItem(sub, "Extract first page", #selector(extractAction(_:)), enabled: pdfCount > 0)
+        addItem(sub, "Rotate clockwise", #selector(rotateClockwiseAction(_:)), enabled: pdfCount > 0)
+        addItem(sub, "Rotate counterclockwise", #selector(rotateCounterclockwiseAction(_:)), enabled: pdfCount > 0)
+
+        parent.submenu = sub
+        m.addItem(parent)
         return m
     }
 
