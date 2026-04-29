@@ -506,6 +506,10 @@ const skipUnsavedConfirmForWindowId = new Set<number>();
 let appQuittingApproved = false;
 
 function createMainWindow(): BrowserWindow {
+  // V1.0031: any window-creation path means the user is going to interact
+  // with WeavePDF, so we drop the accessory-only policy and let macOS
+  // give us a dock icon + menu bar. No-op when already foreground.
+  transitionToForeground();
   const preloadPath = path.join(__dirname, "preload.js");
 
   const win = new BrowserWindow({
@@ -2655,14 +2659,53 @@ function fail(msg: string): number {
 // macOS fires this before the app is ready when the user double-clicks a PDF
 // (or drags one onto the app icon). Register early so we can queue the path.
 // Skip in CLI mode — we don't want file-open events spawning windows.
+//
+// V1.0031: also start as ACCESSORY (no dock icon, no focus steal). This is
+// the headless default — when the Finder Sync extension dispatches a
+// `weavepdf://` URL while WeavePDF isn't running yet, macOS would
+// otherwise activate WeavePDF as a foreground app and pull the user away
+// from the desktop. With accessory policy, the app processes the URL
+// invisibly. We bump back to "regular" only when a window is actually
+// created (bare launch, dock click, or "combine" verb that opens its
+// result in a tab).
+let isHeadlessLaunch = process.platform === "darwin";
+function transitionToForeground(): void {
+  if (process.platform !== "darwin") return;
+  if (!isHeadlessLaunch) return;
+  try {
+    app.setActivationPolicy("regular");
+  } catch {
+    // Some test contexts (no app instance) reject; ignore.
+  }
+  isHeadlessLaunch = false;
+}
+
 if (!isCliMode) {
   app.on("will-finish-launching", () => {
+    if (process.platform === "darwin") {
+      // Set the policy as early as macOS will let us — before any window
+      // appears, before whenReady, before macOS has decided whether to
+      // surface the dock icon.
+      try {
+        app.setActivationPolicy("accessory");
+      } catch {
+        // ignore
+      }
+    }
     app.on("open-file", (event, filePath) => {
       event.preventDefault();
+      // File opens always need a window — bring the app forward.
+      transitionToForeground();
       queueOrSendOpen(filePath);
     });
     app.on("open-url", (event, urlString) => {
       event.preventDefault();
+      // URL handling stays headless by default; only the per-verb logic
+      // in handleWeavePdfUrl bumps to foreground if it needs a window
+      // (currently just "combine"). For in-place verbs (compress,
+      // rotate, extract-first, convert), the action runs in the
+      // background and the app quits when done — the user stays on
+      // their desktop the whole time.
       queueOrHandleWeavePdfUrl(urlString);
     });
   });
@@ -2675,12 +2718,40 @@ if (!isCliMode) {
 const pendingWeavePdfUrls: string[] = [];
 let weavePdfUrlHandlerReady = false;
 
+// V1.0031: track in-flight URL handlers so we can quit cleanly after the
+// last cold-start URL action completes (and still no window is open). If
+// the user fires a Finder right-click action while WeavePDF was not yet
+// running, they expect WeavePDF to do its work and disappear — not stay
+// running in the background forever.
+let urlActionsInFlight = 0;
+
 function queueOrHandleWeavePdfUrl(urlString: string): void {
   if (weavePdfUrlHandlerReady) {
-    void handleWeavePdfUrl(urlString);
+    urlActionsInFlight++;
+    void handleWeavePdfUrl(urlString).finally(() => {
+      urlActionsInFlight--;
+      void maybeQuitAfterHeadlessAction();
+    });
   } else {
     pendingWeavePdfUrls.push(urlString);
   }
+}
+
+// Called after every URL handler completes (and after the initial cold-
+// start URL drain in whenReady). Quits the app if:
+//   - We're still in headless launch mode (no transitionToForeground
+//     has fired — meaning no window was ever created).
+//   - No URL handlers are still running.
+//   - No windows are open.
+// 300 ms grace lets file writes flush + log lines drain before exit.
+async function maybeQuitAfterHeadlessAction(): Promise<void> {
+  if (!isHeadlessLaunch) return;
+  if (urlActionsInFlight > 0) return;
+  await new Promise((r) => setTimeout(r, 300));
+  if (urlActionsInFlight > 0) return; // another URL came in while we waited
+  if (BrowserWindow.getAllWindows().length > 0) return; // a window opened
+  logFinderSync("headless URL action(s) finished — quitting");
+  app.quit();
 }
 
 // Returns a path that doesn't exist yet, deriving from `desired` by appending
@@ -2899,14 +2970,20 @@ if (isCliMode) {
   registerIpc();
   buildAppMenu();
   nativeTheme.on("updated", broadcastTheme);
-  createMainWindow();
 
-  // Drain any `weavepdf://` URLs that came in during cold start (e.g. the
-  // user invoked a Finder right-click action while the app wasn't running;
-  // macOS launched it with the URL queued).
+  // V1.0031: don't unconditionally createMainWindow. If we're handling
+  // a `weavepdf://` URL cold start (Finder Sync extension dispatch),
+  // accessory mode means no window + no dock icon + no focus steal.
+  // Per-verb handlers in handleWeavePdfUrl decide whether to bring up a
+  // window (currently only "combine" does — it opens the merged result).
   weavePdfUrlHandlerReady = true;
+  const hadQueuedUrls = pendingWeavePdfUrls.length > 0;
   for (const url of pendingWeavePdfUrls.splice(0)) {
-    void handleWeavePdfUrl(url);
+    urlActionsInFlight++;
+    void handleWeavePdfUrl(url).finally(() => {
+      urlActionsInFlight--;
+      void maybeQuitAfterHeadlessAction();
+    });
   }
 
   // Windows/Linux: file paths come in as process.argv.
@@ -2917,6 +2994,18 @@ if (isCliMode) {
       }
     }
   }
+
+  // Bare-launch detection: if no URL or file event arrived, this was a
+  // dock-icon / Spotlight launch and the user expects a window. Brief
+  // setTimeout absorbs any straggler event arriving in the same tick.
+  setTimeout(() => {
+    const hasFiles = pendingOpenFiles.length > 0;
+    const hasWindows = BrowserWindow.getAllWindows().length > 0;
+    if (!hadQueuedUrls && !hasFiles && !hasWindows) {
+      // Bare launch — foreground + show the main window.
+      createMainWindow();
+    }
+  }, 100);
 
   app.on("activate", () => {
     // Dock icon click with no windows open → open a fresh one.

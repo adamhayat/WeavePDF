@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0031: headless cold-start so Finder Sync right-click actions don't steal focus (2026-04-29)
+- **Right-click actions on the desktop no longer pull you off the desktop.** When WeavePDF wasn't running and you right-clicked → WeavePDF → Compress / Rotate / Extract / Convert, macOS would auto-foreground WeavePDF as it launched, briefly flashing focus away from where you were. V1.0031 starts WeavePDF in `accessory` activation policy on macOS — no dock icon, no menu bar takeover, no focus steal. The action runs silently in the background; the app quits cleanly when done.
+- **Bare launches still work normally.** Double-click WeavePDF.app / Spotlight launch / dock icon → 100 ms race in `whenReady` confirms no URL/file event arrived, then transitions to regular policy + opens the main window.
+- **Combine is the exception** — it opens the merged result as a tab, so it transitions to foreground (the user expects to see it).
+- **In-flight tracking:** rapid right-click batches (e.g. select 5 PDFs and Compress all) wait for every URL handler to finish before the app quits. `urlActionsInFlight` counter + 300 ms grace.
+- **Bumped V1.0030 → V1.0031** per Critical Rule #12.
+
 ### Changed + Fixed — V1.0030: File menu cleanup + no auto-Finder-reveal + Quick Compress + gs 10.x fix (2026-04-29)
 - **File menu close item is now `Close Tab` (⌘W).** Closes the active tab; if no tabs remain, closes the BrowserWindow. ⌘Q in the WeavePDF app menu stays as the canonical "close app." Replaces `role: "close"` (which macOS Option-toggled to a confusing "Close All").
 - **Services menu removed from the app menu.** Those entries were macOS system services other apps register, not WeavePDF background services. Nothing of ours runs there; cleaner menu.

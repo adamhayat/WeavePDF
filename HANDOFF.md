@@ -5,7 +5,19 @@
 
 ## Current State
 
-**Status:** **V1.0030 — File menu cleanup + Services menu removed + no auto-Finder reveal + Quick Compress rename + gs 10.x dict-arg fix.** Five small things from one user-test pass:
+**Status:** **V1.0031 — Headless cold-start for Finder Sync URL actions.** When the Finder Sync extension dispatched a `weavepdf://` URL while WeavePDF wasn't running yet, macOS launched WeavePDF as a foreground app, stole focus from the desktop / Finder window, briefly flashed a window, then ran the action. The user wanted the action to run silently without ever pulling them off the desktop.
+
+Fix: WeavePDF now starts in **accessory** activation policy on macOS — no dock icon, no menu bar takeover, no focus steal. The only paths that bump back to **regular** are the ones where the user genuinely expects a window:
+1. **Bare launch** (dock click / Spotlight / `open WeavePDF.app`) — race-detected in `whenReady` after a 100 ms grace; no URL or file event arrived → bare launch → foreground + main window.
+2. **`weavepdf://combine`** — opens the merged result as a tab → `createMainWindow()` → `transitionToForeground()`.
+3. **`open-file`** — file double-click / drag-on-dock → `transitionToForeground()` + `queueOrSendOpen`.
+4. **`activate`** event — dock icon click while no windows.
+
+For in-place URL verbs (compress, rotate-cw, rotate-ccw, extract-first, convert): we stay in accessory mode the whole time. After the last URL handler completes, `maybeQuitAfterHeadlessAction` quits the app cleanly — the user stays on the desktop, never sees WeavePDF appear, the file is just rewritten where it was.
+
+In-flight URL counter (`urlActionsInFlight`) prevents quitting mid-batch when multiple right-click actions queue up. 300 ms grace before quit lets file writes / log lines flush.
+
+**V1.0030 base (carried forward):** File menu cleanup + Services menu removed + no auto-Finder reveal + Quick Compress rename + gs 10.x dict-arg fix.** Five small things from one user-test pass:
 
 1. **File menu close item.** `role: "close"` (which macOS Option-toggled to "Close All") replaced with **Close Tab** (⌘W) routed to a new `closeTab` MenuCommand. Closes the active tab; if it was the last tab, closes the BrowserWindow too. ⌘Q in the WeavePDF app menu remains the canonical "close app" action.
 2. **Services menu removed** from the app menu. Those entries (Activity Monitor, Allocations & Leaks, etc.) are macOS system services other apps register, not background services WeavePDF runs — they confused the user. We don't add any of our own; menu drops cleanly.
@@ -516,6 +528,39 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0031: headless cold-start so Finder Sync URL actions don't steal focus
+
+User: "It seems when you do a right click option, if WeavePDF is an open app, it does it without leaving the desktop screen. But if Weave isn't open yet, it opens Weave, and takes you away from the desktop. Can you make it so it either doesn't need to fully open Weave, or just opens it in the background but you stay the entire time on the desktop when doing a quick action?"
+
+Root cause: macOS auto-foregrounds an app the moment it's launched (URL scheme handler, file association, dock click — all the same activation path). Even though our V1.0014..V1.0024 focus tricks were trying to keep the user where they were, the *initial* activation from cold start happened before any of our code ran.
+
+**Fix architecture:** the app now starts in `accessory` activation policy on macOS. Accessory apps don't steal focus, don't show a dock icon, don't take over the menu bar. They run silently. We bump back to `regular` only when a window is actually needed.
+
+**Where regular kicks in:**
+1. `app.on("will-finish-launching")` sets `setActivationPolicy("accessory")` immediately — earliest hook macOS gives us, before any visible activation.
+2. `whenReady` no longer unconditionally calls `createMainWindow`. Instead: drains pending `weavepdf://` URLs, then a 100 ms `setTimeout` checks "did any URL or file event happen?" If not, this is a bare launch → `createMainWindow` (which calls `transitionToForeground` first).
+3. `createMainWindow` itself starts with `transitionToForeground()` — any window-creation path bumps to regular. Includes the V1.0025 cold-start drain in `did-finish-load`, the V1.0008 multi-window `New Window` menu item, and the V1.0017 `bringWindowForward` recovery flows.
+4. `app.on("open-file")` calls `transitionToForeground()` before `queueOrSendOpen` — file double-clicks always foreground.
+5. `app.on("activate")` (dock icon click while no windows) creates a window → `transitionToForeground`.
+
+**Where accessory persists:** in-place `weavepdf://` verbs (compress, rotate-cw, rotate-ccw, extract-first, convert) never call `createMainWindow`. They run in the background. Combine is the exception — it opens the merged result as a tab, which goes through `createMainWindow` → foreground.
+
+**Quit-after-action lifecycle:**
+- `urlActionsInFlight` counter increments on every URL handler invocation, decrements in `.finally`.
+- `maybeQuitAfterHeadlessAction()` checks: still headless? in-flight count == 0? no windows open? Then `app.quit()` after a 300 ms grace.
+- Multiple back-to-back right-click actions queue up cleanly — the counter prevents quitting until the last one finishes.
+
+**Why this is safe for the existing UX:**
+- Bare launch (user double-clicks WeavePDF.app, Spotlight, dock): 100 ms delay then foreground + window. Imperceptible.
+- Cold-start file double-click: `open-file` event fires → `transitionToForeground` → window opens. Same speed as before.
+- Hot run (WeavePDF already in foreground): nothing changes — `isHeadlessLaunch` was false from the moment the first window appeared, so `transitionToForeground()` is a no-op.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.31`.
+- Bumped V1.0030 → V1.0031 per Critical Rule #12.
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) — `isHeadlessLaunch` flag + `transitionToForeground()` helper + `setActivationPolicy("accessory")` in `will-finish-launching` + `transitionToForeground()` calls in `createMainWindow`/`open-file` handler + `urlActionsInFlight` counter + `maybeQuitAfterHeadlessAction` + race-timeout in `whenReady` for bare-launch detection. [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0030: File menu cleanup + Services removed + no auto-reveal + Quick Compress + gs 10.x fix
 
