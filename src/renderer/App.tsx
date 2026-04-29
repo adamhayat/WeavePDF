@@ -1106,6 +1106,23 @@ export function App() {
         case "showWelcome": openWelcome(); break;
         case "showWelcomeFinder": openWelcome(1); break;
         case "newTab": addBlankTab(); break;
+        case "closeTab": {
+          // V1.0030: ⌘W closes the active tab. If it was the last tab,
+          // close the BrowserWindow too (matches Chrome / Safari).
+          const state = useDocumentStore.getState();
+          const cur = state.activeTab();
+          if (!cur) {
+            // No tabs at all — close the window.
+            window.weavepdf.window.close();
+            break;
+          }
+          state.closeTab(cur.id);
+          // After close, if no tabs remain, drop the window.
+          if (useDocumentStore.getState().tabs.length === 0) {
+            window.weavepdf.window.close();
+          }
+          break;
+        }
       }
     });
     // Intentionally omit activeTab from deps — the handler reads fresh store

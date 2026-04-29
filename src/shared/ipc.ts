@@ -221,7 +221,8 @@ export type MenuCommand =
   | "keyboardShortcuts"
   | "showWelcome"
   | "showWelcomeFinder"
-  | "newTab";
+  | "newTab"
+  | "closeTab";
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];
 

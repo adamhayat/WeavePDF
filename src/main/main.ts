@@ -1632,6 +1632,18 @@ group.wait()
         const inPath = path.join(tmpDir, "in.pdf");
         const outPath = path.join(tmpDir, "out.pdf");
         await writeFile(inPath, Buffer.from(bytes));
+        // V1.0030: gs 10.x stopped accepting `-dColorImageDict=<</QFactor.../>>`
+        // as a command-line arg ("Invalid value for option, -dNAME= must be
+        // followed by a valid token"). The 9.x syntax was undocumented and
+        // is now rejected. Modern gs documents passing the dict via inline
+        // PostScript with `-c "<<...>> setdistillerparams" -f input.pdf` —
+        // verified working on gs 10.07 (default current homebrew version)
+        // and back-compatible with 9.x.
+        const dict =
+          `<<` +
+          `/ColorImageDict <</QFactor ${qFactor.toFixed(2)} /HSamples [2 1 1 2] /VSamples [2 1 1 2]>>` +
+          `/GrayImageDict <</QFactor ${qFactor.toFixed(2)} /HSamples [2 1 1 2] /VSamples [2 1 1 2]>>` +
+          `>> setdistillerparams`;
         await new Promise<void>((resolve, reject) => {
           const args = [
             "-sDEVICE=pdfwrite",
@@ -1644,27 +1656,29 @@ group.wait()
             "-dSubsetFonts=true",
             "-dCompressFonts=true",
             "-dDetectDuplicateImages=true",
-            // Color images
+            // Color images (DPI + filter; QFactor comes from inline PS dict)
             "-dDownsampleColorImages=true",
             "-dColorImageDownsampleType=/Bicubic",
             `-dColorImageResolution=${Math.max(36, Math.min(600, opts.colorDpi | 0))}`,
             "-dAutoFilterColorImages=false",
             "-dColorImageFilter=/DCTEncode",
-            `-dColorImageDict=<</QFactor ${qFactor.toFixed(2)} /HSamples [2 1 1 2] /VSamples [2 1 1 2]>>`,
             // Gray images
             "-dDownsampleGrayImages=true",
             "-dGrayImageDownsampleType=/Bicubic",
             `-dGrayImageResolution=${Math.max(36, Math.min(600, opts.grayDpi | 0))}`,
             "-dAutoFilterGrayImages=false",
             "-dGrayImageFilter=/DCTEncode",
-            `-dGrayImageDict=<</QFactor ${qFactor.toFixed(2)} /HSamples [2 1 1 2] /VSamples [2 1 1 2]>>`,
-            // Monochrome / line art (uses subsample + CCITTFaxEncode for crisp text)
+            // Monochrome / line art
             "-dDownsampleMonoImages=true",
             "-dMonoImageDownsampleType=/Subsample",
             `-dMonoImageResolution=${Math.max(72, Math.min(1200, opts.monoDpi | 0))}`,
             "-dEncodeMonoImages=true",
             "-dMonoImageFilter=/CCITTFaxEncode",
             `-sOutputFile=${outPath}`,
+            // Inline PostScript distiller params, then run the input.
+            "-c",
+            dict,
+            "-f",
             inPath,
           ];
           const child = spawn(bin, args);
@@ -2089,8 +2103,12 @@ function buildAppMenu(): void {
               { role: "about" as const },
               { type: "separator" as const },
               { label: "Enable Right Click Options…", click: m("showWelcomeFinder") },
-              { type: "separator" as const },
-              { role: "services" as const },
+              // V1.0030: removed `{ role: "services" }` from the app menu.
+              // Services entries are macOS system-wide actions other apps
+              // register (e.g. Activity Monitor, Allocations & Leaks). They
+              // confused the user — they're not "WeavePDF background
+              // services" and we don't add any of our own. Hidden to keep
+              // our menu intentional.
               { type: "separator" as const },
               { role: "hide" as const },
               { role: "hideOthers" as const },
@@ -2122,7 +2140,12 @@ function buildAppMenu(): void {
         { type: "separator" },
         { label: "Print…", accelerator: "CmdOrCtrl+P", click: m("print") },
         { type: "separator" },
-        isMac ? { role: "close" } : { role: "quit" },
+        // V1.0030: ⌘W now closes the active TAB (renderer-side). Falls
+        // through to closing the window when only one tab exists. ⌘Q in
+        // the WeavePDF menu remains the canonical "close app" action.
+        // Replaces the previous `role: "close"` (which was labeled
+        // "Close Window" and macOS Option-toggled to "Close All").
+        { label: "Close Tab", accelerator: "CmdOrCtrl+W", click: m("closeTab") },
       ],
     },
     {
@@ -2783,7 +2806,13 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
         await runUnary("compress", "", { inPlace: true, reveal: false });
         break;
       case "extract-first":
-        await runUnary("extract-first", "-page1", { reveal: true });
+        // V1.0030: don't reveal the new file in Finder. The user is
+        // already looking at the source folder; popping a fresh Finder
+        // window covers their context (especially annoying on the
+        // desktop where it switches focus away from where they were
+        // working). The new "<name>-page1.pdf" appears next to the
+        // source on its own and the user notices it.
+        await runUnary("extract-first", "-page1", { reveal: false });
         break;
       case "rotate":
       case "rotate-cw":
@@ -2797,7 +2826,9 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
         await runUnary("rotate", "", { extra: ["270"], inPlace: true, reveal: false });
         break;
       case "convert":
-        await runUnary("image-to-pdf", "", { forceOutputExt: "pdf", reveal: true });
+        // V1.0030: same as extract-first — don't reveal. New PDF lands
+        // next to the source image with the user already in context.
+        await runUnary("image-to-pdf", "", { forceOutputExt: "pdf", reveal: false });
         break;
       case "combine": {
         if (paths.length < 2) {

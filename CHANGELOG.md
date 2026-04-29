@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Changed + Fixed — V1.0030: File menu cleanup + no auto-Finder-reveal + Quick Compress + gs 10.x fix (2026-04-29)
+- **File menu close item is now `Close Tab` (⌘W).** Closes the active tab; if no tabs remain, closes the BrowserWindow. ⌘Q in the WeavePDF app menu stays as the canonical "close app." Replaces `role: "close"` (which macOS Option-toggled to a confusing "Close All").
+- **Services menu removed from the app menu.** Those entries were macOS system services other apps register, not WeavePDF background services. Nothing of ours runs there; cleaner menu.
+- **Right-click `Extract first page` / `Convert to PDF` no longer pop a Finder window.** When the user is on the desktop or already inside a Finder window, the new file now appears next to the source without macOS switching focus to a fresh Finder window. `combine` still opens the merged result in WeavePDF (intentional).
+- **FinderSync submenu `Compress` → `Quick Compress`.** Disambiguates from macOS Finder's built-in `Compress` (which sits as a sibling and zips files). Also signals: this is the one-click /ebook preset, not the full CompressModal flow inside the app.
+- **Ghostscript `gs:compress-advanced` no longer errors out.** gs 10.x rejected the legacy `-dColorImageDict=<</QFactor.../>>` cmd-line arg. Now passes the dict via inline `-c "<<...>> setdistillerparams" -f input.pdf` which works on gs 10.x AND 9.x. Verified locally: 933KB → 135KB on the user's contract, exit 0.
+- **Deferred to V1.0031:** full CompressModal redesign with a single lossless→lossy slider + live preview + size estimate. V1.0030's fix only stops the existing modal from erroring.
+- **Bumped V1.0029 → V1.0030** per Critical Rule #12.
+
 ### Fixed — V1.0029: restore WeavePDF parent submenu in Finder right-click (2026-04-29)
 - **Reverted V1.0028's incorrect "flatten" of the FinderSync menu.** Removing the explicit `WeavePDF` parent NSMenuItem caused the 6 actions to render directly in the top-level right-click menu AND mirror inside macOS Sequoia's built-in Quick Actions submenu — neither of which is the requested layout. Restored the V1.0005..V1.0027 pattern: a single `WeavePDF →` entry whose submenu contains all 6 options. Nothing else sprinkles.
 - **Re: duplicate "WeavePDF →"** that V1.0028 was trying to fix: that's a stale macOS pkd cache from rapid install cycles, not caused by the menu code. If still visible, toggle the extension off/on in System Settings → Login Items & Extensions → Finder.

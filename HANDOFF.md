@@ -5,7 +5,15 @@
 
 ## Current State
 
-**Status:** **V1.0029 — Restore WeavePDF parent submenu in Finder right-click.** V1.0028's "remove explicit WeavePDF parent" change was wrong: macOS does NOT auto-wrap the items, so they got sprinkled directly into the top-level right-click menu (and into Quick Actions). User wants exactly: right-click → **WeavePDF →** submenu with the 6 options. Restored the parent + submenu pattern V1.0005..V1.0027 had.
+**Status:** **V1.0030 — File menu cleanup + Services menu removed + no auto-Finder reveal + Quick Compress rename + gs 10.x dict-arg fix.** Five small things from one user-test pass:
+
+1. **File menu close item.** `role: "close"` (which macOS Option-toggled to "Close All") replaced with **Close Tab** (⌘W) routed to a new `closeTab` MenuCommand. Closes the active tab; if it was the last tab, closes the BrowserWindow too. ⌘Q in the WeavePDF app menu remains the canonical "close app" action.
+2. **Services menu removed** from the app menu. Those entries (Activity Monitor, Allocations & Leaks, etc.) are macOS system services other apps register, not background services WeavePDF runs — they confused the user. We don't add any of our own; menu drops cleanly.
+3. **No auto-Finder reveal** for `extract-first` / `convert`. Right-clicking on the desktop and picking these no longer pops a fresh Finder window covering the user's context. The new file lands next to the source where the user is already looking.
+4. **`Compress` → `Quick Compress`** in the Finder right-click submenu. Disambiguates from macOS's built-in `Compress` (zip) which sits as a sibling. "Quick" also signals: this is the one-click /ebook preset, not the full CompressModal flow inside the app.
+5. **Ghostscript gs:compress-advanced no longer errors.** gs 10.x rejects the legacy `-dColorImageDict=<</QFactor.../>>` cmd-line arg ("Invalid value for option, -dNAME= must be followed by a valid token"). Now passes the dict via inline `-c "<<...>> setdistillerparams" -f input.pdf`. Verified locally: 933KB contract → 135KB output, no errors. Deferred to V1.0031: full CompressModal redesign with single lossless→lossy slider + size estimate + live preview.
+
+**V1.0029 base (carried forward):** Restore WeavePDF parent submenu in Finder right-click. V1.0028's "remove explicit WeavePDF parent" change was wrong: macOS does NOT auto-wrap the items, so they got sprinkled directly into the top-level right-click menu (and into Quick Actions). User wants exactly: right-click → **WeavePDF →** submenu with the 6 options. Restored the parent + submenu pattern V1.0005..V1.0027 had.
 
 If the user still sees a duplicate "WeavePDF →" entry after this update, they should toggle the extension off/on in System Settings → Login Items & Extensions → Finder. The duplicate is a stale-pkd state from rapid install/replace cycles, not caused by the menu code.
 
@@ -508,6 +516,36 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0030: File menu cleanup + Services removed + no auto-reveal + Quick Compress + gs 10.x fix
+
+User: "What are the different close options? It should be close tab and close app. Also under services, are those background services always running? Do we need them? Also when I click to do an action on the file, like 'rotate counter clockwise', it always opens it in Finder. But if I'm already in finder, or if I'm on the desktop doing it, I don't need finder to be opened to it. … Change the compress setting to be 'Quick Compress'. Then inside of WeavePDF in the tools, there are errors."
+
+**Five fixes in one V1.0030 turn (CompressModal redesign deferred to V1.0031):**
+
+1. **File menu — `Close Tab` (⌘W) replaces `role: "close"`.** New `closeTab` MenuCommand (`src/shared/ipc.ts` union extended). Renderer handler in `App.tsx`'s onMenuCommand: closes the active tab via `useDocumentStore.getState().closeTab(cur.id)`; if no tabs remain, closes the BrowserWindow via `window.weavepdf.window.close()`. macOS's Option-toggled "Close All" disappears with the role swap. ⌘Q in the WeavePDF app menu stays as the canonical app-quit (no need to add a redundant "Close App" item).
+
+2. **Services menu removed** ([src/main/main.ts](src/main/main.ts) buildAppMenu). Just deleted the `{ role: "services" }` line + the surrounding separator. Nothing to clean up runtime-side — they were never WeavePDF services, just macOS's system-wide pool.
+
+3. **`reveal: false` on `extract-first` and `convert`** in `handleWeavePdfUrl`. Both verbs previously called `shell.showItemInFolder` to "look at me, I made a new file" — but the right-click was triggered from a Finder window where the user was already looking, so popping a fresh Finder window covers their context. Especially annoying when the user is on the desktop (the new Finder window appears in front of every desktop icon they were working with). Now the new file lands next to the source on its own and the user spots it. `combine` still opens the merged result in WeavePDF (different UX, intentional). `compress` and `rotate-cw/ccw` were already in-place + `reveal: false`.
+
+4. **`Compress` → `Quick Compress`** in the FinderSync submenu (`resources/extensions/finder-sync.swift`). Disambiguates from macOS Finder's built-in `Compress` (which appears as a sibling near our submenu and zips files). "Quick" also signals the difference vs. the full CompressModal flow inside the app (which has presets, custom DPIs, advanced controls).
+
+5. **Ghostscript dict-arg compatibility fix** ([src/main/main.ts](src/main/main.ts) `gs:compress-advanced` handler). The user's CompressModal screenshots showed `Error invoking remote method 'gs:compress-advanced': Error: gs exited 1` on every preset. Reproduced locally on the user's exact PDF — gs 10.07 emits:
+   ```
+   Invalid value for option -dColorImageDict=<</QFactor 0.06.../>>,
+   -dNAME= must be followed by a valid token
+   ```
+   The `<</QFactor.../>>` PostScript-dict syntax embedded in a `-d` flag worked in gs 9.x but was tightened up in 10.x. Fix: pass the dict via inline PostScript using `-c "<<...>> setdistillerparams" -f input.pdf`. Documented + back-compat with 9.x. Verified locally on the user's 933KB contract → 135KB output, exit 0, no error logs. Same fix needed in two places (color images dict, gray images dict) — folded into one inline PS string.
+
+**Deferred to V1.0031: full CompressModal redesign.** User wants a single lossless→lossy slider + live preview + size estimate. The V1.0030 fix gets the existing modal back to working; V1.0031 replaces the multi-preset UI with the slider experience.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.30`.
+- gs 10.07 inline-PS form smoke-tested on user's actual PDF.
+- Bumped V1.0029 → V1.0030 per Critical Rule #12.
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) (Services menu removed, Close Tab item, gs inline-PS, reveal:false for extract-first/convert), [src/shared/ipc.ts](src/shared/ipc.ts) (closeTab MenuCommand variant), [src/renderer/App.tsx](src/renderer/App.tsx) (closeTab handler), [resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift) (Quick Compress rename), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0029: restore WeavePDF parent submenu (revert V1.0028's flatten)
 

@@ -73,7 +73,11 @@ class FinderSync: FIFinderSync {
         let sub = NSMenu(title: "WeavePDF")
         sub.autoenablesItems = false
 
-        addItem(sub, "Compress", #selector(compressAction(_:)), enabled: pdfCount > 0)
+        // V1.0030: "Quick Compress" disambiguates from macOS Finder's
+        // built-in "Compress" (zip), which appears as a sibling near our
+        // submenu. "Quick" also signals: this is the one-click /ebook
+        // preset, not the full CompressModal flow inside the app.
+        addItem(sub, "Quick Compress", #selector(compressAction(_:)), enabled: pdfCount > 0)
         addItem(sub, "Combine into PDF", #selector(combineAction(_:)), enabled: ok.count >= 2)
         addItem(sub, "Convert to PDF", #selector(convertAction(_:)), enabled: imgCount > 0)
         addItem(sub, "Extract first page", #selector(extractAction(_:)), enabled: pdfCount > 0)
