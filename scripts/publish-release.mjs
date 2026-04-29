@@ -27,10 +27,14 @@
 
 import { execFileSync, execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { argv, exit } from "node:process";
+import { fileURLToPath } from "node:url";
 
-const repoRoot = resolve(new URL("..", import.meta.url).pathname);
+// fileURLToPath decodes %20 etc. so paths with spaces (like "Coding Projects")
+// resolve correctly. Using `new URL("..").pathname` directly returns the
+// URL-encoded form, which existsSync will reject.
+const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const pkgPath = join(repoRoot, "package.json");
 const changelogPath = join(repoRoot, "CHANGELOG.md");
 const outDir = join(repoRoot, "out", "make");
