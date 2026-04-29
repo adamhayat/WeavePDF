@@ -64,8 +64,18 @@ export function PrintPreviewModal({ open, onClose }: Props) {
   const [pdf, setPdf] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [selectedPage, setSelectedPage] = useState(1);
 
-  // Reset state on open. Important: we explicitly destroy any in-flight pdf
-  // proxy from a previous open to avoid worker leaks.
+  // Refs to avoid putting pdf/loadingTask in deps (which would cause a
+  // tear-rebuild loop). The pdf.js worker race fixed in V1.0022 lives here:
+  // every load is sequenced — we await destroy of the previous proxy
+  // BEFORE swapping in the new one. Without that, rapid layout/orientation
+  // changes triggered overlapping getDocument() + destroy() against the
+  // shared worker port, which surfaced as "PDFWorker.fromPort - the worker
+  // is being destroyed".
+  const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
+  const loadingTaskRef = useRef<ReturnType<typeof pdfjsLib.getDocument> | null>(null);
+
+  // Reset state on open. Important: any pdf proxy from a previous open is
+  // destroyed via the ref-based cleanup below, not here.
   useEffect(() => {
     if (!open) {
       setPrintBytes(null);
@@ -74,10 +84,7 @@ export function PrintPreviewModal({ open, onClose }: Props) {
       setPerSheet(1);
       setOrientation("auto");
       setPrinting(false);
-      if (pdf) {
-        void pdf.destroy();
-        setPdf(null);
-      }
+      // Hand pdf cleanup to the unmount/printBytes-null effect below.
       return;
     }
     requestAnimationFrame(() => closeRef.current?.focus());
@@ -105,16 +112,23 @@ export function PrintPreviewModal({ open, onClose }: Props) {
     (async () => {
       try {
         let next: Uint8Array;
-        if (perSheet === 1 && orientation === "auto") {
-          next = activeTab.bytes!;
-        } else if (perSheet === 1) {
-          // 1-per-sheet but with a forced orientation — that's effectively
-          // a "fit to paper" pass; not common, treat as 1-up source for
-          // now since rotating pages is a separate operation.
+        if (perSheet === 1) {
+          // 1-per-sheet always renders the source bytes directly. Any
+          // orientation control is a no-op here — rotating individual
+          // pages is a separate operation outside print preview's scope.
           next = activeTab.bytes!;
         } else {
+          // V1.0022: "Auto" must NOT be passed as a string to nUpPages
+          // because resolvePaperSize treats "auto" as "use base orientation
+          // of the paper" (i.e. portrait Letter for 2/4/6/9-up). The
+          // user-friendly default for 2-up is landscape, for 4/6/9-up is
+          // portrait — that's what nUpPages's `defaultOrient` provides
+          // when `orientation` is omitted. So when the modal says "auto",
+          // we DROP the orientation key so the primitive picks its default.
           const { nUpPages } = await loadPdfOps();
-          next = await nUpPages(activeTab.bytes!, perSheet, { orientation });
+          const opts: Parameters<typeof nUpPages>[2] =
+            orientation === "auto" ? {} : { orientation };
+          next = await nUpPages(activeTab.bytes!, perSheet, opts);
         }
         if (cancelled) return;
         setPrintBytes(next);
@@ -131,48 +145,76 @@ export function PrintPreviewModal({ open, onClose }: Props) {
     };
   }, [open, activeTab?.bytes, activeTab?.version, perSheet, orientation]);
 
-  // Re-open print bytes through pdf.js for the preview. Destroy the
-  // previous proxy on every change to avoid leaking workers.
+  // V1.0022: properly sequenced pdf.js load. The previous version had a
+  // race where rapid layout/orientation changes triggered overlapping
+  // getDocument() + destroy() calls against the shared pdf.js worker, which
+  // pdf.js surfaced as "PDFWorker.fromPort - the worker is being destroyed."
+  //
+  // Sequencing rules:
+  //   1. Each effect run gets a `cancelled` token. The cleanup sets it.
+  //   2. We never destroy() the previous pdf BEFORE the new one finishes
+  //      loading — that's what was racing the worker. Instead: load new,
+  //      then swap state, then destroy old (so the swap renders without
+  //      pdf.js worker contention).
+  //   3. If a newer effect cancelled this one mid-load, destroy the
+  //      orphaned new pdf instead of mounting it.
   useEffect(() => {
-    if (!printBytes) {
-      if (pdf) {
-        void pdf.destroy();
-        setPdf(null);
-      }
-      return;
-    }
+    if (!printBytes) return;
     let cancelled = false;
-    let nextPdf: pdfjsLib.PDFDocumentProxy | null = null;
+
     (async () => {
+      let task: ReturnType<typeof pdfjsLib.getDocument> | null = null;
+      let loaded: pdfjsLib.PDFDocumentProxy | null = null;
       try {
-        // Fresh slice — pdf.js takes ownership of the buffer it receives.
-        const ab = u8ToAb(printBytes);
-        nextPdf = await pdfjsLib.getDocument({ data: new Uint8Array(ab) }).promise;
+        const data = new Uint8Array(u8ToAb(printBytes));
+        task = pdfjsLib.getDocument({ data });
+        loadingTaskRef.current = task;
+        loaded = await task.promise;
         if (cancelled) {
-          void nextPdf.destroy();
+          // A newer effect superseded us; throw the load away cleanly.
+          try { await loaded.destroy(); } catch { /* ignore */ }
           return;
         }
-        if (pdf) void pdf.destroy();
-        setPdf(nextPdf);
+        // Swap: state update first, then await destroy of the old proxy.
+        const old = pdfRef.current;
+        pdfRef.current = loaded;
+        setPdf(loaded);
         setSelectedPage(1);
+        setLayoutError(null);
+        if (old) {
+          try { await old.destroy(); } catch { /* ignore — best-effort */ }
+        }
+        if (loadingTaskRef.current === task) loadingTaskRef.current = null;
       } catch (err) {
         if (!cancelled) {
           setLayoutError(err instanceof Error ? err.message : String(err));
         }
+        if (loaded) {
+          try { await loaded.destroy(); } catch { /* ignore */ }
+        }
       }
     })();
+
     return () => {
       cancelled = true;
-      if (nextPdf && nextPdf !== pdf) void nextPdf.destroy();
     };
-  }, [printBytes]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [printBytes]);
 
-  // Cleanup pdf proxy when the modal unmounts.
+  // Final cleanup on unmount: destroy any in-flight task + any mounted pdf.
   useEffect(() => {
     return () => {
-      if (pdf) void pdf.destroy();
+      const t = loadingTaskRef.current;
+      const p = pdfRef.current;
+      loadingTaskRef.current = null;
+      pdfRef.current = null;
+      if (t) {
+        try { void t.destroy(); } catch { /* ignore */ }
+      }
+      if (p) {
+        try { void p.destroy(); } catch { /* ignore */ }
+      }
     };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, []);
 
   const handlePrint = useCallback(async () => {
     if (!printBytes || printing) return;

@@ -5,7 +5,13 @@
 
 ## Current State
 
-**Status:** **V1.0021 — Print rebuilt: Preview-app-style modal + clean hidden-window print.** User reported three print bugs in V1.0020:
+**Status:** **V1.0022 — Print preview hotfix: pdf.js worker race + orientation "Auto" bug.** User reported orientation dropdown did nothing AND 2-per-sheet broke with a "PDFWorker.fromPort - the worker is being destroyed" error. Two real bugs:
+1. **pdf.js worker destroy race.** Rapid layout/orientation changes triggered overlapping `getDocument()` and `pdf.destroy()` calls against pdf.js's shared worker port. The previous proxy was destroyed BEFORE the new load finished, and pdf.js surfaced this as the worker error. The preview build "failed" so the dropdown looked like a no-op.
+2. **Orientation "Auto" was ignored.** The modal passed `orientation: "auto"` literally to `nUpPages`, and `resolvePaperSize` treats "auto" as "use base orientation of the paper" (portrait Letter for everything). What "Auto" actually means is "use the primitive's `defaultOrient`" — landscape for 2-up, portrait for 4/6/9-up — which only happens when the orientation key is OMITTED. Now the modal drops the key when "Auto" is selected.
+
+**The proper-sequencing fix in PrintPreviewModal:** every pdf.js load uses a `cancelled` token + ref-based old-pdf tracking. New load happens first → state swaps → old pdf is destroyed AFTER the swap. Any in-flight load that gets superseded destroys its own orphaned proxy without touching the shared worker mid-load.
+
+**V1.0021 base (carried forward):** Print rebuilt: Preview-app-style modal + clean hidden-window print. User reported three print bugs in V1.0020:
 1. Printing prints the renderer's UI chrome (sidebar thumbnails, toolstrip) — happened because the old path called `webContents.print()` on the main window which renders the whole DOM.
 2. Only the first page prints.
 3. macOS adds a filename/URL header band in the page margins.
@@ -465,6 +471,36 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0022: print preview hotfix — pdf.js worker race + orientation Auto bug
+
+User tested V1.0021 and surfaced two real bugs in the new modal:
+1. "The orientation doesnt do anything here, and doing 2 pages per sheet also doesnt work" — screenshots showed `Couldn't build preview: PDFWorker.fromPort - the worker is being destroyed. Please remember to await PDFDocumentLoadingTask.destroy()-calls.`
+
+**Bug 1: pdf.js worker destroy race in PrintPreviewModal.** The previous load sequencing was:
+1. New `printBytes` arrives → effect fires → `pdfjsLib.getDocument({data}).promise`.
+2. Inside the same effect, after the await: `if (pdf) void pdf.destroy()` (the OLD proxy) and `setPdf(nextPdf)`.
+3. But if `printBytes` changed AGAIN before the first await resolved (rapid layout/orientation toggling), a second effect fires and starts ANOTHER getDocument(). The first effect's cleanup sets `cancelled = true`, but its in-flight destroy of the old proxy continues. Now we have: load A (cancelled), destroy A's old (in-flight), load B (in-flight) — three concurrent operations against the SHARED pdf.js worker port. pdf.js's `PDFWorker.fromPort` errors out when it sees a destroy mid-load.
+
+**Fix in [src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx):** sequence properly using refs.
+- `pdfRef` holds the currently-mounted pdf proxy.
+- `loadingTaskRef` holds the in-flight loading task.
+- Each effect creates a `cancelled` token. On rerun, cleanup sets it.
+- New load: `task = getDocument()` → `loaded = await task.promise`. If `cancelled`, destroy `loaded` and bail.
+- Otherwise: swap state FIRST (`pdfRef.current = loaded; setPdf(loaded)`) THEN await destroy of the previous proxy (`if (old) await old.destroy()`). This way no destroy is racing the new load — by the time the destroy fires, the new doc is already mounted and the worker has moved on.
+- Unmount: separate effect with empty deps cleans up `loadingTaskRef` and `pdfRef`.
+
+**Bug 2: orientation "Auto" was a string passed straight to `nUpPages`, not a fallback signal.** [src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) was calling `nUpPages(bytes, perSheet, { orientation: "auto" })`. Inside `nUpPages`, `orientation = opts.orientation ?? grid.defaultOrient` — "auto" is truthy, so the `??` fallback never fires; "auto" propagates to `resolvePaperSize`, which treats it as "use base orientation" (= portrait Letter for everything). That meant Auto + 2-up rendered as portrait Letter (each page squished to 4.25"×11" cells), instead of the intended landscape Letter (5.5"×8.5" cells, the canonical 2-up reading layout).
+
+**Fix:** when the modal's orientation is "auto", DROP the orientation key entirely so `nUpPages` falls through to its `defaultOrient` (landscape for 2-up, portrait for 4/6/9-up). Explicit "Portrait"/"Landscape" choices still pass through.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.22`.
+- Repackaged + reinstalled `/Applications/WeavePDF.app`.
+- Bumped V1.0021 → V1.0022 per Critical Rule #12.
+- Manual end-to-end verification still pending — user should now see: orientation dropdown visibly changes the preview between portrait and landscape sheets; 2/4/6/9-per-sheet builds without the worker error; rapid layout switching no longer triggers stale state.
+
+**Files touched:** [src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) (sequenced pdf.js load with refs, orientation-auto fix), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0021: print rebuilt — Preview-app-style modal + clean hidden-window print
 

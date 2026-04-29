@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0022: print preview hotfix — pdf.js worker race + orientation Auto bug (2026-04-29)
+- **pdf.js worker destroy race in PrintPreviewModal.** Rapid layout/orientation toggling caused overlapping `getDocument()` and `pdf.destroy()` against pdf.js's shared worker port, surfacing as `Couldn't build preview: PDFWorker.fromPort - the worker is being destroyed`. Preview reverted to stale state, dropdown looked broken. V1.0022 sequences loads via refs: new doc loads first → state swaps → old doc destroy is awaited AFTER the swap, never racing the worker.
+- **Orientation "Auto" was passed as the literal string "auto"** to `nUpPages`, which `resolvePaperSize` treats as "use base orientation" (portrait Letter for everything) instead of the layout's `defaultOrient` (landscape for 2-up, portrait for 4/6/9-up). Now the modal omits the orientation key when "Auto" is selected so the primitive's smart default kicks in. Explicit Portrait/Landscape still pass through.
+- **Bumped V1.0021 → V1.0022** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.22`. Manual: orientation now visibly swaps sheet layout between portrait and landscape; 2/4/6/9-per-sheet build cleanly without the worker error.
+
 ### Fixed + Added — V1.0021: print rebuilt — Preview-app-style modal + clean hidden-window print (2026-04-29)
 - **Print no longer prints the renderer's UI chrome.** V1.0020 and earlier called `webContents.print()` on the main BrowserWindow, which printed the entire DOM (Sidebar thumbnails, Toolstrip, Titlebar) and cropped the actual document. V1.0021 adds a dedicated `print:pdf-bytes` IPC ([src/main/main.ts](src/main/main.ts)) that writes the PDF to a temp file, opens it in a HIDDEN BrowserWindow with `plugins: true` (Chromium's PDFium plugin), then prints THAT window — no React, no chrome.
 - **All pages now print, not just the first.** 1.2 s settle delay before `print()` lets PDFium fully render every page in the document before the print job materializes.
