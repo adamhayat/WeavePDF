@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0032: single WeavePDF menu entry + no warm-app focus steal (2026-04-29, computer-use verified)
+- **Root-cause fixed for the duplicate `WeavePDF →` right-click entry.** macOS pkd spawns 4–6 concurrent instances of any FinderSync extension that watches the entire filesystem — observed live on the user's machine. Each contributed its own menu items, doubling (or tripling) the parent menu. V1.0032 adds a `flock`-based primary-instance election in [resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift): the first instance to acquire the lock returns menu items; others return empty NSMenus. Lock lives in `NSTemporaryDirectory()` (the per-bundle-id sandbox temp dir; `/tmp` is blocked by extension sandbox). flock auto-releases when the holder dies, so a survivor seamlessly takes over.
+- **No focus steal when WeavePDF is already running.** V1.0031's accessory-mode policy only protected cold-start launches; warm runs still got auto-activated by `NSWorkspace.shared.open(dispatchURL)` at the LaunchServices level. V1.0032 passes `NSWorkspace.OpenConfiguration(activates: false)` for non-window verbs (compress / rotate / extract-first / convert). `activates = true` only for `combine`, which legitimately needs a window.
+- **Verified live** via computer-use end-to-end before shipping: ONE `WeavePDF →` entry, click `Rotate clockwise` on a desktop PDF → file mtime updates, menu bar stays on "Finder", no WeavePDF window appears, no SecurityAgent prompt.
+- **Bumped V1.0031 → V1.0032** per Critical Rule #12.
+
 ### Fixed — V1.0031: headless cold-start so Finder Sync right-click actions don't steal focus (2026-04-29)
 - **Right-click actions on the desktop no longer pull you off the desktop.** When WeavePDF wasn't running and you right-clicked → WeavePDF → Compress / Rotate / Extract / Convert, macOS would auto-foreground WeavePDF as it launched, briefly flashing focus away from where you were. V1.0031 starts WeavePDF in `accessory` activation policy on macOS — no dock icon, no menu bar takeover, no focus steal. The action runs silently in the background; the app quits cleanly when done.
 - **Bare launches still work normally.** Double-click WeavePDF.app / Spotlight launch / dock icon → 100 ms race in `whenReady` confirms no URL/file event arrived, then transitions to regular policy + opens the main window.

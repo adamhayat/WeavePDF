@@ -5,7 +5,12 @@
 
 ## Current State
 
-**Status:** **V1.0031 — Headless cold-start for Finder Sync URL actions.** When the Finder Sync extension dispatched a `weavepdf://` URL while WeavePDF wasn't running yet, macOS launched WeavePDF as a foreground app, stole focus from the desktop / Finder window, briefly flashed a window, then ran the action. The user wanted the action to run silently without ever pulling them off the desktop.
+**Status:** **V1.0032 — Verified-live: single WeavePDF menu entry + no focus steal even when app is already running.** User pushed back: "you didn't actually verify it — try it and make sure it works." Took computer-use control, reproduced both bugs end-to-end, and shipped two real fixes:
+
+1. **Duplicate `WeavePDF →` entry (root cause: pkd spawns 4–6 FinderSync extension instances).** macOS pkd genuinely launches multiple copies of any FinderSync extension that watches `directoryURLs = [URL(fileURLWithPath: "/")]` — observed live on the user's machine after every install. Each instance contributes its own `menu(for:)` items, so the right-click menu got two `WeavePDF →` parents. Fix: file-lock primary-instance election in `finder-sync.swift`. The first instance to acquire `flock(NSTemporaryDirectory()/weavepdf-finder-sync.lock, LOCK_EX|LOCK_NB)` returns menu items; the others return empty menus. Lock auto-releases on process exit, so a survivor takes over silently. The lock path lives in `NSTemporaryDirectory()` (the per-app-group sandbox temp dir) — `/tmp` is blocked by the extension's sandbox. Verified live: ONE entry now.
+2. **Focus-steal even with V1.0031's accessory mode (root cause: `NSWorkspace.shared.open(URL)` activates the receiver by default).** V1.0031's accessory policy only protects cold-start launches. When WeavePDF was already running, the FinderSync extension's `NSWorkspace.shared.open(dispatchURL)` call activated WeavePDF as a side-effect of the URL dispatch. Fix: pass `NSWorkspace.OpenConfiguration(activates: false)` for non-window verbs (compress / rotate-cw / rotate-ccw / extract-first / convert). `activates = true` only for `combine`, which legitimately needs a window. Verified live: rotate-cw fires, file mtime updates, focus stays on Finder, no SecurityAgent prompt.
+
+**V1.0031 base (carried forward):** Headless cold-start for Finder Sync URL actions. When the Finder Sync extension dispatched a `weavepdf://` URL while WeavePDF wasn't running yet, macOS launched WeavePDF as a foreground app, stole focus from the desktop / Finder window, briefly flashed a window, then ran the action. The user wanted the action to run silently without ever pulling them off the desktop.
 
 Fix: WeavePDF now starts in **accessory** activation policy on macOS — no dock icon, no menu bar takeover, no focus steal. The only paths that bump back to **regular** are the ones where the user genuinely expects a window:
 1. **Bare launch** (dock click / Spotlight / `open WeavePDF.app`) — race-detected in `whenReady` after a 100 ms grace; no URL or file event arrived → bare launch → foreground + main window.
@@ -528,6 +533,35 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0032: actually-verified single menu + no warm-app focus steal
+
+User: "nope all u did was create 2 separate right click menus for weavepdf — and when its not open, it still opens and puts it at top of the screen instead of keeping the view on the screen we are making the action on. Don't just tell me you fixed it, try it and make sure it works." Right. Took computer-use control, ran the live tests, found two real bugs the V1.0029..V1.0031 chain hadn't actually addressed, and shipped fixes I confirmed end-to-end before declaring done.
+
+**Bug 1: duplicate `WeavePDF →` was multiple FinderSync extension instances.** `ps aux | grep WeavePDFFinderSync` showed FOUR concurrent processes — pkd genuinely spawns multiple instances of our extension (different locale stacks per instance: 3 with `(en, en-CA, he-CA)`, 1 with `(en-CA, he-CA)`). Each instance returns its own menu(for:) items; Finder concatenates them; user sees two `WeavePDF →` parents (or more — the count varies). After `pkill -9 -f WeavePDFFinderSync && killall pkd Finder`, all instances respawned in seconds. So this isn't a one-off cache bug — it's by-design pkd behaviour we have to defeat in code.
+
+**Fix 1: file-lock primary-instance election.** [resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift) now does `flock(NSTemporaryDirectory()/weavepdf-finder-sync.lock, LOCK_EX|LOCK_NB)` on first menu(for:) call. Whoever wins the race holds the lock and returns full menu items; losers return empty NSMenus. flock auto-releases when the holder process dies, so a survivor takes over silently. Lock file MUST be in `NSTemporaryDirectory()` not `/tmp` — sandboxed extensions can't write to `/tmp` (verified the hard way: my first attempt put the lock at `/tmp/weavepdf-finder-sync.lock`, ALL instances failed to create it, and ALL returned empty menus → entire WeavePDF parent disappeared from the right-click menu). `NSTemporaryDirectory()` returns the per-bundle-id sandbox temp dir, which all instances of the same extension share.
+
+**Bug 2: warm-running WeavePDF activates on URL dispatch.** V1.0031's `app.setActivationPolicy("accessory")` only takes effect on cold start (set in `will-finish-launching`). When WeavePDF is already running with `regular` policy, the FinderSync extension's `NSWorkspace.shared.open(dispatchURL)` call activated the receiving app by default. Even though our handler doesn't call `bringWindowForward` for in-place verbs, the activation happened at the LaunchServices level before our code ran.
+
+**Fix 2: `NSWorkspace.OpenConfiguration(activates: false)`.** Same file. Pass `config.activates = (verb == "combine")` so only `combine` activates — every other verb dispatches without LaunchServices auto-activation. Verified live: rotate-cw fires while WeavePDF is running in the background; menu bar stays on Finder; file mtime updates; no WeavePDF window appears.
+
+**Verification methodology** (so the next time the user pushes back I can show evidence):
+1. Confirm extension count: `ps aux | grep WeavePDFFinderSync | grep -v grep | wc -l`. Pre-V1.0032: 4–6. Post: 4–6 (we don't reduce the count, just the menu contribution).
+2. Live screenshot of right-click menu: ONE `WeavePDF →`, no duplicates.
+3. Click rotate-cw on a known PDF, capture before/after `stat` mtime → file actually rotated.
+4. Live screenshot menu bar shows "Finder" not "WeavePDF" → focus didn't steal.
+5. Trace log shows `url verb=rotate-cw` + `rotate: ... → ... (in-place)` lines.
+All confirmed before claiming done.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.32`.
+- pkd ghost-instance count: pre-fix 4–6 instances all contribute menus → 2 `WeavePDF →` entries. Post-fix: same ghost count, only ONE contributes menu → ONE entry.
+- Cold-start focus: trace log `headless URL action(s) finished — quitting`, menu bar stays on Finder.
+- Warm-run focus: menu bar stays on Finder during URL dispatch + handler execution.
+- Bumped V1.0031 → V1.0032 per Critical Rule #12.
+
+**Files touched:** [resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift) (file-lock primary-instance election, NSWorkspace.OpenConfiguration with activates: false), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0031: headless cold-start so Finder Sync URL actions don't steal focus
 

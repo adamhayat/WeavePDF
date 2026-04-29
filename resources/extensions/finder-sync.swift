@@ -29,6 +29,7 @@
 
 import Cocoa
 import FinderSync
+import Darwin
 
 class FinderSync: FIFinderSync {
     static let supported: Set<String> = [
@@ -39,6 +40,40 @@ class FinderSync: FIFinderSync {
         "png", "jpg", "jpeg", "heic", "heif",
         "tif", "tiff", "gif", "bmp", "webp",
     ]
+
+    // V1.0032: macOS pkd can spawn multiple instances of this extension
+    // (different locale stacks, Finder window contexts, etc.) — observed
+    // 4-6 concurrent processes on a clean machine. Each instance contributes
+    // its own menu, so the user sees N "WeavePDF →" entries. flock() against
+    // a shared file gives us a primary-instance election: whoever acquires
+    // the exclusive lock first is the one that returns menus; others return
+    // empty. flock auto-releases when the holder process dies, so a survivor
+    // can take over silently.
+    //
+    // The lock file MUST live in NSTemporaryDirectory(), not /tmp. The
+    // sandbox blocks /tmp writes — every instance fails to create the lock
+    // and they all return empty menus, killing the WeavePDF parent entry
+    // entirely. NSTemporaryDirectory() returns the per-app-group sandbox
+    // temp dir which all instances of the SAME extension share (they have
+    // the same bundle ID → same container).
+    static let lockPath: String = {
+        let dir = NSTemporaryDirectory()
+        return (dir as NSString).appendingPathComponent("weavepdf-finder-sync.lock")
+    }()
+    static var lockFd: Int32 = -1
+
+    static func ensureLock() -> Bool {
+        if lockFd >= 0 { return true }
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o600)
+        if fd < 0 { return false }
+        let result = flock(fd, LOCK_EX | LOCK_NB)
+        if result != 0 {
+            close(fd)
+            return false
+        }
+        lockFd = fd
+        return true
+    }
 
     override init() {
         super.init()
@@ -53,6 +88,11 @@ class FinderSync: FIFinderSync {
         let m = NSMenu(title: "")
         m.autoenablesItems = false
         guard menuKind == .contextualMenuForItems else { return m }
+
+        // V1.0032: only the primary instance returns a menu. Others are
+        // ghost copies pkd spawned for various contexts; if they all
+        // contribute menus, the user sees duplicate "WeavePDF →" entries.
+        guard FinderSync.ensureLock() else { return m }
 
         let urls = FIFinderSyncController.default().selectedItemURLs() ?? []
         let ok = urls.filter { FinderSync.supported.contains($0.pathExtension.lowercased()) }
@@ -153,7 +193,16 @@ class FinderSync: FIFinderSync {
         // NSWorkspace.shared.open is allowed in a sandboxed extension because
         // the URL is dispatched through LaunchServices to whichever app
         // registered the `weavepdf://` scheme — our parent WeavePDF.app.
-        NSWorkspace.shared.open(dispatchURL)
+        //
+        // V1.0032: pass `activates = false` for verbs that don't need the
+        // user to interact with WeavePDF (compress, rotate, extract, convert).
+        // Without this, macOS auto-activates the URL handler when delivering
+        // the URL — pulling focus off the desktop even when the app is
+        // running and accessory mode wouldn't apply. "combine" still
+        // activates because its result is a tab the user expects to see.
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = (verb == "combine")
+        NSWorkspace.shared.open(dispatchURL, configuration: config) { _, _ in }
     }
 
     // MARK: - URL filters
