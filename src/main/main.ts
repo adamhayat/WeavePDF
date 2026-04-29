@@ -55,6 +55,63 @@ function logFinderSync(line: string): void {
   }
 }
 
+const finderSyncNotificationName = "ca.adamhayat.weavepdf.finder-action";
+let finderSyncNotificationBridge: ReturnType<typeof spawn> | null = null;
+
+function helperBinaryPath(name: string): string {
+  const resourcesRoot = app.isPackaged
+    ? path.join(process.resourcesPath, "resources")
+    : path.join(__dirname, "..", "..", "resources");
+  return path.join(resourcesRoot, "helpers", name);
+}
+
+function startFinderSyncNotificationBridge(): void {
+  if (process.platform !== "darwin") return;
+  if (finderSyncNotificationBridge) return;
+
+  const bridgePath = helperBinaryPath("url-listener-bin");
+  if (!existsSync(bridgePath)) {
+    logFinderSync(`notification bridge missing: ${bridgePath}`);
+    return;
+  }
+
+  try {
+    const child = spawn(bridgePath, [], { stdio: ["ignore", "pipe", "pipe"] });
+    finderSyncNotificationBridge = child;
+    logFinderSync(`notification bridge started (${finderSyncNotificationName})`);
+
+    let pending = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      pending += chunk.toString("utf8");
+      const lines = pending.split(/\r?\n/);
+      pending = lines.pop() ?? "";
+      for (const line of lines) {
+        const urlString = line.trim();
+        if (!urlString) continue;
+        logFinderSync(`notification bridge received ${urlString}`);
+        queueOrHandleWeavePdfUrl(urlString);
+      }
+    });
+
+    child.stderr?.on("data", (chunk: Buffer) => {
+      const msg = chunk.toString("utf8").trim();
+      if (msg) logFinderSync(`notification bridge stderr: ${msg}`);
+    });
+
+    child.on("exit", (code, signal) => {
+      logFinderSync(`notification bridge exited code=${code ?? "null"} signal=${signal ?? "null"}`);
+      finderSyncNotificationBridge = null;
+    });
+
+    child.on("error", (err) => {
+      logFinderSync(`notification bridge error: ${err.message}`);
+      finderSyncNotificationBridge = null;
+    });
+  } catch (err) {
+    logFinderSync(`notification bridge failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
+
 // Allowlist of filesystem paths the renderer is permitted to read or write
 // via fs:read-file / fs:write-file / shell:show-in-folder. Paths are only
 // added here by main-process flows the user initiated: dialog selections,
@@ -2717,6 +2774,7 @@ if (!isCliMode) {
 // such a URL, this is how we capture the verb without dropping it.
 const pendingWeavePdfUrls: string[] = [];
 let weavePdfUrlHandlerReady = false;
+const recentWeavePdfUrls = new Map<string, number>();
 
 // V1.0031: track in-flight URL handlers so we can quit cleanly after the
 // last cold-start URL action completes (and still no window is open). If
@@ -2726,6 +2784,17 @@ let weavePdfUrlHandlerReady = false;
 let urlActionsInFlight = 0;
 
 function queueOrHandleWeavePdfUrl(urlString: string): void {
+  const now = Date.now();
+  for (const [url, seenAt] of recentWeavePdfUrls) {
+    if (now - seenAt > 5_000) recentWeavePdfUrls.delete(url);
+  }
+  const lastSeen = recentWeavePdfUrls.get(urlString);
+  if (lastSeen && now - lastSeen < 5_000) {
+    logFinderSync(`duplicate URL ignored: ${urlString}`);
+    return;
+  }
+  recentWeavePdfUrls.set(urlString, now);
+
   if (weavePdfUrlHandlerReady) {
     urlActionsInFlight++;
     void handleWeavePdfUrl(urlString).finally(() => {
@@ -2970,6 +3039,11 @@ if (isCliMode) {
   registerIpc();
   buildAppMenu();
   nativeTheme.on("updated", broadcastTheme);
+  startFinderSyncNotificationBridge();
+  app.on("before-quit", () => {
+    finderSyncNotificationBridge?.kill();
+    finderSyncNotificationBridge = null;
+  });
 
   // V1.0031: don't unconditionally createMainWindow. If we're handling
   // a `weavepdf://` URL cold start (Finder Sync extension dispatch),

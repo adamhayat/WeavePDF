@@ -190,6 +190,21 @@ class FinderSync: FIFinderSync {
             return
         }
 
+        // V1.0033: if the parent app is already running, avoid
+        // NSWorkspace.open entirely for background-only verbs. Even with
+        // OpenConfiguration.activates = false, LaunchServices can still
+        // disturb macOS Show Desktop because it routes an "open URL" event
+        // through the app activation machinery. A distributed notification
+        // is local, fire-and-forget, and doesn't change the foreground app or
+        // cancel Show Desktop. The parent app runs a tiny Swift listener that
+        // forwards this URL string to main.ts. If WeavePDF is not running,
+        // there is no listener, so we fall back to LaunchServices below.
+        if verb != "combine" && isParentRunning() {
+            if dispatchViaNotification(urlString: urlStr) {
+                return
+            }
+        }
+
         // NSWorkspace.shared.open is allowed in a sandboxed extension because
         // the URL is dispatched through LaunchServices to whichever app
         // registered the `weavepdf://` scheme — our parent WeavePDF.app.
@@ -203,6 +218,43 @@ class FinderSync: FIFinderSync {
         let config = NSWorkspace.OpenConfiguration()
         config.activates = (verb == "combine")
         NSWorkspace.shared.open(dispatchURL, configuration: config) { _, _ in }
+    }
+
+    private func isParentRunning() -> Bool {
+        return NSRunningApplication
+            .runningApplications(withBundleIdentifier: "ca.adamhayat.weavepdf")
+            .contains { !$0.isTerminated }
+    }
+
+    private func dispatchViaNotification(urlString: String) -> Bool {
+        let token = UUID().uuidString
+        var didAck = false
+        let center = DistributedNotificationCenter.default()
+        let observer = center.addObserver(
+            forName: Notification.Name("ca.adamhayat.weavepdf.finder-action-ack"),
+            object: nil,
+            queue: nil
+        ) { notification in
+            guard let ackToken = notification.userInfo?["token"] as? String else { return }
+            if ackToken == token {
+                didAck = true
+                CFRunLoopStop(CFRunLoopGetCurrent())
+            }
+        }
+
+        center.postNotificationName(
+            Notification.Name("ca.adamhayat.weavepdf.finder-action"),
+            object: nil,
+            userInfo: ["url": urlString, "token": token],
+            deliverImmediately: true
+        )
+
+        let deadline = Date(timeIntervalSinceNow: 0.25)
+        while !didAck && Date() < deadline {
+            RunLoop.current.run(mode: .default, before: deadline)
+        }
+        center.removeObserver(observer)
+        return didAck
     }
 
     // MARK: - URL filters

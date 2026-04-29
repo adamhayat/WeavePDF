@@ -163,8 +163,13 @@ const config: ForgeConfig = {
     // of the fully-fused .app.
     postPackage: async (_forgeConfig, options) => {
       const repoRoot = resolve(__dirname);
+      const helperScript = join(repoRoot, "scripts/build-url-listener.mjs");
+      const helperBin = join(repoRoot, "resources/helpers/url-listener-bin");
       const buildScript = join(repoRoot, "scripts/build-finder-sync.mjs");
       const appex = join(repoRoot, "out/build-finder-sync/WeavePDFFinderSync.appex");
+
+      console.log("[postPackage] Building Finder Sync notification bridge...");
+      execFileSync("node", [helperScript], { stdio: "inherit" });
 
       console.log(
         `[postPackage] Building WeavePDFFinderSync.appex (signing identity: ${SIGNING_IDENTITY})...`,
@@ -183,6 +188,10 @@ const config: ForgeConfig = {
         rmSync(dest, { recursive: true, force: true });
         cpSync(appex, dest, { recursive: true });
         console.log(`[postPackage] embedded extension: ${dest}`);
+
+        const helperDest = join(appBundle, "Contents/Resources/resources/helpers/url-listener-bin");
+        cpSync(helperBin, helperDest);
+        console.log(`[postPackage] embedded notification bridge: ${helperDest}`);
 
         // Re-sign the parent .app WITHOUT --deep. This regenerates the
         // parent's CodeResources to seal the new PlugIns/ contents, but
