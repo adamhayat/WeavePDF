@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" width="1024" height="1024">
+  <!--
+    WeavePDF app icon.
+    Spec from BRAND.md:
+      - macOS squircle base with a near-flat luminous gradient from
+        #1E2440 (bottom-right) to #3B4CCA (top-left). Loom Indigo.
+      - Centered page glyph (rounded-corner rectangle, ~62% of squircle)
+        rendered in soft #FBFBFA with a 1px inner border.
+      - Two thin threads in #7A8AFF crossing diagonally to form a low-contrast
+        "W". Threads pass over/under at the crossing — the only literal
+        weaving cue in the entire identity.
+      - No fox, no folded corner, no text, no drop shadow.
+  -->
+
+  <defs>
+    <!-- Loom Indigo gradient: top-left light → bottom-right deep -->
+    <linearGradient id="loom" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3B4CCA"/>
+      <stop offset="55%" stop-color="#2D389E"/>
+      <stop offset="100%" stop-color="#1E2440"/>
+    </linearGradient>
+
+    <!-- Soft luminous gloss in the top-left corner -->
+    <radialGradient id="gloss" cx="0.22" cy="0.18" r="0.55">
+      <stop offset="0%" stop-color="#7A8AFF" stop-opacity="0.22"/>
+      <stop offset="60%" stop-color="#7A8AFF" stop-opacity="0.04"/>
+      <stop offset="100%" stop-color="#7A8AFF" stop-opacity="0"/>
+    </radialGradient>
+
+    <!-- Page paper: flat soft white -->
+    <linearGradient id="paper" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#FBFBFA"/>
+    </linearGradient>
+
+    <!-- Clip path for thread "under" segments — clipped to page rectangle -->
+    <clipPath id="pageClip">
+      <rect x="240" y="200" width="544" height="624" rx="48" ry="48"/>
+    </clipPath>
+  </defs>
+
+  <!-- Squircle base. macOS will apply its own corner mask, but we draw
+       a 228 radius squircle here so the shape reads at every render path. -->
+  <rect width="1024" height="1024" rx="228" ry="228" fill="url(#loom)"/>
+
+  <!-- Top-left luminous gloss -->
+  <rect width="1024" height="1024" rx="228" ry="228" fill="url(#gloss)"/>
+
+  <!-- Page glyph: centered, ~62% of squircle width, rounded corners -->
+  <g>
+    <rect x="240" y="200" width="544" height="624" rx="48" ry="48"
+          fill="url(#paper)"/>
+    <!-- Inner 1px hairline border -->
+    <rect x="240.5" y="200.5" width="543" height="623" rx="47.5" ry="47.5"
+          fill="none" stroke="rgba(0,0,0,0.06)" stroke-width="1"/>
+  </g>
+
+  <!--
+    Two threads crossing diagonally over the page to imply a "W".
+    Thread A: top-left → bottom-center (left leg of W)
+    Thread B: top-right → bottom-center (right leg of W)
+    They cross near the page center — Thread A passes UNDER Thread B
+    at the crossing, then over at the second meeting.
+
+    Implementation: each thread is a single quadratic curve. The "under"
+    illusion is achieved by overpainting the crossing thread on top of
+    the other. A short paper-colored gap is drawn at the crossing on
+    the underlying thread to make the crossover read.
+  -->
+
+  <g clip-path="url(#pageClip)">
+    <!-- Thread A: starts top-left of page, dips to bottom-center -->
+    <path d="M 304 296 Q 360 540 512 720"
+          fill="none"
+          stroke="#7A8AFF"
+          stroke-width="22"
+          stroke-linecap="round"/>
+
+    <!-- Thread B: starts top-right of page, dips to bottom-center -->
+    <path d="M 720 296 Q 664 540 512 720"
+          fill="none"
+          stroke="#7A8AFF"
+          stroke-width="22"
+          stroke-linecap="round"/>
+
+    <!--
+      Crossover gap: paper-colored stroke segment punched into Thread A
+      where Thread B passes OVER it. Subtle but reads as woven.
+    -->
+    <path d="M 460 540 L 488 552"
+          fill="none"
+          stroke="#FBFBFA"
+          stroke-width="28"
+          stroke-linecap="round"/>
+
+    <!--
+      Repaint Thread B on top of the gap so it reads as the over-strand.
+    -->
+    <path d="M 720 296 Q 664 540 512 720"
+          fill="none"
+          stroke="#7A8AFF"
+          stroke-width="22"
+          stroke-linecap="round"/>
+
+    <!--
+      Inner W-vertex stitch: a small middle peak between the two threads,
+      hinting at the third stroke of a W. Optional but reinforces the letter.
+    -->
+    <path d="M 488 580 L 512 540 L 536 580"
+          fill="none"
+          stroke="#7A8AFF"
+          stroke-width="22"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+          opacity="0.78"/>
+  </g>
+</svg>

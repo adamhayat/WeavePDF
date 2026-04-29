@@ -1,0 +1,151 @@
+@import "tailwindcss";
+
+/* WeavePDF brand: Loom Indigo accent (replaces the prior electric violet).
+   Light accent #3B4CCA, dark accent #7A8AFF. See BRAND.md for the full palette. */
+@theme {
+  --color-accent: #3b4cca;
+  --color-accent-hover: #4f5ee0;
+  --color-accent-press: #2a36a8;
+  --color-success: #30d158;
+  --color-warn: #ff9f0a;
+  --color-destructive: #ff453a;
+
+  --radius-page: 6px;
+  --radius-popover: 8px;
+  --radius-thumb: 10px;
+
+  --font-sans: ui-sans-serif, -apple-system, BlinkMacSystemFont, "SF Pro Text", "SF Pro Display", "Segoe UI", Helvetica, Arial, sans-serif;
+  --font-mono: "GT America Mono", ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+}
+
+/* Semantic theme tokens — light defaults, dark overrides applied via <html data-theme="dark">. */
+:root {
+  --app-bg: #fbfbfa;
+  --app-fg: #16181b;
+  --panel-bg: #ffffff;
+  --panel-bg-raised: #ffffff;
+  --panel-border: rgba(0, 0, 0, 0.08);
+  --panel-border-strong: rgba(0, 0, 0, 0.14);
+  --muted: rgba(22, 24, 27, 0.62);
+  --subtle: rgba(22, 24, 27, 0.42);
+  --hover-bg: rgba(0, 0, 0, 0.04);
+  --active-bg: rgba(0, 0, 0, 0.07);
+  --page-shadow: 0 1px 2px rgba(0, 0, 0, 0.06), 0 6px 20px rgba(0, 0, 0, 0.08);
+  --thumb-ring: rgba(0, 0, 0, 0.1);
+  --selection-bg: rgba(59, 76, 202, 0.22);
+  --accent-soft: #e7eafb;
+}
+
+[data-theme="dark"] {
+  --app-bg: #101113;
+  --app-fg: #ececea;
+  --panel-bg: #181a1d;
+  --panel-bg-raised: #1f2126;
+  --panel-border: rgba(255, 255, 255, 0.08);
+  --panel-border-strong: rgba(255, 255, 255, 0.14);
+  --muted: rgba(236, 236, 234, 0.6);
+  --subtle: rgba(236, 236, 234, 0.4);
+  --hover-bg: rgba(255, 255, 255, 0.05);
+  --active-bg: rgba(255, 255, 255, 0.09);
+  --page-shadow: 0 1px 2px rgba(0, 0, 0, 0.5), 0 8px 28px rgba(0, 0, 0, 0.55);
+  --thumb-ring: rgba(255, 255, 255, 0.1);
+  --selection-bg: rgba(122, 138, 255, 0.35);
+  --accent-soft: #1e2440;
+  /* Dark-mode accent override per BRAND.md */
+  --color-accent: #7a8aff;
+  --color-accent-hover: #94a2ff;
+  --color-accent-press: #6271e0;
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--app-bg);
+  color: var(--app-fg);
+  font-feature-settings: "ss01", "cv11";
+  -webkit-font-smoothing: antialiased;
+}
+
+::selection {
+  background: var(--selection-bg);
+}
+
+/* Tabular numerals for sizes / page numbers */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Scrollbar — subtle, macOS-like */
+.acr-scroll::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.acr-scroll::-webkit-scrollbar-track {
+  background: transparent;
+}
+.acr-scroll::-webkit-scrollbar-thumb {
+  background: transparent;
+  border-radius: 8px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.acr-scroll:hover::-webkit-scrollbar-thumb {
+  background: rgba(127, 127, 127, 0.35);
+  background-clip: padding-box;
+}
+
+/* Draggable macOS title bar region */
+.drag-region {
+  -webkit-app-region: drag;
+}
+.no-drag {
+  -webkit-app-region: no-drag;
+}
+
+/* Shake on error — 2px at 80ms per design system */
+@keyframes acr-shake {
+  0%, 100% { transform: translateX(0); }
+  25% { transform: translateX(-2px); }
+  75% { transform: translateX(2px); }
+}
+.shake {
+  animation: acr-shake 80ms ease-in-out 2;
+}
+
+/* pdf.js text layer — default styles so selection matches canvas.
+   `user-select: text` is required because body has `select-none` on the chrome. */
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  line-height: 1;
+  opacity: 0.25;
+  user-select: text;
+  -webkit-user-select: text;
+}
+/* Edit-text tool mode — spans become tappable, with a hover highlight. */
+[data-edit-text="1"] .textLayer {
+  pointer-events: auto;
+}
+[data-edit-text="1"] .textLayer > span:hover {
+  background: var(--selection-bg);
+  outline: 1px solid var(--color-accent);
+  cursor: text;
+  border-radius: 2px;
+}
+.textLayer > span,
+.textLayer > br {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0 0;
+  user-select: text;
+  -webkit-user-select: text;
+}
+.textLayer ::selection {
+  background: rgba(109, 94, 245, 0.45);
+}

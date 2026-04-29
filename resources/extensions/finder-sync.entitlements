@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!--
+    macOS pkd refuses to load any app extension that isn't sandboxed
+    ("plug-ins must be sandboxed"). app-sandbox=true is mandatory.
+  -->
+  <key>com.apple.security.app-sandbox</key>
+  <true/>
+
+  <!--
+    Allow the sandboxed extension to open URLs registered to other apps.
+    Used by the extension's menu actions: it builds a `weavepdf://` URL with
+    the selected file paths and the chosen verb, then calls
+    `NSWorkspace.shared.open(URL)` to dispatch to the parent WeavePDF.app —
+    which has the actual TCC grants and can do the heavy work.
+  -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+
+  <!--
+    The extension reads file paths the user has selected in Finder. The
+    FinderSync extension framework grants implicit read access to those
+    URLs (via FIFinderSyncController.selectedItemURLs()), so we don't need
+    a separate file-access entitlement here — just URL forwarding to the
+    parent app.
+  -->
+</dict>
+</plist>
