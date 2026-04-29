@@ -15,7 +15,6 @@ export const IpcChannel = {
   WindowMinimize: "window:minimize",
   WindowMaximize: "window:maximize",
   WindowClose: "window:close",
-  ConfirmBeforeClose: "window:confirm-before-close",
   SignatureGet: "signature:get",
   SignatureSet: "signature:set",
   SignatureClear: "signature:clear",

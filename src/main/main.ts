@@ -45,9 +45,25 @@ const pendingOpenFiles: string[] = [];
 // added here by main-process flows the user initiated: dialog selections,
 // drag-drop, OS open-file. This closes the "compromised renderer can steal
 // /Users/X/.ssh/id_rsa via IPC" hole.
+//
+// Paths are stored in BOTH the lexical-resolved and realpath forms (V1.0020).
+// realpath closes a TOCTOU where the user picks /Desktop/safe.pdf, the
+// allowlist would store the lexical path, and an attacker symlinks that
+// path to /etc/hosts before the renderer issues readFile. We bless both
+// forms so that the user's pick survives a non-malicious symlink swap (e.g.
+// Sketch/Figma proxy paths) AND assertBlessed can check the realpath.
 const blessedPaths = new Set<string>();
 function blessPath(p: string | null | undefined): void {
-  if (p) blessedPaths.add(path.resolve(p));
+  if (!p) return;
+  const resolved = path.resolve(p);
+  blessedPaths.add(resolved);
+  try {
+    blessedPaths.add(realpathSync.native(resolved));
+  } catch {
+    // Save targets may not exist yet (Save As). Future writes will pass
+    // because the lexical path is allowlisted; realpath resolution happens
+    // when the file finally exists.
+  }
 }
 function isInsidePath(child: string, parent: string): boolean {
   const rel = path.relative(parent, child);
@@ -60,9 +76,12 @@ function policyRealPath(p: string): string {
   } catch {
     // Save targets may not exist yet. Resolve the closest existing ancestor
     // so symlinked parent directories cannot bypass protected-location checks.
+    // Hard cap the walk at 64 iterations so a maliciously-deep path can't
+    // wedge the loop.
     const missing: string[] = [];
     let cursor = resolved;
-    while (!existsSync(cursor)) {
+    let i = 0;
+    while (!existsSync(cursor) && i++ < 64) {
       const next = path.dirname(cursor);
       if (next === cursor) break;
       missing.unshift(path.basename(cursor));
@@ -77,7 +96,18 @@ function policyRealPath(p: string): string {
 }
 function assertBlessed(p: string): void {
   const resolved = path.resolve(p);
-  if (!blessedPaths.has(resolved)) {
+  // Realpath check (V1.0020): reject if neither the lexical path nor the
+  // realpath is in the allowlist. A symlink pointed at /etc/hosts after the
+  // user blessed /Desktop/safe.pdf would have a realpath outside the
+  // allowlist and get rejected here.
+  let real = resolved;
+  try {
+    real = realpathSync.native(resolved);
+  } catch {
+    // File doesn't exist (yet — Save As). Lexical match is enough since
+    // there's no symlink to resolve through.
+  }
+  if (!blessedPaths.has(resolved) && !blessedPaths.has(real)) {
     throw new Error(`path not permitted: ${resolved}`);
   }
   // Defense-in-depth: reject anything under the app's own userData so the
@@ -87,6 +117,81 @@ function assertBlessed(p: string): void {
   if (isInsidePath(checked, userData)) {
     throw new Error("path not permitted: userData");
   }
+}
+
+// Path validator for the system-wide `weavepdf://` URL scheme (V1.0020).
+// Any process on the Mac can dispatch a `weavepdf://compress?paths=…` URL
+// and macOS will route it to WeavePDF — so the receiving handler MUST treat
+// the paths as untrusted. The Finder Sync extension is a legit caller, but
+// browsers, scripts, mailto: payloads, etc. could also form these URLs.
+//
+// Two-layer check:
+//   1. Path realpath must live inside one of the user's "documents" roots
+//      (Desktop, Documents, Downloads, Movies, Music, Pictures, Public,
+//      iCloud Drive, /Volumes/* for external drives + DMGs).
+//   2. Path realpath must NOT be inside a sensitive subtree (~/.ssh, ~/.aws,
+//      ~/.gnupg, ~/Library/Keychains, ~/Library/Application Support, /etc,
+//      /System, /private, /usr, /bin, /sbin).
+//   3. Extension must be one of the file types our menu supports (pdf,
+//      png, jpg/jpeg, heic, heif). Belt-and-braces with the Finder Sync
+//      extension's filter, which we don't trust.
+const WEAVEPDF_URL_ALLOWED_EXTS = new Set([
+  "pdf", "png", "jpg", "jpeg", "heic", "heif",
+]);
+const WEAVEPDF_URL_BLOCKED_BASENAMES = new Set([
+  ".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker",
+  "Keychains", "Cookies",
+]);
+function isSafeWeavePdfPath(p: string): boolean {
+  // 1. Resolve to realpath. If the file doesn't exist, reject — the URL
+  //    handler operates on existing files.
+  let real: string;
+  try {
+    real = realpathSync.native(p);
+  } catch {
+    return false;
+  }
+
+  // 2. Allowed extension.
+  const ext = path.extname(real).replace(/^\./, "").toLowerCase();
+  if (!WEAVEPDF_URL_ALLOWED_EXTS.has(ext)) return false;
+
+  // 3. Blocked subtree check — walk components and reject anything sensitive.
+  const home = app.getPath("home");
+  const homeReal = (() => {
+    try { return realpathSync.native(home); } catch { return home; }
+  })();
+  const components = real.split(path.sep);
+  for (const comp of components) {
+    if (WEAVEPDF_URL_BLOCKED_BASENAMES.has(comp)) return false;
+  }
+  // Hard system paths.
+  for (const blocked of ["/etc", "/private/etc", "/System", "/usr", "/bin", "/sbin"]) {
+    if (real === blocked || real.startsWith(blocked + path.sep)) return false;
+  }
+  // App's own data — never let a `weavepdf://` URL touch it.
+  const userData = policyRealPath(app.getPath("userData"));
+  if (isInsidePath(real, userData)) return false;
+  const appSupport = path.join(homeReal, "Library", "Application Support");
+  if (isInsidePath(real, appSupport)) return false;
+  const libraryKeychains = path.join(homeReal, "Library", "Keychains");
+  if (isInsidePath(real, libraryKeychains)) return false;
+
+  // 4. Allowed roots.
+  const allowedRoots = [
+    path.join(homeReal, "Desktop"),
+    path.join(homeReal, "Documents"),
+    path.join(homeReal, "Downloads"),
+    path.join(homeReal, "Movies"),
+    path.join(homeReal, "Music"),
+    path.join(homeReal, "Pictures"),
+    path.join(homeReal, "Public"),
+    path.join(homeReal, "Library", "Mobile Documents"), // iCloud Drive
+    "/Volumes",
+    "/tmp", // some workflows pipe via /tmp; ext check above limits damage
+    os.tmpdir(),
+  ];
+  return allowedRoots.some((root) => isInsidePath(real, root));
 }
 
 const MAX_SIGNATURE_DATA_URL_BYTES = 5 * 1024 * 1024;
@@ -506,33 +611,39 @@ group.wait()
       try {
         return safeStorage.decryptString(await readFile(enc));
       } catch {
-        // Fall through to plain fallback.
-      }
-    }
-    if (existsSync(raw)) {
-      try {
-        return (await readFile(raw)).toString("utf8");
-      } catch {
+        // Decryption failed — Keychain rejected, item missing, or build
+        // identity changed. Don't fall through to a plaintext fallback;
+        // surface null so the user re-creates the signature with the new
+        // signing identity.
         return null;
       }
+    }
+    // Legacy plain signature.raw from V1.0019 and earlier — refuse + delete.
+    // V1.0020 no longer writes this fallback; old builds may have left one.
+    if (existsSync(raw)) {
+      await unlink(raw).catch(() => {});
     }
     return null;
   });
 
   ipcMain.handle(IpcChannel.SignatureSet, async (_e, dataUrl: string): Promise<void> => {
     assertSignatureDataUrl(dataUrl);
-    if (safeStorage.isEncryptionAvailable()) {
-      await writeFile(sigEncPath(), safeStorage.encryptString(dataUrl));
-      // Clean up any stale plain copy so we don't mix states.
-      await unlink(sigRawPath()).catch(() => {});
-    } else {
-      // Keychain unavailable (common on ad-hoc-signed Electron builds).
-      // Write plain bytes with restrictive 0600 perms so only this user can
-      // read it. The signature image isn't more sensitive than other files
-      // in Application Support — acceptable fallback.
-      await writeFile(sigRawPath(), dataUrl, { mode: 0o600 });
-      await unlink(sigEncPath()).catch(() => {});
+    // V1.0020: refuse to persist a signature without Keychain. A captured
+    // handwritten signature is a meaningful identity asset; keeping it on
+    // disk in plaintext (even with 0o600) puts it one Time-Machine-restore
+    // away from another user/device. If Keychain isn't available, surface
+    // a clear error so the renderer can prompt the user to fix their
+    // signing identity rather than silently downgrading their security.
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error(
+        "Cannot save signature without Keychain encryption. " +
+          "If WeavePDF is ad-hoc signed, run `bash scripts/setup-local-signing.sh` " +
+          "and reinstall, then try again.",
+      );
     }
+    await writeFile(sigEncPath(), safeStorage.encryptString(dataUrl));
+    // Clean up any stale plain copy from older builds.
+    await unlink(sigRawPath()).catch(() => {});
   });
 
   ipcMain.handle(IpcChannel.SignatureClear, async (): Promise<void> => {
@@ -944,9 +1055,26 @@ group.wait()
         // Block every outbound request. The HTML can still reference local
         // images/fonts via file://, which are technically intercepted too —
         // textutil embeds images inline as data: URLs, so this is fine.
+        // V1.0020: tightened from prefix-startsWith to exact-equality check
+        // on the URL pathname so a malicious HTML can't smuggle
+        // `file:///tmp/weavepdf-doc2pdf-XXXX/out.html?../../../etc/passwd`
+        // past the filter (the substring check would have accepted it).
+        const allowedFileUrl = "file://" + htmlPath;
         hidSession.webRequest.onBeforeRequest((details, cb) => {
-          const ok = details.url.startsWith("data:") || details.url.startsWith("file://" + htmlPath);
-          cb({ cancel: !ok });
+          if (details.url.startsWith("data:")) return cb({ cancel: false });
+          try {
+            const parsed = new URL(details.url);
+            // Compare normalised pathname; rejects query/fragment-smuggled paths.
+            if (parsed.protocol === "file:" && parsed.pathname === htmlPath && !parsed.search && !parsed.hash) {
+              return cb({ cancel: false });
+            }
+          } catch {
+            // Malformed URL → block.
+          }
+          // Defensive: accept the literal expected URL even if URL parsing
+          // changes shape across Electron versions.
+          if (details.url === allowedFileUrl) return cb({ cancel: false });
+          cb({ cancel: true });
         });
         hidden.webContents.on("will-navigate", (ev) => ev.preventDefault());
         hidden.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
@@ -1396,12 +1524,16 @@ function compareSemver(a: string, b: string): number {
 
 async function fetchLatestRelease(): Promise<ReleaseInfo | null> {
   const url = `https://api.github.com/repos/${UPDATE_REPO_OWNER}/${UPDATE_REPO_NAME}/releases/latest`;
+  // V1.0020: 10s timeout. Without this, a slow/hung GitHub request leaves
+  // the silent startup poll dangling forever and a manual "Check for
+  // Updates" never resolves.
   const res = await fetch(url, {
     headers: {
       Accept: "application/vnd.github+json",
       "User-Agent": UPDATE_USER_AGENT,
       "X-GitHub-Api-Version": "2022-11-28",
     },
+    signal: AbortSignal.timeout(10_000),
   });
   if (!res.ok) {
     // 404 = no releases yet (repo is fresh). Treat as "no update available"
@@ -1420,6 +1552,19 @@ async function fetchLatestRelease(): Promise<ReleaseInfo | null> {
   };
   if (json.draft || json.prerelease) return null;
   if (!json.tag_name || !json.html_url) return null;
+  // V1.0020: belt-and-braces. We control the repo, so a hostile html_url
+  // shouldn't appear, but if a future GitHub response drift includes a
+  // redirect-style html_url field, we don't want to launch the user's
+  // browser at an arbitrary host. Verify the host looks like GitHub.
+  let htmlHost: string;
+  try {
+    htmlHost = new URL(json.html_url).hostname;
+  } catch {
+    return null;
+  }
+  if (htmlHost !== "github.com" && !htmlHost.endsWith(".github.com")) {
+    return null;
+  }
   return {
     tag: json.tag_name,
     htmlUrl: json.html_url,
@@ -2037,6 +2182,11 @@ async function runCli(args: string[]): Promise<number> {
     const password = passwordArg === "-"
       ? readFileSync(0, "utf8").split(/\r?\n/, 1)[0] ?? ""
       : passwordArg;
+    // V1.0020: parity with the encrypt path. qpdf's `--password-file=-`
+    // reads stdin until EOF and treats embedded \n as part of the password,
+    // but a multi-line password trips qpdf's own argv parsing in
+    // edge cases. Reject newlines outright — same rule encrypt enforces.
+    assertQpdfArgSafe(password, "PDF password");
     await new Promise<void>((resolve, reject) => {
       const child = spawn(bin, ["--password-file=-", "--decrypt", "--", input, output]);
       child.stdin.end(password + "\n");
@@ -2132,16 +2282,49 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
   if (parsed.protocol !== "weavepdf:") return;
 
   const verb = parsed.host;
-  const paths = (parsed.searchParams.get("paths") ?? "")
+  const allowedVerbs = new Set(["compress", "extract-first", "rotate", "convert", "combine"]);
+  if (!allowedVerbs.has(verb)) {
+    console.error(`[weavepdf://] unknown verb: ${verb}`);
+    logFinderSync(`unknown verb: ${verb} — abort`);
+    return;
+  }
+  const rawPaths = (parsed.searchParams.get("paths") ?? "")
     .split("|")
     .filter(Boolean)
     .map((p) => decodeURIComponent(p));
 
+  // V1.0020 hardening: any process on the Mac can dispatch a `weavepdf://`
+  // URL and macOS will route it to us. Filter every path through
+  // isSafeWeavePdfPath BEFORE any I/O — rejects sensitive locations
+  // (~/.ssh, ~/.aws, /etc, /System, /Library/Keychains, app userData),
+  // wrong extensions, and non-existent files. The Finder Sync extension
+  // already pre-filters by extension, but we don't trust the URL source.
+  const paths: string[] = [];
+  const rejected: string[] = [];
+  for (const p of rawPaths) {
+    if (isSafeWeavePdfPath(p)) paths.push(p);
+    else rejected.push(p);
+  }
+  if (rejected.length) {
+    logFinderSync(`rejected ${rejected.length} unsafe path(s): ${rejected.join(", ")}`);
+    // Surface to the user so a real Finder Sync invocation that hit a
+    // sensitive path doesn't fail silently.
+    const target = getActiveWindow();
+    if (target) {
+      void dialog.showMessageBox(target, {
+        type: "warning",
+        message: "WeavePDF rejected an unsafe file path",
+        detail: `One or more paths were outside your normal document folders or pointed at sensitive system locations. WeavePDF only acts on PDFs and images in places like Desktop, Documents, Downloads, iCloud Drive, and external volumes.\n\nRejected:\n${rejected.slice(0, 5).join("\n")}${rejected.length > 5 ? `\n…and ${rejected.length - 5} more` : ""}`,
+        buttons: ["OK"],
+      });
+    }
+  }
+
   logFinderSync(`url verb=${verb} paths=${paths.length}: ${paths.join(", ")}`);
 
   if (paths.length === 0) {
-    console.error(`[weavepdf://] verb=${verb} has no paths`);
-    logFinderSync(`verb=${verb} has no paths — abort`);
+    console.error(`[weavepdf://] verb=${verb} has no (safe) paths`);
+    logFinderSync(`verb=${verb} has no safe paths — abort`);
     return;
   }
 

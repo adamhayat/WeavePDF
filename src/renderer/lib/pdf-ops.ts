@@ -1143,12 +1143,37 @@ export async function redactRegion(
  *   - external URL: /Subtype /Link, /A action with /S /URI + /URI(...)
  *   - intra-document: /Subtype /Link, /A action with /S /GoTo + /D [page /Fit]
  */
+// V1.0020 hardening: defensive URL scheme allowlist for Link annotations.
+// LinkPopover already validates user input, but addLinkAnnotation can be
+// called from any future code path (palette macros, batch ops, etc.); this
+// is the chokepoint where the URL becomes a baked-in PDF object that
+// downstream readers (Preview, Adobe, browsers) will follow.
+const LINK_ANNOTATION_ALLOWED_SCHEMES = new Set(["http:", "https:", "mailto:"]);
+function assertSafeLinkUrl(rawUrl: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new Error("Link URL is not a valid URL");
+  }
+  if (!LINK_ANNOTATION_ALLOWED_SCHEMES.has(parsed.protocol)) {
+    throw new Error(
+      `Link URL scheme not allowed: ${parsed.protocol} (only http, https, and mailto)`,
+    );
+  }
+}
+
 export async function addLinkAnnotation(
   base: Uint8Array,
   page: number,
   rect: { x: number; y: number; width: number; height: number },
   target: { kind: "url"; url: string } | { kind: "page"; pageNumber: number },
 ): Promise<Uint8Array> {
+  if (target.kind === "url") {
+    // Re-validate at the chokepoint; UI already checks, but a future caller
+    // shouldn't be able to forge a `javascript:` / `file:` link annotation.
+    assertSafeLinkUrl(target.url);
+  }
   const doc = await load(base);
   const pages = doc.getPages();
   if (page < 1 || page > pages.length) {

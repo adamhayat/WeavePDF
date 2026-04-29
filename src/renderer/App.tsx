@@ -1,7 +1,7 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useHotkeys } from "react-hotkeys-hook";
 import { useTheme } from "./hooks/useTheme";
-import { useDocumentStore } from "./stores/document";
+import { rebasePendingEditSeq, useDocumentStore } from "./stores/document";
 import { useUIStore } from "./stores/ui";
 import { pdfjsLib, initPdfWorker } from "./lib/pdfjs";
 // pdf-ops is lazy-loaded at use sites so the pdf-lib chunk (~425 KB) doesn't
@@ -351,6 +351,19 @@ export function App() {
         numPages: pdf.numPages,
       });
 
+      // V1.0020: rebase the per-process pending-edit sequence above every
+      // restored createdAt BEFORE re-adding them, so brand-new edits made
+      // in this session sort AFTER the restored ones for undo. Without
+      // this, ⌘Z would peel off a restored sticky/shape instead of the
+      // most recent freshly-drawn one (the new one starts at seq=1, the
+      // restored ones carry seq=15..47 from the previous session).
+      const allCreatedAt: Array<number | undefined> = [
+        ...m.pendingTextEdits.map((t) => (t as PendingTextEdit).createdAt),
+        ...m.pendingImageEdits.map((i) => (i as PendingImageEdit).createdAt),
+        ...m.pendingShapeEdits.map((s) => (s as PendingShapeEdit).createdAt),
+      ];
+      rebasePendingEditSeq(...allCreatedAt);
+
       // Replay pending overlays so the user sees exactly what they left.
       const store = useDocumentStore.getState();
       for (const t of m.pendingTextEdits as PendingTextEdit[]) {
@@ -405,6 +418,12 @@ export function App() {
       }
 
       let bytes = payload.bytes;
+      // V1.0020: explicit flag instead of `bytes === payload.bytes` identity
+      // check below. The identity comparison silently flipped to `false` if
+      // anyone added a defensive `bytes = bytes.slice()` above this line —
+      // and that would have routed the next ⌘S over the encrypted original
+      // with the unencrypted copy (Critical Rule #6 violation).
+      let wasDecrypted = false;
       let pdf;
       try {
         pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
@@ -424,13 +443,14 @@ export function App() {
         });
         if (!decrypted) return; // user canceled
         bytes = decrypted;
+        wasDecrypted = true;
         pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
       }
       addTab({
         name: payload.name,
         // Decrypted files drop the original path so ⌘S routes to Save-As —
         // prevents overwriting the encrypted original with an unencrypted copy.
-        path: bytes === payload.bytes ? payload.path : null,
+        path: wasDecrypted ? null : payload.path,
         sizeBytes: bytes.byteLength,
         bytes,
         pdf,
@@ -1340,14 +1360,6 @@ export function App() {
             onSubmit={runEncrypt}
           />
         )}
-        <PasswordModalWrapper
-          prompt={passwordPrompt}
-          busy={passwordBusy}
-          error={passwordError}
-          setPrompt={setPasswordPrompt}
-          setBusy={setPasswordBusy}
-          setError={setPasswordError}
-        />
         {!!passwordPrompt && (
           <PasswordModal
             open={true}
@@ -1457,37 +1469,6 @@ function ContextMenuHost() {
       onClose={close}
     />
   );
-}
-
-// If the component tree unmounts while a password prompt is pending (e.g.
-// tab close, tab switch that removed the parent), the prompt's resolver
-// would never fire and loadAsTab would hang forever. This host component
-// exists purely to reject the pending promise on unmount.
-function PasswordModalWrapper({
-  prompt,
-  setPrompt,
-  setBusy,
-  setError,
-}: {
-  prompt: { bytes: Uint8Array; name: string; resolve: (b: Uint8Array | null) => void } | null;
-  busy: boolean;
-  error: string | null;
-  setPrompt: (p: null) => void;
-  setBusy: (b: boolean) => void;
-  setError: (e: string | null) => void;
-}) {
-  useEffect(() => {
-    return () => {
-      if (prompt) {
-        prompt.resolve(null);
-        setPrompt(null);
-        setBusy(false);
-        setError(null);
-      }
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  return null;
 }
 
 const toArrayBuffer = u8ToAb;

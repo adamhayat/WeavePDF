@@ -139,9 +139,13 @@ const config: ForgeConfig = {
       [FuseV1Options.RunAsNode]: false,
       [FuseV1Options.EnableCookieEncryption]: true,
       [FuseV1Options.EnableNodeOptionsEnvironmentVariable]: false,
-      // Left ON so Playwright can attach via --inspect. Local-only personal app;
-      // revisit if we ever distribute publicly.
-      [FuseV1Options.EnableNodeCliInspectArguments]: true,
+      // V1.0020: ON only for Playwright test builds (VITE_E2E=1). Production
+      // DMGs we hand to friends ship with --inspect disabled, since anyone
+      // able to launch the binary could otherwise attach a debugger to the
+      // main process and call Node primitives (child_process.exec etc.)
+      // that bypass the entire IPC allowlist.
+      // Re-enable for tests with: `npm run package:test` (sets VITE_E2E=1).
+      [FuseV1Options.EnableNodeCliInspectArguments]: process.env.VITE_E2E === "1",
       [FuseV1Options.EnableEmbeddedAsarIntegrityValidation]: true,
       [FuseV1Options.OnlyLoadAppFromAsar]: true,
     }),

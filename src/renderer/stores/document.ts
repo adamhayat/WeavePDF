@@ -180,6 +180,22 @@ function nextPendingEditOrder(): number {
   return pendingEditSeq;
 }
 
+/**
+ * Bump the global pendingEditSeq counter so it sits ABOVE every value in the
+ * argument list. Called by the draft-restore path so newly-created edits
+ * after a restore get higher createdAt numbers than the restored ones —
+ * keeps undo order correct.
+ *
+ * Without this, a fresh-process pendingEditSeq starts at 0 and a brand-new
+ * edit gets createdAt=1, sorting it BEFORE every restored edit (which carry
+ * createdAt values from the previous session, e.g. 15, 23, 47). ⌘Z would
+ * then peel off a restored edit instead of the new one.
+ */
+export function rebasePendingEditSeq(...values: Array<number | undefined>): void {
+  const max = values.reduce<number>((acc, v) => (typeof v === "number" && v > acc ? v : acc), 0);
+  if (max > pendingEditSeq) pendingEditSeq = max;
+}
+
 function hasPendingEdits(tab: DocumentTab): boolean {
   return (
     tab.pendingTextEdits.length > 0 ||

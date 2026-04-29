@@ -5,7 +5,32 @@
 
 ## Current State
 
-**Status:** **V1.0019 — Beta distribution: GitHub Releases publishing + in-app "Check for Updates…".** Wired up the Tier-1 distribution path (manual updates, no Apple Developer ID needed yet):
+**Status:** **V1.0020 — Pre-distribution security + quality hardening.** Ran 4 specialist code reviews (security, TypeScript quality, performance, simplicity) and applied every Critical / High / actionable Medium / Low finding. Two big buckets:
+
+**Security hardening:**
+- **`weavepdf://` URL handler** now validates every path through `isSafeWeavePdfPath()`: must realpath inside an allowlisted user root (Desktop/Documents/Downloads/iCloud/Volumes/Movies/Music/Pictures/Public/tmp), must NOT be inside a sensitive subtree (~/.ssh, ~/.aws, ~/.gnupg, /etc, /System, /Library/Keychains, app userData), must have an allowed extension. Closes the "any process can dispatch `weavepdf://compress?paths=/Users/adam/.ssh/id_rsa`" hole. Rejected paths surface a native warning dialog.
+- **Verb allowlist** at the top of the handler — only `compress / extract-first / rotate / convert / combine` accepted; unknown verbs logged + rejected.
+- **doc2pdf hidden-window URL filter** — tightened from `startsWith` substring to exact-equality URL comparison so a hostile HTML can't smuggle `?../../../etc/passwd` past the prefix.
+- **Bless-path TOCTOU closed** — `blessPath` now stores both lexical-resolved AND realpath; `assertBlessed` checks both. Symlink swap between dialog and read no longer bypasses the allowlist.
+- **`addLinkAnnotation`** re-validates URL schemes (http/https/mailto only) at the pdf-ops chokepoint, not just in the LinkPopover UI. Future callers (palette macros, batch ops) can't forge `javascript:` / `file:` link annotations.
+- **Plaintext signature fallback removed** — `safeStorage` unavailability now throws an actionable error pointing the user at `setup-local-signing.sh` instead of silently writing a 0o600 plaintext signature image.
+- **`EnableNodeCliInspectArguments`** Forge fuse now flips OFF for production DMG packaging (`process.env.VITE_E2E !== "1"`); ON only for `npm run package:test`. Distributed binaries can no longer be `--inspect`-attached to bypass IPC.
+- **GitHub release htmlUrl** validated as a `github.com` host before being passed to `shell.openExternal`. Belt-and-braces against future API drift.
+- **`--cli decrypt` password** now goes through `assertQpdfArgSafe` like `--cli encrypt` already did. No newline-injected smuggling.
+
+**TypeScript quality:**
+- Removed dead `PasswordModalWrapper` host-component noise.
+- Replaced fragile `bytes === payload.bytes` decryption identity check with explicit `wasDecrypted` flag (Critical Rule #6 protection).
+- Fixed `pendingEditSeq` collision on draft restore — `rebasePendingEditSeq()` lifts the per-process counter above every restored `createdAt` so new edits sort AFTER restored ones for undo. Closes the "⌘Z removes a restored sticky instead of the new one" bug.
+- GitHub update poll now has `AbortSignal.timeout(10_000)` so a hung GitHub doesn't dangle the silent startup poll forever.
+
+**Simplicity wins (dead code):**
+- Deleted `src/renderer/components/CompressSheet/` (~183 LOC). Only `CompressModal` is wired.
+- Removed `IpcChannel.ConfirmBeforeClose` (declared, never handled, never called).
+
+**Deferred (perf refactors):** Viewer/Sidebar virtualization (the perf reviewer's #1 + #2 wins). They'd deliver order-of-magnitude improvements on 50+ page PDFs but are big enough to risk destabilizing the app before this beta. Documented for a future session.
+
+**V1.0019 base (carried forward):** Beta distribution: GitHub Releases publishing + in-app "Check for Updates…". Wired up the Tier-1 distribution path (manual updates, no Apple Developer ID needed yet):
 1. **`npm run release`** ([scripts/publish-release.mjs](scripts/publish-release.mjs)) — runs `npm run make` to build the DMG + ZIP, extracts the `V1.<patch>` block from CHANGELOG.md as release notes, calls `gh release create vX.Y.Z` to publish to `github.com/adamhayat/WeavePDF`. Zero new npm deps — uses the `gh` CLI you already have authenticated. Preflight checks: clean working tree, gh authed, tag not already on origin. Override dirty with `WEAVEPDF_DIRTY_OK=1`. Draft release with `--draft`.
 2. **Help → Check for Updates…** + silent startup auto-poll (5s after window load) — fetches `api.github.com/repos/adamhayat/WeavePDF/releases/latest`, semver-compares to the running version, opens the GitHub release page if a newer version is available. Manual mode shows a dialog regardless of result; auto-poll is silent unless an update exists. Native macOS dialog with **Download** / **Later** buttons; Download opens the release page in the user's browser.
 
@@ -425,6 +450,43 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0020: pre-distribution security + quality hardening
+
+User: "Apply all fixes necessary, we need to make sure its stable and safe for others to use." Ran 4 specialist code reviews in parallel (security-sentinel, kieran-typescript-reviewer, performance-oracle, code-simplicity-reviewer) right before broader beta distribution. Applied every Critical / High / actionable-Medium / Low finding from security and TS quality. Deferred the big perf refactors (Viewer/Sidebar virtualization) as too risky for "stability" scope right now.
+
+**Security fixes:**
+1. **H1 — `weavepdf://` path validation.** Any process on macOS can dispatch a `weavepdf://compress?paths=/Users/adam/.ssh/id_rsa` URL and macOS routes it to WeavePDF. Pre-V1.0020 the handler shelled out to Ghostscript with the path as both input AND output, overwriting in place. Added `isSafeWeavePdfPath()` — realpath must live in a user-document root (Desktop/Documents/Downloads/iCloud/Pictures/Movies/Music/Public/Volumes/tmp), must NOT live in a sensitive subtree (~/.ssh, ~/.aws, ~/.gnupg, /etc, /System, /Library/Keychains, /Library/Application Support, app userData, /usr, /bin, /sbin, /private/etc), must have an allowed extension. Plus verb allowlist at handler entry. Rejected paths surface a native dialog.
+2. **H2 — doc2pdf URL filter substring bug.** The `webRequest.onBeforeRequest` filter for the hidden HTML→PDF window used `details.url.startsWith("file://" + htmlPath)` which passed `file://.../out.html?../../../etc/passwd`. Tightened to URL-parse + exact pathname equality + reject non-empty search/hash.
+3. **M1 — `addLinkAnnotation` URL scheme allowlist.** Pre-V1.0020 the renderer's LinkPopover validated http/https/mailto, but `addLinkAnnotation` itself accepted any string. A future palette/batch caller could have forged a `javascript:` link annotation. Added `assertSafeLinkUrl` chokepoint inside the primitive.
+4. **M2 — bless-path TOCTOU.** `blessPath()` stored only `path.resolve(p)` (lexical). An attacker could swap the path to a symlink between user dialog selection and renderer read. `blessPath` now stores both lexical AND realpath; `assertBlessed` checks both. `policyRealPath` walk now hard-capped at 64 iterations.
+5. **M3 — plaintext signature fallback removed.** `SignatureSet` previously wrote `signature.raw` (0o600 plaintext) when `safeStorage.isEncryptionAvailable()` was false. A captured signature image is a meaningful identity asset; one Time Machine restore from any user account would expose it. V1.0020 throws an actionable error referring the user to `setup-local-signing.sh`. `SignatureGet` now refuses the legacy fallback and deletes any leftover `signature.raw`.
+6. **L1 — `EnableNodeCliInspectArguments` fuse OFF for prod.** Anyone able to launch the binary could `--inspect`-attach to the main process and call `child_process.exec` to bypass the entire IPC allowlist. Now: `process.env.VITE_E2E === "1"` only — Playwright `npm run package:test` keeps it on; production DMGs ship without it.
+7. **L3 — update poll htmlUrl host check.** `fetchLatestRelease()` now verifies `new URL(json.html_url).hostname` ends with `github.com` before passing to `shell.openExternal`.
+
+**TypeScript critical/high fixes:**
+8. **Critical-1: dead PasswordModalWrapper deleted.** It mounted unconditionally (always, not just when a prompt was active) AND captured its `prompt` prop in a `[]`-deps useEffect cleanup, making the cleanup a no-op forever. The actual prompt clearing happens in PasswordModal's own `onCancel`/`onSubmit`.
+9. **Critical-2: `--cli decrypt` password sanitization.** Now goes through `assertQpdfArgSafe` like `encrypt`. No newline-injected qpdf argv smuggling.
+10. **Critical-3: `bytes === payload.bytes` identity check replaced.** Was deciding whether to keep the source path (for ⌘S targeting) based on referential equality with the input bytes. A future defensive `bytes = bytes.slice()` would silently flip the comparison and start overwriting encrypted originals with plaintext. Now an explicit `wasDecrypted` boolean.
+11. **High-4: `pendingEditSeq` rebase on draft restore.** Per-process counter started at 0 every launch; restored edits carry their previous-session createdAt (e.g. 15..47). New edits made after restore got createdAt=1 and sorted BEFORE all restored ones, so ⌘Z peeled off a restored sticky instead of the freshly-drawn shape. Added exported `rebasePendingEditSeq(...createdAts)` and called it from the draft replay path.
+12. **High-7: GitHub update fetch 10s timeout.** `AbortSignal.timeout(10_000)` so a hung GitHub doesn't leave the silent startup poll dangling forever or block "Check for Updates" indefinitely.
+
+**Dead code removed:**
+13. **`src/renderer/components/CompressSheet/`** deleted (~183 LOC). Only `CompressModal` is wired in App.tsx; CompressSheet was an earlier iteration left in the tree.
+14. **`IpcChannel.ConfirmBeforeClose`** removed from `src/shared/ipc.ts`. Declared, never handled, never called — a hanging-future footgun for any caller that hit it.
+
+**Deferred (intentional — beyond "stable + safe" scope):**
+- Perf O1+O2: Viewer renders all N PageCanvas components for an N-page PDF; PendingTextLayer/ImageLayer/ShapeLayer subscribe to the whole active tab. Order-of-magnitude wins available via virtualization + per-page selectors. Risk of destabilizing the rendering pipeline under time pressure — saving for a dedicated perf session.
+- Perf O4: Sidebar thumbnail virtualization. Same risk reasoning.
+- Perf O3: passwordRetry path doesn't `pdf.destroy()` the pre-throw proxy — minor; pdf.js cleans these up on GC.
+- Larger simplicity refactors (consolidating 19 modal flag triplets into a single union) — high churn, low payoff in this turn.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.20`.
+- Repackaged + reinstalled `/Applications/WeavePDF.app` (with `EnableNodeCliInspectArguments: false` since `VITE_E2E` is unset).
+- Bumped V1.0019 → V1.0020 per Critical Rule #12.
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) (bless realpath, isSafeWeavePdfPath, weavepdf:// path filter + verb allowlist + rejection dialog, doc2pdf URL filter, signature fallback removed, --cli decrypt password sanitization, update fetch timeout + htmlUrl host check), [src/renderer/lib/pdf-ops.ts](src/renderer/lib/pdf-ops.ts) (assertSafeLinkUrl), [src/renderer/App.tsx](src/renderer/App.tsx) (wasDecrypted flag, PasswordModalWrapper deletion, rebasePendingEditSeq import + call), [src/renderer/stores/document.ts](src/renderer/stores/document.ts) (rebasePendingEditSeq export), [src/shared/ipc.ts](src/shared/ipc.ts) (ConfirmBeforeClose removed), [forge.config.ts](forge.config.ts) (inspect fuse env-gated), [src/renderer/components/CompressSheet/](src/renderer/components/CompressSheet/) (deleted), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0019: GitHub Releases publish flow + in-app Check for Updates
 
