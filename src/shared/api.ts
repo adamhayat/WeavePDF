@@ -8,6 +8,8 @@ import type {
   OpenFileDialogOptions,
   OpenFileDialogResult,
   OpenedFile,
+  PrintOptions,
+  PrinterInfo,
   SaveFileDialogOptions,
   SaveFileDialogResult,
   WriteFileResult,
@@ -28,15 +30,18 @@ export interface WeavePDFApi {
    *  close / before-quit handler can show an "unsaved changes" dialog. */
   notifyDirtyTabs: (names: string[]) => void;
   /** V1.0021: print clean PDF bytes via hidden BrowserWindow. Caller bakes
-   *  pending overlays + applies n-up layout first; this just shows the
-   *  native macOS print dialog for the supplied PDF. `documentName` is
-   *  used as the print-job title (and influences the macOS default header).
-   *  Returns ok:true if the user actually printed; ok:false if they hit
-   *  Cancel; ok:false + error for actual failures. */
+   *  pending overlays + applies n-up layout first. V1.0028 adds PrintOptions —
+   *  with options provided, prints silently via the chosen printer (no
+   *  macOS dialog). Without options, the legacy V1.0021 path runs (shows
+   *  the macOS dialog). `documentName` is the print-job title.
+   *  Returns ok:true if printed; ok:false + error for failures. */
   printPdfBytes: (
     bytes: ArrayBuffer,
     documentName?: string,
+    options?: PrintOptions,
   ) => Promise<{ ok: boolean; error?: string }>;
+  /** V1.0028: list available printers for the unified Print Preview panel. */
+  listPrinters: () => Promise<PrinterInfo[]>;
   getTheme: () => Promise<AppTheme>;
   onThemeUpdated: (cb: (theme: AppTheme) => void) => () => void;
   // Electron 32+ removed File.path for security; use webUtils.getPathForFile

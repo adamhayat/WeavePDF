@@ -830,12 +830,42 @@ group.wait()
   // dialog appears with just the PDF as input. Critically: the user's
   // sidebar thumbnails, toolstrip, and titlebar are NOT in the hidden
   // window's DOM, so they can't bleed into the print output.
+  // V1.0028: list available printers for the unified Print Preview panel.
+  // Uses webContents.getPrintersAsync() — the modern replacement for the
+  // sync getPrinters() API. Returns the same fields macOS exposes via CUPS:
+  // name (CUPS device id, used as deviceName in print() options), displayName
+  // (user-friendly), isDefault (one printer at a time), status (CUPS bitmask).
+  ipcMain.handle(IpcChannel.ListPrinters, async (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return [];
+    try {
+      // Electron's typed PrinterInfo only declares `name` + `displayName`,
+      // but the runtime payload also includes isDefault + status (CUPS).
+      // Cast through unknown so we don't ship a `any`.
+      const list = (await win.webContents.getPrintersAsync()) as unknown as Array<{
+        name: string;
+        displayName?: string;
+        isDefault?: boolean;
+        status?: number;
+      }>;
+      return list.map((p) => ({
+        name: p.name,
+        displayName: p.displayName || p.name,
+        isDefault: !!p.isDefault,
+        status: typeof p.status === "number" ? p.status : 0,
+      }));
+    } catch {
+      return [];
+    }
+  });
+
   ipcMain.handle(
     IpcChannel.PrintPdfBytes,
     async (
       _e,
       bytes: ArrayBuffer,
       documentName?: string,
+      options?: import("../shared/ipc").PrintOptions,
     ): Promise<{ ok: boolean; error?: string }> => {
       if (!bytes || !(bytes instanceof ArrayBuffer)) {
         return { ok: false, error: "no bytes" };
@@ -914,28 +944,42 @@ group.wait()
         // PDFs on Adam's M1 — adjust upward if larger PDFs get clipped.
         await new Promise((r) => setTimeout(r, 1200));
 
-        const printed = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
-          hidden.webContents.print(
-            {
-              silent: false,
+        // V1.0028: when the unified panel passed `options`, print silently
+        // with all settings pre-chosen. Otherwise (legacy path with no
+        // options), show the native macOS dialog as V1.0021 did. This keeps
+        // any future caller that doesn't yet provide options working.
+        const useSilent = !!options?.deviceName;
+        const printOpts: Electron.WebContentsPrintOptions = useSilent
+          ? {
+              silent: true,
               printBackground: false,
-              // Empty header/footer suppresses the default URL/page-name
-              // band macOS otherwise prints in the top + bottom margins.
               header: "",
               footer: "",
-              // Default margins (let macOS pick) so the user's chosen
-              // paper size in the dialog wins.
               margins: { marginType: "default" },
-              // Do not pass deviceName — let user pick in the dialog.
-            },
-            (success, failureReason) => {
-              if (success) return resolve({ ok: true });
-              // "cancelled" is the user hitting Cancel in the system
-              // dialog — that's a normal outcome, not an error.
-              if (failureReason === "cancelled") return resolve({ ok: false });
-              resolve({ ok: false, error: failureReason || "print failed" });
-            },
-          );
+              deviceName: options!.deviceName,
+              color: options!.color,
+              copies: Math.max(1, Math.floor(options!.copies || 1)),
+              duplexMode: options!.duplexMode,
+              landscape: options!.landscape,
+              ...(options!.pageRanges && options!.pageRanges.length > 0
+                ? { pageRanges: options!.pageRanges }
+                : {}),
+            }
+          : {
+              silent: false,
+              printBackground: false,
+              header: "",
+              footer: "",
+              margins: { marginType: "default" },
+            };
+        const printed = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+          hidden.webContents.print(printOpts, (success, failureReason) => {
+            if (success) return resolve({ ok: true });
+            // "cancelled" is the user hitting Cancel in the system
+            // dialog — that's a normal outcome, not an error.
+            if (failureReason === "cancelled") return resolve({ ok: false });
+            resolve({ ok: false, error: failureReason || "print failed" });
+          });
         });
         return printed;
       } catch (err) {
@@ -2642,7 +2686,15 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
   if (parsed.protocol !== "weavepdf:") return;
 
   const verb = parsed.host;
-  const allowedVerbs = new Set(["compress", "extract-first", "rotate", "convert", "combine"]);
+  const allowedVerbs = new Set([
+    "compress",
+    "extract-first",
+    "rotate", // legacy alias for rotate-cw (V1.0014..V1.0027)
+    "rotate-cw",
+    "rotate-ccw",
+    "convert",
+    "combine",
+  ]);
   if (!allowedVerbs.has(verb)) {
     console.error(`[weavepdf://] unknown verb: ${verb}`);
     logFinderSync(`unknown verb: ${verb} — abort`);
@@ -2734,10 +2786,15 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
         await runUnary("extract-first", "-page1", { reveal: true });
         break;
       case "rotate":
-        // In-place: matches Finder's built-in Rotate Quick Action which
-        // overwrites the source. Rotation is metadata-only (no quality loss),
-        // so in-place is the right default.
+      case "rotate-cw":
+        // V1.0028: split into clockwise + counterclockwise. Old "rotate"
+        // alias maps to clockwise for back-compat with V1.0014..V1.0027
+        // dispatch URLs that may be cached in macOS's URL routing.
         await runUnary("rotate", "", { extra: ["90"], inPlace: true, reveal: false });
+        break;
+      case "rotate-ccw":
+        // 270° clockwise = 90° counter-clockwise. Same in-place behaviour.
+        await runUnary("rotate", "", { extra: ["270"], inPlace: true, reveal: false });
         break;
       case "convert":
         await runUnary("image-to-pdf", "", { forceOutputExt: "pdf", reveal: true });

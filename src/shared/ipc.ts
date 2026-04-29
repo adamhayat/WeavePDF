@@ -15,9 +15,14 @@ export const IpcChannel = {
   PrintWindow: "window:print",
   /** V1.0021: prints clean PDF bytes via a hidden BrowserWindow. The
    *  caller is responsible for committing pending overlays and applying any
-   *  n-up layout BEFORE sending bytes here. Shows the native macOS print
-   *  dialog. Works on the document itself, never the surrounding chrome. */
+   *  n-up layout BEFORE sending bytes here. V1.0028 added PrintOptions —
+   *  silent printing with all settings pre-chosen by our unified panel,
+   *  so the macOS native dialog never appears as a second stage. */
   PrintPdfBytes: "print:pdf-bytes",
+  /** V1.0028: list available printers so the unified Print Preview panel
+   *  can let the user pick one. Returns name (CUPS device name used in
+   *  print() options), displayName (user-visible), isDefault. */
+  ListPrinters: "print:list-printers",
   GetAppTheme: "app:get-theme",
   ThemeUpdated: "app:theme-updated",
   WindowMinimize: "window:minimize",
@@ -123,6 +128,42 @@ export type DraftRecord = {
   manifest: DraftManifest;
   /** Null when nothing was committed yet — caller should load the original bytes. */
   currentBytes: ArrayBuffer | null;
+};
+
+/**
+ * V1.0028: PrintOptions for the unified Print Preview panel. The renderer
+ * collects these from its UI and passes them to PrintPdfBytes, which
+ * configures `webContents.print()` with `silent: true` so the macOS dialog
+ * is bypassed entirely (printer + every setting come from our panel).
+ */
+export type PrintOptions = {
+  /** CUPS device name from ListPrinters (the `name` field). Required for
+   *  silent printing — Electron throws if missing or invalid. */
+  deviceName: string;
+  /** true = color, false = mono. Driver may ignore on color-only or
+   *  mono-only printers. */
+  color: boolean;
+  /** 1+ copies. */
+  copies: number;
+  /** Two-sided mode. "simplex" = single-sided. */
+  duplexMode: "simplex" | "shortEdge" | "longEdge";
+  /** Page orientation. We DO bake N-up into the bytes via nUpPages, but
+   *  whether each output sheet should be portrait or landscape is a
+   *  print-driver concern (paper feeding direction). */
+  landscape: boolean;
+  /** Page ranges to print, applied AFTER any baked-in n-up. Empty = all. */
+  pageRanges?: Array<{ from: number; to: number }>;
+};
+
+export type PrinterInfo = {
+  /** CUPS device name — pass this to PrintPdfBytes.options.deviceName. */
+  name: string;
+  /** User-friendly name shown in the picker. */
+  displayName: string;
+  /** True if this is the OS default printer. */
+  isDefault: boolean;
+  /** Status bitmask from CUPS. 0 = idle/ready. */
+  status: number;
 };
 
 export type DigitalCertInfo = {

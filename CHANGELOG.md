@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Added + Fixed — V1.0028: unified Print Preview + split rotate + Finder duplicate-menu fix (2026-04-29)
+- **Unified Print Preview panel** ([src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) + [src/renderer/components/PrintPreviewModal/usePrintReducer.ts](src/renderer/components/PrintPreviewModal/usePrintReducer.ts)). One panel with every print setting (printer, copies, pages range, paper, layout/N-up, orientation, color, two-sided) on the left rail and a live preview on the right. Preview rebuilds on every setting that affects rendering (paper / layout / orientation / pages range), with 120 ms debounce + cancel-token + sequenced pdf.js loading to dodge the worker race. Footer shows total-sheets math (e.g. "12 sheets × 3 = 36"). Print is silent — `webContents.print({ silent: true, deviceName, color, copies, duplexMode, landscape })` — so the macOS native dialog is bypassed entirely. No more two-stage flow with duplicate Layout/Orientation controls.
+- **New IPC `print:list-printers`** ([src/shared/ipc.ts](src/shared/ipc.ts), [src/main/main.ts](src/main/main.ts)) — `webContents.getPrintersAsync()` exposed to the renderer for the Printer dropdown.
+- **`PrintPdfBytes` accepts `options: PrintOptions`** — when `deviceName` is set, prints silently with all settings pre-chosen. Without options, the legacy V1.0021 path runs (system dialog appears) for back-compat.
+- **Rotate split into Clockwise / Counter-clockwise** in the Finder right-click submenu. Two new verbs `rotate-cw` (90°) and `rotate-ccw` (270°); legacy `rotate` aliased to `rotate-cw` for back-compat.
+- **Removed the duplicate "WeavePDF →" entry** in Finder right-click. Pre-V1.0028 we added an explicit `WeavePDF` parent NSMenuItem inside `menu(for:)`, but macOS already auto-wraps every FinderSync extension's items under a parent named after the extension's bundle display name — so the user saw two parents. Now we return items directly; macOS handles the wrapping.
+- **Bumped V1.0027 → V1.0028** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.28`.
+
 ### Fixed + Changed — V1.0027: already-open tab switch + Print Preview simplified + cert-trust setup (2026-04-29)
 - **Reopening a file that's already in a tab now switches to that tab.** Before V1.0027 it re-read from disk and triggered the autosave-restore prompt — the user just wanted the existing tab raised. Now the renderer's `onOpenFilePath` checks for a matching `path` first and calls `setActiveTab` if found.
 - **Print Preview simplified to preview-only.** V1.0021's Layout/Orientation dropdowns duplicated the controls already in the macOS native print dialog, and the values didn't match because our modal baked layout INTO the PDF before the native dialog showed it. Removed our controls; the native dialog now owns all real print options (printer, copies, layout, orientation, paper, duplex, color). Our modal is now just a clean preview (thumbnails left, big page right, Cancel / Print).

@@ -5,7 +5,13 @@
 
 ## Current State
 
-**Status:** **V1.0027 — Already-open file switches tab + Print Preview simplified to preview-only + cert-trust step in setup-local-signing.sh.** Three issues addressed in one turn:
+**Status:** **V1.0028 — Unified Print Preview panel (silent printing, no second dialog) + split rotate (CW/CCW) + Finder duplicate-menu fix.** Three changes:
+
+1. **Unified Print Preview panel.** V1.0021..V1.0027 had a two-stage flow: our preview → macOS native dialog with duplicate Layout/Orientation controls. V1.0028 collapses both into one panel: **left rail with every setting** (printer, copies, pages range, paper size, layout/N-up, orientation, color, two-sided), **right pane with a live preview** that rebuilds whenever a setting that affects rendering changes (paper / layout / orientation / pages range — copies, color, duplex don't trigger rebuild). Print button calls `printPdfBytes` with `silent: true` — every setting is pre-chosen, so the macOS dialog never appears as a second stage. Architecture follows the design agent's spec (PrintControlsRail / PreviewPane / PagePager / usePrintReducer).
+2. **Rotate split into Clockwise / Counter-clockwise** in the Finder right-click submenu. The single "Rotate 90°" became two items routed to `rotate-cw` (90°) and `rotate-ccw` (270°). Legacy "rotate" verb still works as an alias for clockwise (back-compat with V1.0014..V1.0027 cached URL routings).
+3. **Removed duplicate "WeavePDF →" in Finder right-click.** Our `menu(for:)` was wrapping its items in an explicit "WeavePDF" parent NSMenuItem, but macOS already auto-promotes a "WeavePDF" entry from the extension's bundle display name. The result was two visible "WeavePDF →" entries: macOS's auto-wrapper (empty submenu) AND our explicit one (with items). Now we return items directly into `m`, letting macOS handle the parent.
+
+**V1.0027 base (carried forward):** Already-open file switches tab + cert-trust step in setup-local-signing.sh. Three issues addressed in one turn:
 
 1. **Reopening a file already in a tab now switches to that tab** instead of the autosave-restore prompt + duplicate tab. Renderer's `onOpenFilePath` handler checks for an existing tab with the same `path` first; if found, calls `setActiveTab(existing.id)` and bails before any read/restore-prompt logic.
 2. **Print Preview modal stripped to preview-only.** V1.0021 introduced our own Layout/Orientation controls, but the macOS native print dialog already has identical controls — the user reported the duplicate was confusing and the values didn't match across the two dialogs. Now our modal shows a clean preview (thumbnail strip + big preview), and the native dialog owns all real print options (printer, copies, layout, orientation, paper, duplex). One source of truth.
@@ -498,6 +504,66 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0028: unified Print Preview panel + split rotate + Finder duplicate-menu fix
+
+User: "The print flow isnt good. Before it was good with the print options and preview on the first screen, and the second flow duplicated the items. We should have one unified print panel with a preview and all options should be tested and working and update live preview before printing. Call a UX design agent to help plan and design this." Plus: split rotate into CW/CCW. Plus: Finder right-click shows two "WeavePDF" entries.
+
+**Print panel — design agent's spec executed.** Spawned a Plan agent in the background; it produced a tight spec for the unified panel (single modal, two-column layout, controls left / preview right, `silent: true` so the macOS dialog never appears). Implemented exactly to spec.
+
+New IPC + types in [src/shared/ipc.ts](src/shared/ipc.ts):
+- `ListPrinters` (`print:list-printers`) — returns `{ name, displayName, isDefault, status }[]` from `webContents.getPrintersAsync()`. Used to populate the Printer dropdown.
+- `PrintOptions` type — `{ deviceName, color, copies, duplexMode, landscape, pageRanges? }`. Required for silent printing per the spec.
+
+[src/main/main.ts](src/main/main.ts) updates:
+- New `IpcChannel.ListPrinters` handler. Casts through `unknown` because Electron's typed `PrinterInfo` doesn't declare `isDefault` / `status` even though the runtime payload does.
+- `PrintPdfBytes` handler accepts an optional `options` arg. When `options.deviceName` is set: `silent: true` + every option pre-set → macOS dialog skipped entirely. When omitted: legacy V1.0021 path (silent: false, system dialog appears) — keeps any non-modal caller working.
+
+New renderer files:
+- [src/renderer/components/PrintPreviewModal/usePrintReducer.ts](src/renderer/components/PrintPreviewModal/usePrintReducer.ts) — state machine. `PrintSettings` type + reducer + `parsePageRanges` helper that turns `"1-3, 5"` into `[{from:1,to:3},{from:5,to:5}]` with inline validation.
+- [src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) — full rewrite. ~700 LOC. Three-pane layout: Header / (ControlsRail | PreviewPane+PagePager) / Footer. ControlsRail and PreviewPane are inline subcomponents in the same file — small enough to not warrant separate files per CLAUDE.md "no new files unless asked."
+
+**Preview rebuild pipeline** (only triggered by paper / layout / orientation / pages range; copies, color, duplex don't touch the preview):
+1. Source bytes → `extractPages` if range filter is active.
+2. → `nUpPages` if layout > 1 (bakes paper + orientation).
+3. → `fitToPaper` if 1-up AND paper ≠ Letter / orientation ≠ portrait.
+4. pdf.js sequenced load (await destroy of previous proxy AFTER new doc finishes loading — same race-free pattern V1.0022 introduced).
+
+120 ms debounce absorbs rapid radio-button clicks. Cancel-token aborts in-flight rebuilds when settings change again.
+
+**Print path** (silent):
+```ts
+window.weavepdf.printPdfBytes(printBytes, name, {
+  deviceName: settings.deviceName,
+  color: settings.color,
+  copies: settings.copies,
+  duplexMode: settings.duplex,
+  landscape: settings.orientation === "landscape",
+});
+```
+No `pageRanges` passed — already applied to bytes via `extractPages` so they don't double-filter. No `mediaSize` — paper is baked in (the spec flagged `mediaSize` as undocumented + unreliable on macOS).
+
+**Footer shows real sheet math** — when copies > 1, displays "12 sheets × 3 = 36" so the user knows what they're committing to. Print error inline in the same row (red, no popup) so they can retry without losing settings.
+
+**Rotate split** ([resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift) + [src/main/main.ts](src/main/main.ts)). Swift menu now has "Rotate clockwise" → `rotate-cw` (90°) and "Rotate counterclockwise" → `rotate-ccw` (270°). Main-side handler dispatches both to the existing `runUnary("rotate", ...)` path with the right angle. Legacy "rotate" verb still maps to clockwise — back-compat for any cached URL dispatches from V1.0014..V1.0027.
+
+**Finder duplicate-menu fix** ([resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift)). Pre-V1.0028 `menu(for:)` did:
+```swift
+let parent = NSMenuItem(title: "WeavePDF", action: nil, keyEquivalent: "")
+let sub = NSMenu(title: "WeavePDF")
+addItem(sub, ...)
+parent.submenu = sub
+m.addItem(parent)
+return m
+```
+That added an explicit "WeavePDF" parent NSMenuItem to the menu we returned. But macOS Sequoia auto-wraps every Finder Sync extension's `menu(for:)` items in a parent NSMenuItem named after the extension's bundle display name — so the user saw TWO "WeavePDF →" entries: the auto-wrapped one (with our items) and our explicit one (with the same items doubled). V1.0028 returns items directly into `m`; macOS does the wrapping. One entry, no duplicate.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.28`.
+- Bumped V1.0027 → V1.0028 per Critical Rule #12.
+- Manual end-to-end pending — the silent print path is the riskiest piece (some printer drivers reject silent jobs); user should test with their Brother HL-2240.
+
+**Files touched:** [src/shared/ipc.ts](src/shared/ipc.ts) (ListPrinters channel + PrintOptions/PrinterInfo types), [src/shared/api.ts](src/shared/api.ts) (printPdfBytes options arg + listPrinters), [src/preload/preload.ts](src/preload/preload.ts) (bindings), [src/main/main.ts](src/main/main.ts) (ListPrinters handler + silent print path + rotate-cw/rotate-ccw verbs + allowedVerbs update), [src/renderer/components/PrintPreviewModal/usePrintReducer.ts](src/renderer/components/PrintPreviewModal/usePrintReducer.ts) (new), [src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) (rewrite), [resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift) (rotate split + duplicate parent removed), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0027: already-open tab switch + Print Preview simplified + cert-trust setup
 

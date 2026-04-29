@@ -39,11 +39,20 @@ const api: WeavePDFApi = {
     }>,
   printWindow: () => ipcRenderer.invoke(IpcChannel.PrintWindow) as Promise<void>,
   notifyDirtyTabs: (names) => ipcRenderer.send(IpcChannel.NotifyDirtyTabs, names),
-  printPdfBytes: (bytes, documentName) =>
-    ipcRenderer.invoke(IpcChannel.PrintPdfBytes, bytes, documentName) as Promise<{
+  printPdfBytes: (bytes, documentName, options) =>
+    ipcRenderer.invoke(
+      IpcChannel.PrintPdfBytes,
+      bytes,
+      documentName,
+      options,
+    ) as Promise<{
       ok: boolean;
       error?: string;
     }>,
+  listPrinters: () =>
+    ipcRenderer.invoke(IpcChannel.ListPrinters) as ReturnType<
+      WeavePDFApi["listPrinters"]
+    >,
   getTheme: () => ipcRenderer.invoke(IpcChannel.GetAppTheme) as Promise<AppTheme>,
   onThemeUpdated: (cb) => {
     const listener = (_e: unknown, theme: AppTheme) => cb(theme);

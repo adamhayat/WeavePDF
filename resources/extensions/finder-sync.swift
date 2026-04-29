@@ -6,12 +6,13 @@
 // Finder, then a "WeavePDF" entry with a hover submenu appears in the Finder
 // right-click context menu for PDFs and supported image types.
 //
-// Submenu items (5):
-//   - Compress         — PDF only
-//   - Combine into PDF — 2+ files of any supported type
-//   - Convert to PDF   — image only
-//   - Extract first page — PDF only
-//   - Rotate 90°       — PDF only
+// Submenu items (6):
+//   - Compress              — PDF only
+//   - Combine into PDF      — 2+ files of any supported type
+//   - Convert to PDF        — image only
+//   - Extract first page    — PDF only
+//   - Rotate clockwise      — PDF only (90° clockwise)
+//   - Rotate counterclockwise — PDF only (90° counter-clockwise)
 //
 // IPC architecture: macOS pkd requires app extensions to be sandboxed. A
 // sandboxed extension cannot spawn arbitrary child processes (which the
@@ -50,27 +51,30 @@ class FinderSync: FIFinderSync {
 
     override func menu(for menuKind: FIMenuKind) -> NSMenu {
         let m = NSMenu(title: "")
+        m.autoenablesItems = false
         guard menuKind == .contextualMenuForItems else { return m }
 
         let urls = FIFinderSyncController.default().selectedItemURLs() ?? []
         let ok = urls.filter { FinderSync.supported.contains($0.pathExtension.lowercased()) }
         guard !ok.isEmpty else { return m }
 
-        let parent = NSMenuItem(title: "WeavePDF", action: nil, keyEquivalent: "")
-        let sub = NSMenu(title: "WeavePDF")
-        sub.autoenablesItems = false
-
         let pdfCount = ok.filter { $0.pathExtension.lowercased() == "pdf" }.count
         let imgCount = ok.filter { FinderSync.imageOnly.contains($0.pathExtension.lowercased()) }.count
 
-        addItem(sub, "Compress", #selector(compressAction(_:)), enabled: pdfCount > 0)
-        addItem(sub, "Combine into PDF", #selector(combineAction(_:)), enabled: ok.count >= 2)
-        addItem(sub, "Convert to PDF", #selector(convertAction(_:)), enabled: imgCount > 0)
-        addItem(sub, "Extract first page", #selector(extractAction(_:)), enabled: pdfCount > 0)
-        addItem(sub, "Rotate 90°", #selector(rotateAction(_:)), enabled: pdfCount > 0)
+        // V1.0028: return items directly into the menu macOS provides for our
+        // extension. Previously we added an extra parent NSMenuItem titled
+        // "WeavePDF" with a submenu — but macOS already auto-creates a
+        // "WeavePDF" entry from the extension's bundle display name and
+        // routes our items into ITS submenu. The explicit parent caused a
+        // visible duplicate "WeavePDF →" in the right-click menu (one with
+        // empty submenu, one with our items).
+        addItem(m, "Compress", #selector(compressAction(_:)), enabled: pdfCount > 0)
+        addItem(m, "Combine into PDF", #selector(combineAction(_:)), enabled: ok.count >= 2)
+        addItem(m, "Convert to PDF", #selector(convertAction(_:)), enabled: imgCount > 0)
+        addItem(m, "Extract first page", #selector(extractAction(_:)), enabled: pdfCount > 0)
+        addItem(m, "Rotate clockwise", #selector(rotateClockwiseAction(_:)), enabled: pdfCount > 0)
+        addItem(m, "Rotate counterclockwise", #selector(rotateCounterclockwiseAction(_:)), enabled: pdfCount > 0)
 
-        parent.submenu = sub
-        m.addItem(parent)
         return m
     }
 
@@ -109,8 +113,12 @@ class FinderSync: FIFinderSync {
         dispatch(verb: "extract-first", urls: selectedExt(["pdf"]))
     }
 
-    @objc func rotateAction(_ sender: AnyObject?) {
-        dispatch(verb: "rotate", urls: selectedExt(["pdf"]))
+    @objc func rotateClockwiseAction(_ sender: AnyObject?) {
+        dispatch(verb: "rotate-cw", urls: selectedExt(["pdf"]))
+    }
+
+    @objc func rotateCounterclockwiseAction(_ sender: AnyObject?) {
+        dispatch(verb: "rotate-ccw", urls: selectedExt(["pdf"]))
     }
 
     // MARK: - URL-scheme dispatcher
