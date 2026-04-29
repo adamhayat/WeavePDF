@@ -5,7 +5,15 @@
 
 ## Current State
 
-**Status:** **V1.0034 — Hotfix: Finder Convert works again with notification fallback.** V1.0033 introduced a quiet distributed-notification path for warm Finder actions so Show Desktop would not collapse, but the user's live report came back immediately: **Convert to PDF no longer converted images from the right-click menu.**
+**Status:** **V1.0035 — Spurious "Restore unsaved work?" suppressed + FillableBanner surfaces FormFillModal for AcroForm PDFs.** Two user-reported issues:
+
+1. **"Restore unsaved work?" appearing without changes.** User opened a fillable PDF (`2026-CCC-Credit-Card-Authorization-Form-fillable.pdf`), made no intentional edits, closed, reopened — got prompted to restore "1 shape" autosave. Cause: the V0.6 autosave persisted ANY pending overlay (`pendingShapeEdits.length > 0` etc.) even without a committed history. A single accidental click on a fillable PDF's annotation layer (form widgets sit on top of our PageCanvas pointer handler) could create a 1-shape pending edit that got autosaved as a draft. Fix in V1.0035 [src/renderer/hooks/useDraftPersistence.ts](src/renderer/hooks/useDraftPersistence.ts): autosave now requires `tab.history.length > 0` (a committed change via `applyEdit`). Pending overlays alone don't get persisted. The V1.0026 close-confirm dialog still warns the user on intentional close (it checks `tab.dirty` which IS set by addPendingShapeEdit), so they can save first if they actually want to keep a pending overlay.
+
+2. **No discoverable form-fill UX for AcroForm PDFs.** WeavePDF has a working `FormFillModal` (lists fields, lets the user type values, writes back via `setFormFields`) but the user didn't know it existed. Fix in V1.0035: new [src/renderer/components/FillableBanner/FillableBanner.tsx](src/renderer/components/FillableBanner/FillableBanner.tsx). On every active-tab change runs `getFormFields(tab.bytes)`; if any fields detected, shows a banner above the toolstrip: "This is a fillable PDF. N form fields detected. [Fill form] [Don't suggest again] [×]". Click "Fill form" → opens FormFillModal. Per-tab dismissal + global suppress flag in localStorage. Lazy-loads `pdf-ops` so boot bundle stays small for read-only viewing.
+
+In-place form-widget rendering (typing directly on the page where the field IS) is still pending — substantial feature, V1.0036+. V1.0035 banner unblocks usability today.
+
+**V1.0034 base (carried forward):** Hotfix: Finder Convert works again with notification fallback. V1.0033 introduced a quiet distributed-notification path for warm Finder actions so Show Desktop would not collapse, but the user's live report came back immediately: **Convert to PDF no longer converted images from the right-click menu.**
 
 Root cause: `finder-sync.swift` posted the notification and returned as soon as `isParentRunning()` was true. On the real Finder Sync path, the notification did not reach WeavePDF's bridge, so there was no conversion and no fallback.
 

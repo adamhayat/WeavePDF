@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed + Added — V1.0035: spurious "Restore unsaved work?" suppressed + FillableBanner for AcroForm PDFs (2026-04-29)
+- **No more spurious restore prompts.** Autosave now requires a committed change (`tab.history.length > 0`) before persisting a draft — pure pending overlays alone (e.g. an accidental shape from clicking a fillable PDF's annotation layer) no longer trigger a draft. User reported the prompt firing on a fillable PDF where no intentional edits were made; that's resolved. The V1.0026 close-confirm dialog still warns on intentional close so real pending overlays aren't lost silently.
+- **FillableBanner surfaces FormFillModal for AcroForm PDFs.** New banner ([src/renderer/components/FillableBanner/FillableBanner.tsx](src/renderer/components/FillableBanner/FillableBanner.tsx)) detects form fields on active-tab change via `getFormFields` and shows: "This is a fillable PDF. N form fields detected. [Fill form] [Don't suggest again] [×]". Click "Fill form" → opens the existing FormFillModal which lists each field and writes values back via `setFormFields`. Per-tab dismissal + global localStorage suppress flag. Lazy-loads `pdf-ops` so the boot path stays light.
+- **In-place form-widget rendering** (typing directly on the page where the field is) is still pending — substantial feature, V1.0036+. V1.0035's banner unblocks usability today.
+- **Bumped V1.0034 → V1.0035** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.35`. The autosave change is one condition tightening; the banner is new lazy code with no boot-path impact.
+
 ### Fixed — V1.0034: Convert fallback restored after notification bridge miss (2026-04-29)
 - **Fixed `Convert to PDF` doing nothing from Finder right-click.** V1.0033's warm-app notification path returned immediately after posting to the bridge. On the user's live Finder Sync path, that notification was not reaching WeavePDF, so the action never fell back to the proven `NSWorkspace.open` URL dispatch.
 - **Finder Sync notification dispatch is now acknowledged.** The Swift bridge replies with `ca.adamhayat.weavepdf.finder-action-ack` when it receives a URL. The extension waits up to 250 ms; if no ack arrives, it falls back to `NSWorkspace.open(..., activates: false)`. This restores conversion reliability while still preserving the quiet Show Desktop path when the bridge is working.

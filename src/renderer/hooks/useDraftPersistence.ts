@@ -43,14 +43,18 @@ export function useDraftPersistence(): void {
       }
       lastKey.current.set(tab.id, tab.draftKey);
 
-      // Skip clean tabs that have nothing worth restoring (no edits, no
-      // pending overlays, no history) — saves IO for read-only viewing.
-      const hasState =
-        tab.dirty ||
-        tab.history.length > 0 ||
-        tab.pendingTextEdits.length > 0 ||
-        tab.pendingImageEdits.length > 0 ||
-        tab.pendingShapeEdits.length > 0;
+      // V1.0035: only autosave drafts when the user has APPLIED at least
+      // one edit (`tab.history.length > 0`). Pure pending overlays — a
+      // single click that created a tiny shape, an accidental highlight on
+      // a fillable PDF's annotation layer — were noisy: they triggered a
+      // "Restore unsaved work?" prompt on every reopen for changes the
+      // user didn't intend. Real edits get committed via applyEdit, which
+      // grows history; THAT's the signal worth restoring across launches.
+      // Tradeoff: a user who draws a shape, doesn't commit, then walks
+      // away and the laptop dies, won't see the shape back. The V1.0026
+      // close-confirm dialog still warns them on intentional close so
+      // they can save first.
+      const hasState = tab.history.length > 0;
       if (!hasState) {
         // Nuke any stale slot from a previous edit cycle.
         try {

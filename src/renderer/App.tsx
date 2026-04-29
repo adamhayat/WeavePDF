@@ -19,6 +19,7 @@ import { CommandPalette, type PaletteAction } from "./components/CommandPalette/
 import { ContextMenu } from "./components/ContextMenu/ContextMenu";
 import { LinkPopover } from "./components/LinkPopover/LinkPopover";
 import { DefaultPdfBanner } from "./components/DefaultPdfBanner/DefaultPdfBanner";
+import { FillableBanner } from "./components/FillableBanner/FillableBanner";
 
 // Modal components — rendered conditionally based on `*Open` state in the ui
 // store. None of them are visible at boot, so we lazy-load each so its bundle
@@ -1341,6 +1342,7 @@ export function App() {
     <div className="flex h-full flex-col bg-[var(--app-bg)] text-[var(--app-fg)]">
       <Titlebar onOpen={openFile} onSave={() => saveCurrent(false)} onExport={exportCombined} />
       <DefaultPdfBanner />
+      <FillableBanner />
       {hasDocs && activeTab?.bytes && (
         <Toolstrip
           onSave={() => saveCurrent(false)}
