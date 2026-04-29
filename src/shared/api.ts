@@ -24,6 +24,16 @@ export interface WeavePDFApi {
   getDefaultPdfApp: () => Promise<{ isDefault: boolean; currentBundleId: string | null }>;
   setAsDefaultPdfApp: () => Promise<{ ok: boolean; error?: string }>;
   printWindow: () => Promise<void>;
+  /** V1.0021: print clean PDF bytes via hidden BrowserWindow. Caller bakes
+   *  pending overlays + applies n-up layout first; this just shows the
+   *  native macOS print dialog for the supplied PDF. `documentName` is
+   *  used as the print-job title (and influences the macOS default header).
+   *  Returns ok:true if the user actually printed; ok:false if they hit
+   *  Cancel; ok:false + error for actual failures. */
+  printPdfBytes: (
+    bytes: ArrayBuffer,
+    documentName?: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
   getTheme: () => Promise<AppTheme>;
   onThemeUpdated: (cb: (theme: AppTheme) => void) => () => void;
   // Electron 32+ removed File.path for security; use webUtils.getPathForFile

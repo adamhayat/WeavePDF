@@ -9,7 +9,15 @@ export const IpcChannel = {
   OpenSystemSettings: "shell:open-system-settings",
   GetDefaultPdfApp: "app:get-default-pdf-app",
   SetAsDefaultPdfApp: "app:set-as-default-pdf-app",
+  /** Legacy: webContents.print() on the main window. Replaced by PrintPdfBytes
+   *  (which prints a clean PDF via a hidden BrowserWindow) but kept for
+   *  back-compat in case old callers exist. New code should use PrintPdfBytes. */
   PrintWindow: "window:print",
+  /** V1.0021: prints clean PDF bytes via a hidden BrowserWindow. The
+   *  caller is responsible for committing pending overlays and applying any
+   *  n-up layout BEFORE sending bytes here. Shows the native macOS print
+   *  dialog. Works on the document itself, never the surrounding chrome. */
+  PrintPdfBytes: "print:pdf-bytes",
   GetAppTheme: "app:get-theme",
   ThemeUpdated: "app:theme-updated",
   WindowMinimize: "window:minimize",

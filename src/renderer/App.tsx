@@ -80,6 +80,11 @@ const RestoreDraftModal = lazy(() =>
     default: m.RestoreDraftModal,
   })),
 );
+const PrintPreviewModal = lazy(() =>
+  import("./components/PrintPreviewModal/PrintPreviewModal").then((m) => ({
+    default: m.PrintPreviewModal,
+  })),
+);
 const PageLayoutModal = lazy(() =>
   import("./components/PageLayoutModal/PageLayoutModal").then((m) => ({
     default: m.PageLayoutModal,
@@ -216,6 +221,9 @@ export function App() {
   const pageLayoutOpen = useUIStore((s) => s.pageLayoutOpen);
   const openPageLayout = useUIStore((s) => s.openPageLayout);
   const closePageLayout = useUIStore((s) => s.closePageLayout);
+  const printPreviewOpen = useUIStore((s) => s.printPreviewOpen);
+  const openPrintPreview = useUIStore((s) => s.openPrintPreview);
+  const closePrintPreview = useUIStore((s) => s.closePrintPreview);
   const shortcutHelpOpen = useUIStore((s) => s.shortcutHelpOpen);
   const openShortcutHelp = useUIStore((s) => s.openShortcutHelp);
   const closeShortcutHelp = useUIStore((s) => s.closeShortcutHelp);
@@ -592,16 +600,16 @@ export function App() {
     }
   }, [tabs, commitAllPending]);
 
-  const printCurrent = useCallback(async () => {
+  const printCurrent = useCallback(() => {
+    // V1.0021: route to PrintPreviewModal instead of direct
+    // webContents.print() on the main window. The preview modal handles
+    // committing pending overlays, layout selection (1/2/4/6/9 per sheet),
+    // and the actual print via printPdfBytes (which uses a hidden
+    // BrowserWindow → no UI chrome bleeds into the print).
     const at = useDocumentStore.getState().activeTab();
-    if (!at) return;
-    try {
-      if (tabHasPendingEdits(at)) await commitAllPending(at.id);
-      await window.weavepdf.printWindow();
-    } catch (err) {
-      alert(`Print failed: ${(err as Error).message ?? err}`);
-    }
-  }, [commitAllPending]);
+    if (!at?.bytes) return; // no PDF loaded → no-op (don't open empty modal)
+    openPrintPreview();
+  }, [openPrintPreview]);
 
   const deleteSelected = useCallback(async () => {
     if (!activeTab?.bytes || activeTab.selectedPages.size === 0) return;
@@ -748,6 +756,7 @@ export function App() {
     aiOpen ||
     recentDraftsOpen ||
     pageLayoutOpen ||
+    printPreviewOpen ||
     shortcutHelpOpen ||
     welcomeOpen ||
     contextMenuOpen ||
@@ -1389,6 +1398,7 @@ export function App() {
           />
         )}
         {pageLayoutOpen && <PageLayoutModal open={true} onClose={closePageLayout} />}
+        {printPreviewOpen && <PrintPreviewModal open={true} onClose={closePrintPreview} />}
         {shortcutHelpOpen && <ShortcutHelpModal open={true} onClose={closeShortcutHelp} />}
         {welcomeOpen && (
           <WelcomeModal

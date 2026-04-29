@@ -22,6 +22,7 @@ type UIStore = {
   digitalSignOpen: boolean;
   recentDraftsOpen: boolean;
   pageLayoutOpen: boolean;
+  printPreviewOpen: boolean;
   shortcutHelpOpen: boolean;
   welcomeOpen: boolean;
   welcomeInitialStep: 0 | 1;
@@ -119,6 +120,8 @@ type UIStore = {
   closeRecentDrafts: () => void;
   openPageLayout: () => void;
   closePageLayout: () => void;
+  openPrintPreview: () => void;
+  closePrintPreview: () => void;
   openShortcutHelp: () => void;
   closeShortcutHelp: () => void;
   openWelcome: (initialStep?: 0 | 1) => void;
@@ -162,6 +165,7 @@ export const useUIStore = create<UIStore>((set) => ({
   digitalSignOpen: false,
   recentDraftsOpen: false,
   pageLayoutOpen: false,
+  printPreviewOpen: false,
   shortcutHelpOpen: false,
   welcomeOpen: false,
   welcomeInitialStep: 0,
@@ -234,6 +238,8 @@ export const useUIStore = create<UIStore>((set) => ({
   closeRecentDrafts: () => set({ recentDraftsOpen: false }),
   openPageLayout: () => set({ pageLayoutOpen: true }),
   closePageLayout: () => set({ pageLayoutOpen: false }),
+  openPrintPreview: () => set({ printPreviewOpen: true }),
+  closePrintPreview: () => set({ printPreviewOpen: false }),
   openShortcutHelp: () => set({ shortcutHelpOpen: true }),
   closeShortcutHelp: () => set({ shortcutHelpOpen: false }),
   openWelcome: (initialStep = 0) => set({ welcomeOpen: true, welcomeInitialStep: initialStep }),

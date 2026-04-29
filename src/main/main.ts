@@ -569,12 +569,143 @@ group.wait()
   });
 
   ipcMain.handle(IpcChannel.PrintWindow, async (e) => {
-    const w = BrowserWindow.fromWebContents(e.sender);
-    if (!w) return;
-    await new Promise<void>((res) => {
-      w.webContents.print({ silent: false, printBackground: true }, () => res());
-    });
+    // V1.0021: legacy path. New code uses PrintPdfBytes (which prints the
+    // PDF document only, not the app's UI chrome). This handler now does
+    // nothing useful for PDF documents because webContents.print() on the
+    // main window prints the entire renderer DOM (sidebar thumbnails +
+    // toolstrip etc.). Kept as a no-op for back-compat to avoid runtime
+    // errors if any old caller still invokes it.
+    void e;
   });
+
+  // V1.0021: clean PDF print. Caller passes already-laid-out PDF bytes
+  // (overlays committed, n-up applied if requested). We write the bytes to
+  // a temp file, open them in a HIDDEN BrowserWindow that loads only the
+  // PDF — Electron/Chromium renders it with PDFium. Then we call
+  // webContents.print() on that hidden window so the macOS native print
+  // dialog appears with just the PDF as input. Critically: the user's
+  // sidebar thumbnails, toolstrip, and titlebar are NOT in the hidden
+  // window's DOM, so they can't bleed into the print output.
+  ipcMain.handle(
+    IpcChannel.PrintPdfBytes,
+    async (
+      _e,
+      bytes: ArrayBuffer,
+      documentName?: string,
+    ): Promise<{ ok: boolean; error?: string }> => {
+      if (!bytes || !(bytes instanceof ArrayBuffer)) {
+        return { ok: false, error: "no bytes" };
+      }
+      if (bytes.byteLength === 0) return { ok: false, error: "empty bytes" };
+      const buf = Buffer.from(bytes);
+
+      // Use the document name (without .pdf) as the temp filename so macOS
+      // shows a sensible job title in the print queue + dialog. Sanitize
+      // aggressively — only ASCII alphanumerics, dash, underscore, dot.
+      const safeName = (documentName || "document")
+        .replace(/\.pdf$/i, "")
+        .replace(/[^a-zA-Z0-9._-]/g, "_")
+        .slice(0, 100) || "document";
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "weavepdf-print-"));
+      const pdfPath = path.join(tmpDir, `${safeName}.pdf`);
+      await writeFile(pdfPath, buf);
+
+      const hidden = new BrowserWindow({
+        show: false,
+        // Letter at 96 DPI ≈ 816×1056. Comfortable initial render area for
+        // PDFium; doesn't affect what gets printed.
+        width: 816,
+        height: 1056,
+        webPreferences: {
+          // plugins:true enables the bundled PDFium plugin so file://*.pdf
+          // renders cleanly inside the hidden window.
+          plugins: true,
+          // Stay locked down — print path doesn't need any of these.
+          contextIsolation: true,
+          nodeIntegration: false,
+          sandbox: true,
+          javascript: false,
+          webSecurity: true,
+          allowRunningInsecureContent: false,
+          partition: `print-${randomUUID()}`,
+        },
+      });
+
+      // Hard-block any outbound load except the temp PDF itself. If a
+      // hostile PDF tries to phone home through an embedded annotation,
+      // the request is cancelled before it leaves the host.
+      hidden.webContents.session.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
+      const allowedPdfUrl = "file://" + pdfPath;
+      hidden.webContents.session.webRequest.onBeforeRequest((details, cb) => {
+        try {
+          const u = new URL(details.url);
+          if (u.protocol === "file:" && u.pathname === pdfPath) return cb({ cancel: false });
+        } catch {
+          // fall through
+        }
+        if (details.url === allowedPdfUrl) return cb({ cancel: false });
+        // Allow Chromium-internal chrome:// URLs the PDFium UI uses.
+        if (details.url.startsWith("chrome://") || details.url.startsWith("chrome-extension://")) {
+          return cb({ cancel: false });
+        }
+        cb({ cancel: true });
+      });
+      hidden.webContents.on("will-navigate", (ev) => ev.preventDefault());
+      hidden.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+
+      try {
+        await hidden.loadFile(pdfPath);
+        // Title the print job after the doc — macOS uses this in the
+        // print queue + the default page header (when the user has
+        // "Print headers and footers" enabled in the dialog). Cleaner
+        // than the temp file path or generic "untitled".
+        try {
+          hidden.setTitle(safeName);
+        } catch {
+          // Some platforms throw on setTitle for hidden windows; ignore.
+        }
+        // Give PDFium a beat to lay out ALL pages. Without this the
+        // print() call sometimes fires before later pages are composed
+        // and prints a partial doc. 1.2s is comfortable for 100-page
+        // PDFs on Adam's M1 — adjust upward if larger PDFs get clipped.
+        await new Promise((r) => setTimeout(r, 1200));
+
+        const printed = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
+          hidden.webContents.print(
+            {
+              silent: false,
+              printBackground: false,
+              // Empty header/footer suppresses the default URL/page-name
+              // band macOS otherwise prints in the top + bottom margins.
+              header: "",
+              footer: "",
+              // Default margins (let macOS pick) so the user's chosen
+              // paper size in the dialog wins.
+              margins: { marginType: "default" },
+              // Do not pass deviceName — let user pick in the dialog.
+            },
+            (success, failureReason) => {
+              if (success) return resolve({ ok: true });
+              // "cancelled" is the user hitting Cancel in the system
+              // dialog — that's a normal outcome, not an error.
+              if (failureReason === "cancelled") return resolve({ ok: false });
+              resolve({ ok: false, error: failureReason || "print failed" });
+            },
+          );
+        });
+        return printed;
+      } catch (err) {
+        return {
+          ok: false,
+          error: err instanceof Error ? err.message : String(err),
+        };
+      } finally {
+        if (!hidden.isDestroyed()) hidden.destroy();
+        // Don't await — best-effort cleanup, fire and forget.
+        void rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      }
+    },
+  );
 
   ipcMain.handle(IpcChannel.GetAppTheme, (): AppTheme => {
     return nativeTheme.shouldUseDarkColors ? "dark" : "light";

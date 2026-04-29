@@ -5,7 +5,22 @@
 
 ## Current State
 
-**Status:** **V1.0020 — Pre-distribution security + quality hardening.** Ran 4 specialist code reviews (security, TypeScript quality, performance, simplicity) and applied every Critical / High / actionable Medium / Low finding. Two big buckets:
+**Status:** **V1.0021 — Print rebuilt: Preview-app-style modal + clean hidden-window print.** User reported three print bugs in V1.0020:
+1. Printing prints the renderer's UI chrome (sidebar thumbnails, toolstrip) — happened because the old path called `webContents.print()` on the main window which renders the whole DOM.
+2. Only the first page prints.
+3. macOS adds a filename/URL header band in the page margins.
+Plus a feature request: print-preview UI with thumbnails on the left like macOS Preview.app.
+
+**The fix:**
+- **New `print:pdf-bytes` IPC** ([src/main/main.ts](src/main/main.ts)) — writes the print PDF to a temp file, opens it in a HIDDEN BrowserWindow with `plugins: true` (so Chromium's PDFium plugin renders it), then calls `webContents.print()` on that hidden window. The renderer's main window's DOM is never involved → no sidebar/toolstrip in the output. Empty `header`/`footer` strings suppress macOS's default filename band. 1.2s settle delay gives PDFium time to render every page before print fires (closes the "only prints first page" bug). `setTitle(safeName)` makes the print job name human-readable.
+- **New PrintPreviewModal** ([src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx)) modeled on macOS Preview.app's print panel: layout selector + orientation at the top, thumbnail strip on the left (clickable navigation), big page preview on the right, Cancel / Print at the bottom. Layout = 1 / 2 / 4 / 6 / 9 per sheet. Live preview re-renders whenever layout or orientation changes. Re-uses the existing `nUpPages` pdf-ops primitive.
+- **`printCurrent` rewired** ([src/renderer/App.tsx](src/renderer/App.tsx)) — opens the preview modal instead of immediate-printing. `webContents.print()` on the main window is now a no-op for back-compat.
+- **No-bytes guard** — ⌘P / File → Print / palette Print no-ops when the active tab is blank (no PDF loaded), so the modal never opens empty.
+- **Modal added to `featureShortcutBlocked`** — one-key tool shortcuts (T/E/S/I etc.) don't fire while preview is open.
+
+**What this means for users:** ⌘P → preview modal opens → pick layout → Print → native macOS print dialog with the doc's pages and ONLY the doc (no UI chrome, all pages, no filename header). Save-as-PDF from that dialog gives a clean output that can be inspected to verify the fix.
+
+**V1.0020 base (carried forward):** Pre-distribution security + quality hardening. Ran 4 specialist code reviews (security, TypeScript quality, performance, simplicity) and applied every Critical / High / actionable Medium / Low finding. Two big buckets:
 
 **Security hardening:**
 - **`weavepdf://` URL handler** now validates every path through `isSafeWeavePdfPath()`: must realpath inside an allowlisted user root (Desktop/Documents/Downloads/iCloud/Volumes/Movies/Music/Pictures/Public/tmp), must NOT be inside a sensitive subtree (~/.ssh, ~/.aws, ~/.gnupg, /etc, /System, /Library/Keychains, app userData), must have an allowed extension. Closes the "any process can dispatch `weavepdf://compress?paths=/Users/adam/.ssh/id_rsa`" hole. Rejected paths surface a native warning dialog.
@@ -450,6 +465,54 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0021: print rebuilt — Preview-app-style modal + clean hidden-window print
+
+User reported three print bugs after V1.0020 shipped:
+1. "Printing the thumbnails on the side, and half of the first sheet (cut off)"
+2. "Only prints the first page"
+3. "Prints unnecessary things like pdf file name etc"
+Plus: "I like how in the mac Preview app, you get a print preview on the left side of all the pages."
+
+**Root cause of the chrome-in-print bug:** the old `printCurrent` called `window.weavepdf.printWindow()` which fired `webContents.print()` on the MAIN BrowserWindow — that prints the entire renderer DOM, including the Sidebar (thumbnails), Toolstrip, Titlebar, etc. The PDF document itself is just one element in that DOM, so it gets cropped. The "only first page" issue is the same root cause: only the visible viewport renders into the print job.
+
+**Fix architecture:** dedicated print path through a HIDDEN BrowserWindow that loads ONLY the PDF document (no React, no chrome). Chromium's PDFium plugin handles the multi-page render. Then `webContents.print()` on that hidden window prints the clean PDF.
+
+**New IPC: `print:pdf-bytes`** ([src/main/main.ts](src/main/main.ts), [src/shared/ipc.ts](src/shared/ipc.ts), [src/preload/preload.ts](src/preload/preload.ts), [src/shared/api.ts](src/shared/api.ts))
+- Renderer sends ArrayBuffer + optional documentName.
+- Main writes to `os.tmpdir/weavepdf-print-XXXX/<safeName>.pdf` (sanitized doc name = nicer print-job title).
+- Hidden BrowserWindow with `plugins: true`, `javascript: false`, sandboxed, partition isolated, all subresource requests rejected except the temp PDF itself (defense vs. hostile PDF embeds).
+- 1.2 s settle delay so PDFium fully composites every page before print fires (this closes the "only first page" bug — too-short delay was racing the multi-page render).
+- `setTitle(safeName)` renames the print job from "document.pdf" to the actual file's name.
+- `print()` options: `header: ""`, `footer: ""` to suppress macOS's default filename/URL header band; `silent: false` so the user gets the native print dialog; `marginType: "default"` so the user's chosen paper size in the dialog wins.
+- Returns `{ ok, error? }`. `ok: false` with no error = user cancelled in the dialog.
+- Cleanup: temp dir removed in `finally`, hidden window destroyed.
+
+**New PrintPreviewModal** ([src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx))
+- Three-pane layout modeled on macOS Preview.app's print panel:
+  - Top: layout dropdown (1/2/4/6/9 per sheet) + orientation (Auto/Portrait/Landscape).
+  - Left: vertical thumbnail strip — every page of the laid-out doc, click to navigate.
+  - Right: big preview canvas of the selected page, rendered at devicePixelRatio for sharpness.
+  - Bottom: Cancel / Print buttons.
+- On open: bakes pending overlays via existing `commitAllPending` so the preview matches what will print.
+- Layout changes rebuild the preview bytes via `nUpPages` (existing pdf-ops primitive from V0.7) and re-render with pdf.js.
+- Per-tab pdf.js proxy is destroyed on every layout change AND on modal close — no worker leaks per Critical Rule #10.
+- Esc closes (when not mid-print). Backdrop click closes (when not mid-print). Print button shows a spinner while waiting on the dialog.
+- React.lazy + Suspense (joins the existing 18 modal lazy chunks for perf parity).
+
+**Wired into App.tsx:**
+- New ui-store flag `printPreviewOpen` + `openPrintPreview` / `closePrintPreview` actions.
+- `printCurrent` callback now opens the preview modal instead of calling `printWindow()`. Guarded against blank tabs (no PDF → no-op, doesn't open empty modal).
+- Added to `featureShortcutBlocked` predicate so one-key tool shortcuts (T/E/S/H/etc.) don't fire while preview is open.
+- Old `printWindow` IPC kept as a no-op for back-compat (any renderer-side caller that still references it just does nothing instead of erroring).
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.21`.
+- Repackaged + reinstalled `/Applications/WeavePDF.app`.
+- Bumped V1.0020 → V1.0021 per Critical Rule #12.
+- Manual end-to-end verification still pending (user will save-as-PDF from the print dialog and inspect to confirm: all pages present, no chrome, no filename header).
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) (new PrintPdfBytes handler with hidden window + PDFium + empty header/footer + 1.2s settle, old PrintWindow → no-op), [src/shared/ipc.ts](src/shared/ipc.ts) (new PrintPdfBytes channel), [src/shared/api.ts](src/shared/api.ts) (printPdfBytes signature), [src/preload/preload.ts](src/preload/preload.ts) (printPdfBytes binding), [src/renderer/App.tsx](src/renderer/App.tsx) (printCurrent rewired, modal lazy-imported, blank-tab guard, featureShortcutBlocked update), [src/renderer/stores/ui.ts](src/renderer/stores/ui.ts) (printPreviewOpen + actions), [src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) (new — 478 LOC), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0020: pre-distribution security + quality hardening
 

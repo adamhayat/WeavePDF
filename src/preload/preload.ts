@@ -38,6 +38,11 @@ const api: WeavePDFApi = {
       error?: string;
     }>,
   printWindow: () => ipcRenderer.invoke(IpcChannel.PrintWindow) as Promise<void>,
+  printPdfBytes: (bytes, documentName) =>
+    ipcRenderer.invoke(IpcChannel.PrintPdfBytes, bytes, documentName) as Promise<{
+      ok: boolean;
+      error?: string;
+    }>,
   getTheme: () => ipcRenderer.invoke(IpcChannel.GetAppTheme) as Promise<AppTheme>,
   onThemeUpdated: (cb) => {
     const listener = (_e: unknown, theme: AppTheme) => cb(theme);
