@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0025: file-open works again after closing the last window with X (2026-04-29)
+- **Root cause of the entire focus-bug saga.** Closing the last window via the red X kept WeavePDF running but with zero windows (standard macOS behavior). Subsequent double-clicks on a PDF in Finder fired `app.on("open-file")` → `queueOrSendOpen(path)` → `getActiveWindow()` returned null → path was queued in `pendingOpenFiles` → **nothing created a new window to drain the queue**. PDF appeared not to open at all.
+- **Fix** ([src/main/main.ts](src/main/main.ts) `queueOrSendOpen`): after pushing to the queue in the no-target branch, if `BrowserWindow.getAllWindows().length === 0`, call `createMainWindow()`. The new window's existing `did-finish-load` handler drains `pendingOpenFiles` automatically. Same fallback `app.on("activate")` already does for Dock-icon clicks; the file-open path was just missing it.
+- **Why V1.0014–V1.0024's layered focus tricks didn't help here:** they all assumed a window existed to focus. With zero windows, `bringWindowForward` was never even reached. Those layers remain valuable for legitimate background-focus / Show-Desktop / Space-mismatch cases.
+- **Bumped V1.0024 → V1.0025** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.25`.
+
 ### Fixed — V1.0024: defeat macOS "Show Desktop" gesture on file-open (2026-04-29)
 - **Show Desktop (Fn key, Globe key, top-right hot corner) was the missed scenario.** V1.0023 fixed normal-backgrounded focus, but Show Desktop slides every window off-screen via a Mission Control transform that `app.focus()`/`setAlwaysOnTop`/AppleScript activate don't undo. The app activated correctly but the window stayed at its slid-off position; user saw nothing.
 - **Fix in [src/main/main.ts](src/main/main.ts) `bringWindowForward`:** before the focus pulse, capture `target.getBounds()` and check intersection against every display via `screen.getAllDisplays()`. If fully off-screen → reposition to a centered rect on the primary display's work area (forces a hard reposition that breaks the Show Desktop transform). If on-screen → re-`setBounds(originalBounds)` to break any in-progress slide. AppKit no-ops if the rect didn't change at the system level, so this is cheap when nothing's wrong.

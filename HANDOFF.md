@@ -5,7 +5,13 @@
 
 ## Current State
 
-**Status:** **V1.0024 — Defeat macOS "Show Desktop" gesture (Fn key / hot-corner) on file-open.** I reproduced V1.0023 + traced via `/tmp/weavepdf-quickaction.log` — V1.0023 actually works for normal "WeavePDF in background" cases (focused=true after the pulse). User then clarified the actual scenario: they trigger macOS's **Show Desktop** (Fn / Globe key OR top-right hot-corner) which slides every window off-screen via a system animation. When they double-click the PDF after that, WeavePDF's app activates correctly but the window stays at its slid-off position because Show Desktop's transform isn't undone by `app.focus()`/`setAlwaysOnTop`/AppleScript activate.
+**Status:** **V1.0025 — File-open works again after closing the last window with X.** User dug deeper into the focus complaints and found the real issue: it's not Show Desktop or background focus — it's that **closing the last window via the red X "swallows" all subsequent file-open events**. macOS keeps the app running with zero windows; `queueOrSendOpen` saw `target = null` from `getActiveWindow()`, queued the file path into `pendingOpenFiles`, but never created a window to drain it. Path sat in the queue forever until the user manually re-opened a window via the Dock click or ⌘N.
+
+**Fix in [src/main/main.ts](src/main/main.ts) `queueOrSendOpen`:** if there are zero windows when a file-open event arrives, push the path to `pendingOpenFiles` AND call `createMainWindow()`. The new window's existing `did-finish-load` handler drains `pendingOpenFiles` for us — same path as the cold-start drain. This mirrors the existing `app.on("activate")` behaviour for Dock-icon clicks; the file-open path was just missing the same fallback.
+
+This single fix probably explains the entire saga of focus reports — every "WeavePDF didn't come to front" complaint where the user had previously closed all windows would actually have been "WeavePDF received the file but had no window to put it in." The Show-Desktop / background-focus tricks (V1.0014–V1.0024) all assumed a window existed; if not, they no-oped.
+
+**V1.0024 base (carried forward):** Defeat macOS "Show Desktop" gesture + AppleScript activate + retry loop + cross-Space visibility — still useful for the legitimate background-focus cases. I reproduced V1.0023 + traced via `/tmp/weavepdf-quickaction.log` — V1.0023 actually works for normal "WeavePDF in background" cases (focused=true after the pulse). User then clarified the actual scenario: they trigger macOS's **Show Desktop** (Fn / Globe key OR top-right hot-corner) which slides every window off-screen via a system animation. When they double-click the PDF after that, WeavePDF's app activates correctly but the window stays at its slid-off position because Show Desktop's transform isn't undone by `app.focus()`/`setAlwaysOnTop`/AppleScript activate.
 
 **Fix in [src/main/main.ts](src/main/main.ts) `bringWindowForward`:** before the focus pulse, query the window's current bounds and check whether they intersect any display. If fully off-screen (Show Desktop active), reposition to the center of the primary display's work area. If on-screen but possibly slid mid-animation, re-`setBounds` with the captured bounds to break the in-progress transform (no-op when nothing's actually moving). Logs the bounds before AND after the pulse so we can see the reposition in `/tmp/weavepdf-quickaction.log`.
 
@@ -480,6 +486,30 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0025: ROOT CAUSE found — file-open after last-window-close was a dead-end queue
+
+User figured out the actual bug after a full chain of false leads (V1.0014..V1.0024 focus tricks): "I think i found the issue. its not related to show desktop. basically when I click it and it opens, then i click 'X' to exit out, then try opening a new file, it wont open." Confirmed by reading the code path:
+
+1. User clicks the red X → `BrowserWindow.close()` runs → window destroyed → app keeps running on macOS (per the `window-all-closed` handler that bails out on darwin).
+2. User double-clicks a PDF in Finder → `app.on("open-file")` fires → calls `queueOrSendOpen(filePath)`.
+3. `queueOrSendOpen` calls `getActiveWindow()` (focused → first → null). With zero windows, this returns null.
+4. `queueOrSendOpen` falls through the `if (target && ready)` branch and pushes to `pendingOpenFiles` → exits.
+5. **Nothing creates a new window.** The path sits in the queue. The PDF appears to "not open."
+
+The misleading symptom: from the user's perspective WeavePDF was unresponsive. They (and I) interpreted it as a focus bug — the file appeared to open but the window wasn't visible. Actually the file DIDN'T open; we'd just been queueing without draining.
+
+**Fix in [src/main/main.ts](src/main/main.ts) `queueOrSendOpen`:** after pushing to `pendingOpenFiles` in the no-target branch, check `BrowserWindow.getAllWindows().length === 0` and call `createMainWindow()` if true. The new window's `did-finish-load` handler already drains `pendingOpenFiles` — same code path as cold-start. This mirrors what `app.on("activate")` already does for Dock-icon clicks; the file-open path just hadn't been wired to the same fallback.
+
+**Logging extended** to include `windowCount=N` in the `queueOrSendOpen` trace line and `→ no windows; creating one to drain the queue` when the new fallback fires. So if it ever misbehaves again, the trace shows whether a window was created.
+
+**Why V1.0014–V1.0024 didn't catch this:** every fix in that range assumed a window existed to focus. With zero windows, `bringWindowForward` was never even called (the `if` branch wasn't reached). All those layered fixes are still useful for the legitimate "window exists but is backgrounded / on another Space / off-screen" cases — they just couldn't help when there was nothing to bring forward in the first place.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.25`.
+- Bumped V1.0024 → V1.0025 per Critical Rule #12.
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) (`queueOrSendOpen` create-on-empty fallback + windowCount trace), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0024: defeat macOS "Show Desktop" gesture on file-open
 

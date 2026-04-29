@@ -269,14 +269,24 @@ function queueOrSendOpen(filePath: string): void {
   // V1.0023: detailed logging so we can debug "opens but didn't focus"
   // reports without screen-recording. Drops to /tmp/weavepdf-quickaction.log.
   logFinderSync(
-    `queueOrSendOpen ${filePath} — target=${target ? "yes" : "no"} ready=${ready}`,
+    `queueOrSendOpen ${filePath} — target=${target ? "yes" : "no"} ready=${ready} windowCount=${BrowserWindow.getAllWindows().length}`,
   );
   if (target && ready) {
     target.webContents.send(IpcChannel.OpenFilePath, filePath);
     bringWindowForward(target);
-  } else {
-    pendingOpenFiles.push(filePath);
-    logFinderSync(`  → queued (pending=${pendingOpenFiles.length})`);
+    return;
+  }
+  // V1.0025: if there are NO windows (user closed the last one with the
+  // red X — macOS keeps the app running but with zero windows), queueing
+  // the path was a dead-end — nothing would drain it. Create a fresh
+  // window; its did-finish-load handler drains pendingOpenFiles for us.
+  // This matches the existing app.on("activate") behaviour for dock-icon
+  // clicks; we just hadn't wired the same fallback into the file-open path.
+  pendingOpenFiles.push(filePath);
+  logFinderSync(`  → queued (pending=${pendingOpenFiles.length})`);
+  if (BrowserWindow.getAllWindows().length === 0) {
+    logFinderSync(`  → no windows; creating one to drain the queue`);
+    createMainWindow();
   }
 }
 
