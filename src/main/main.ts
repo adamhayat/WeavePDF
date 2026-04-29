@@ -40,6 +40,21 @@ function getActiveWindow(): BrowserWindow | null {
 // once the renderer signals it's listening.
 const pendingOpenFiles: string[] = [];
 
+// Hoisted high so the early helpers (queueOrSendOpen, bringWindowForward)
+// can call it. The Finder Sync extension dispatches via this same log path
+// for `weavepdf://` URL invocations — sharing one file means the user can
+// share /tmp/weavepdf-quickaction.log and we get a unified trace of every
+// open-file / right-click event the app handled.
+const FINDER_SYNC_LOG = "/tmp/weavepdf-quickaction.log";
+function logFinderSync(line: string): void {
+  try {
+    const stamp = new Date().toISOString();
+    appendFileSync(FINDER_SYNC_LOG, `[${stamp}] ${line}\n`);
+  } catch {
+    // Logging is best-effort; ignore if /tmp is wedged.
+  }
+}
+
 // Allowlist of filesystem paths the renderer is permitted to read or write
 // via fs:read-file / fs:write-file / shell:show-in-folder. Paths are only
 // added here by main-process flows the user initiated: dialog selections,
@@ -250,11 +265,18 @@ function queueOrSendOpen(filePath: string): void {
   // that arrive while window A is focused land as a tab in A, not in some
   // arbitrary other window. Defaults to a tab in whichever window is on top.
   const target = getActiveWindow();
-  if (target && !target.webContents.isLoading()) {
+  const ready = !!target && !target.webContents.isLoading();
+  // V1.0023: detailed logging so we can debug "opens but didn't focus"
+  // reports without screen-recording. Drops to /tmp/weavepdf-quickaction.log.
+  logFinderSync(
+    `queueOrSendOpen ${filePath} — target=${target ? "yes" : "no"} ready=${ready}`,
+  );
+  if (target && ready) {
     target.webContents.send(IpcChannel.OpenFilePath, filePath);
     bringWindowForward(target);
   } else {
     pendingOpenFiles.push(filePath);
+    logFinderSync(`  → queued (pending=${pendingOpenFiles.length})`);
   }
 }
 
@@ -284,9 +306,25 @@ function bringWindowForward(target: BrowserWindow): void {
   target.moveTop();
   if (process.platform !== "darwin") return;
 
+  logFinderSync(
+    `bringWindowForward — focused=${target.isFocused()} visible=${target.isVisible()} minimized=${target.isMinimized()}`,
+  );
+
   // Un-hide the app if it was hidden via ⌘H. show() is a no-op when not
   // hidden, safe to always call.
   app.show?.();
+
+  // V1.0023: bring to front across ALL macOS Spaces during the pulse.
+  // Without this, the window comes forward only on its own Space — if the
+  // user happens to be on a different Space (or in a different Stage
+  // Manager group), the window is "in front" but not visible to them.
+  // Capture prior state so we restore it after the pulse.
+  const wasVisibleOnAllWorkspaces = target.isVisibleOnAllWorkspaces();
+  try {
+    target.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+  } catch {
+    // Some old Electron versions throw if the window isn't fullscreen-able.
+  }
 
   // Force the window above EVERYTHING for a beat. screen-saver level beats
   // every normal stacking — including focus-stealing prevention. Briefly
@@ -298,16 +336,44 @@ function bringWindowForward(target: BrowserWindow): void {
   target.focus();
   target.moveTop();
 
+  // V1.0023: AppleScript activation as the FINAL, most reliable focus
+  // primitive on macOS. `app.focus({ steal: true })` is documented as a
+  // hint and macOS's WindowServer can ignore it under load (Spaces switch,
+  // active input in another app, recent activation policy changes). The
+  // `osascript activate` call goes through NSWorkspace which is the same
+  // path the dock icon uses — macOS treats this as a user-initiated
+  // activation and won't reject it.
+  try {
+    spawn("osascript", ["-e", 'tell application "WeavePDF" to activate'], {
+      detached: true,
+      stdio: "ignore",
+    }).unref();
+  } catch (err) {
+    logFinderSync(`  osascript activate failed: ${err instanceof Error ? err.message : String(err)}`);
+  }
+
   setTimeout(() => {
     if (target.isDestroyed()) return;
     target.setAlwaysOnTop(false);
+    // Restore prior cross-Space behaviour. We only forced it during the
+    // pulse so the user's window-management preferences are preserved.
+    try {
+      target.setVisibleOnAllWorkspaces(wasVisibleOnAllWorkspaces, {
+        visibleOnFullScreen: wasVisibleOnAllWorkspaces,
+      });
+    } catch {
+      // ignore
+    }
     // Re-assert focus once more in case the Space change or app switch ate
     // the first call. moveTop ensures we're at the top of the window stack
     // within the current Space.
     target.focus();
     target.moveTop();
     app.focus({ steal: true });
-  }, 120);
+    logFinderSync(
+      `  after-pulse — focused=${target.isFocused()} visible=${target.isVisible()}`,
+    );
+  }, 200);
 }
 
 async function withTempDir<T>(prefix: string, run: (dir: string) => Promise<T>): Promise<T> {
@@ -2381,21 +2447,6 @@ function uniqueOutputPath(desired: string): string {
   let n = 1;
   while (existsSync(`${stem}-${n}${ext}`)) n++;
   return `${stem}-${n}${ext}`;
-}
-
-// Append-only log for Finder-Sync URL dispatches. Lives at the same path the
-// V1.0001..V1.0004 bash dispatcher used so users with the old workflow file
-// see consistent debug output. Failures of right-click verbs are otherwise
-// invisible (no renderer console for the user, no visible UI feedback for
-// per-file ops like Rotate / Compress / Extract).
-const FINDER_SYNC_LOG = "/tmp/weavepdf-quickaction.log";
-function logFinderSync(line: string): void {
-  try {
-    const stamp = new Date().toISOString();
-    appendFileSync(FINDER_SYNC_LOG, `[${stamp}] ${line}\n`);
-  } catch {
-    // Logging is best-effort; ignore if /tmp is wedged.
-  }
 }
 
 // Handler for `weavepdf://<verb>?paths=<encoded-pipe-list>` URLs dispatched

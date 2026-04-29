@@ -5,7 +5,12 @@
 
 ## Current State
 
-**Status:** **V1.0022 — Print preview hotfix: pdf.js worker race + orientation "Auto" bug.** User reported orientation dropdown did nothing AND 2-per-sheet broke with a "PDFWorker.fromPort - the worker is being destroyed" error. Two real bugs:
+**Status:** **V1.0023 — Bulletproof focus on file-open: AppleScript activate + cross-Space visibility + tracing.** User reported again that opening a PDF (`N10 : N11 Contract.pdf` from Desktop) sometimes opens the file in a backgrounded WeavePDF window — the V1.0017 + V1.0021 stack (always-on-top + 50/120 ms retry) doesn't survive every backgrounded scenario. V1.0023 layers on the most reliable macOS primitive available:
+- **`osascript -e 'tell application "WeavePDF" to activate'`** — AppleScript activation goes through NSWorkspace (the same path the dock icon uses) and macOS treats it as user-initiated, so focus-stealing prevention doesn't fight it. This runs alongside the existing `setAlwaysOnTop("screen-saver")` + `app.focus({ steal: true })` pulse.
+- **`setVisibleOnAllWorkspaces(true)` during the 200 ms pulse** — handles the case where the user's current Space is different from the one WeavePDF lives on. Without this, the window comes "to front" on its own Space but the user doesn't see it. We capture and restore the prior setting after the pulse so we don't permanently change window-management behaviour.
+- **Detailed tracing** — `queueOrSendOpen` and `bringWindowForward` now log every call to `/tmp/weavepdf-quickaction.log` with focus state before and after the pulse. If the focus issue STILL persists, the log will show whether `bringWindowForward` was even invoked + what state the window was in.
+
+**V1.0022 base (carried forward):** Print preview hotfix: pdf.js worker race + orientation "Auto" bug.** User reported orientation dropdown did nothing AND 2-per-sheet broke with a "PDFWorker.fromPort - the worker is being destroyed" error. Two real bugs:
 1. **pdf.js worker destroy race.** Rapid layout/orientation changes triggered overlapping `getDocument()` and `pdf.destroy()` calls against pdf.js's shared worker port. The previous proxy was destroyed BEFORE the new load finished, and pdf.js surfaced this as the worker error. The preview build "failed" so the dropdown looked like a no-op.
 2. **Orientation "Auto" was ignored.** The modal passed `orientation: "auto"` literally to `nUpPages`, and `resolvePaperSize` treats "auto" as "use base orientation of the paper" (portrait Letter for everything). What "Auto" actually means is "use the primitive's `defaultOrient`" — landscape for 2-up, portrait for 4/6/9-up — which only happens when the orientation key is OMITTED. Now the modal drops the key when "Auto" is selected.
 
@@ -471,6 +476,33 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0023: bulletproof file-open focus (AppleScript + cross-Space + tracing)
+
+User: "Try opening N10 / N11 Contract .pdf from my desktop and you will see that it doesnt bring the WeavePDF to the front view of the screen, it opens but without launching and showing the app." Same class of bug we tried to fix in V1.0014 (initial focus call), V1.0016 (50 ms retry), V1.0017 (always-on-top "screen-saver" + 120 ms retry). The previous layers help in some scenarios but don't survive every backgrounded state.
+
+**What was happening:** the open-file event fires correctly, `queueOrSendOpen` sends the IPC to the renderer (so the PDF DOES open as a tab), and `bringWindowForward` fires its sequence. But macOS's WindowServer is silently rejecting the activation under at least one of these conditions:
+- User's current Space is different from the one WeavePDF lives on (always-on-top brings the window forward "on its Space," not necessarily the user's).
+- Stage Manager has the user in a different group.
+- WeavePDF was recently activated/deactivated and the activation policy throttle kicked in.
+- A concurrent app (Slack notification, Calendar reminder) is also fighting for focus.
+
+**Fix in [src/main/main.ts](src/main/main.ts):**
+1. **AppleScript activation:** `spawn("osascript", ["-e", 'tell application "WeavePDF" to activate'])` is the same NSWorkspace activation the dock icon uses — macOS treats it as user-initiated and won't reject it. Detached, unref'd, fire-and-forget. Wrapped in try/catch so a crashed osascript doesn't break the focus path.
+2. **Cross-Space visibility during the pulse:** capture `target.isVisibleOnAllWorkspaces()`, set it to `true` during the 200 ms pulse, restore the original after. The window now appears on the user's CURRENT Space when activated, not just the one it normally lives on. Restoration preserves the user's window-management preferences.
+3. **Pulse extended to 200 ms** (was 120) — gives the WindowServer slightly more headroom to settle the activation across Space changes + osascript dispatch.
+4. **Detailed tracing in `/tmp/weavepdf-quickaction.log`:** every `queueOrSendOpen` call logs the path + whether a target window exists + whether it's loading. Every `bringWindowForward` call logs focus/visible/minimized state before and after the pulse. If focus STILL misses in the wild, the log gives us evidence instead of guesswork.
+5. **Hoisted `FINDER_SYNC_LOG` + `logFinderSync` to the top of main.ts** so the early helpers (queueOrSendOpen, bringWindowForward) can call them. Was previously declared near the bottom — relied on hoisting + run-order to work.
+
+**Why AppleScript and not just `app.focus({steal:true})`:** Electron's `app.focus({steal:true})` calls `[NSApp activateIgnoringOtherApps:YES]` directly. AppleScript's `tell ... to activate` ALSO calls activateIgnoringOtherApps under the hood, but it does so via NSWorkspace.shared which routes through Apple Events — macOS treats Apple-Event-initiated activation as inherently user-driven and applies a different (more permissive) activation policy than direct API calls. The difference matters in edge cases, which is why apps that need bulletproof activation (Zoom, Slack, IDEs) commonly use both.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.23`.
+- Repackaged + reinstalled `/Applications/WeavePDF.app`.
+- Bumped V1.0022 → V1.0023 per Critical Rule #12.
+- User-side verification: open the contract PDF from Desktop while WeavePDF is backgrounded → window should now reliably come to front. If it still doesn't, share `/tmp/weavepdf-quickaction.log` and the trace will show where the activation fell off.
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) (queueOrSendOpen logging, bringWindowForward AppleScript activate + cross-Space visibility + tracing, FINDER_SYNC_LOG/logFinderSync hoisted), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0022: print preview hotfix — pdf.js worker race + orientation Auto bug
 

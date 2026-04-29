@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0023: bulletproof file-open focus on macOS (2026-04-29)
+- **Adds AppleScript activation as the final focus primitive.** `osascript -e 'tell application "WeavePDF" to activate'` goes through NSWorkspace + Apple Events, the same path the dock icon uses. macOS treats this as user-initiated and applies a more permissive activation policy than direct `app.focus({steal:true})` calls — survives Space differences, Stage Manager groups, focus-stealing prevention from concurrent apps.
+- **Window now visible across Spaces during the 200 ms focus pulse.** `setVisibleOnAllWorkspaces(true)` for the duration of the pulse so the user sees the window on their CURRENT Space, not just the one WeavePDF normally lives on. Original setting is restored after the pulse so window-management preferences aren't permanently changed.
+- **Detailed tracing to `/tmp/weavepdf-quickaction.log`** in both `queueOrSendOpen` and `bringWindowForward`. Logs path + target/ready state + window focus/visible/minimized state before and after the pulse. If focus still misses for any user, the log gives evidence (was the dispatch routed correctly? did the pulse fire? did macOS settle on focused state?).
+- **Hoisted log helpers** (`FINDER_SYNC_LOG`, `logFinderSync`) to the top of main.ts so the early file-open path can call them safely.
+- **Bumped V1.0022 → V1.0023** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.23`. Manual verification pending — user should retest the same scenario (open `N10 : N11 Contract.pdf` from Desktop while WeavePDF is in another Space / backgrounded). If focus still misses, the trace log will pinpoint where.
+
 ### Fixed — V1.0022: print preview hotfix — pdf.js worker race + orientation Auto bug (2026-04-29)
 - **pdf.js worker destroy race in PrintPreviewModal.** Rapid layout/orientation toggling caused overlapping `getDocument()` and `pdf.destroy()` against pdf.js's shared worker port, surfacing as `Couldn't build preview: PDFWorker.fromPort - the worker is being destroyed`. Preview reverted to stale state, dropdown looked broken. V1.0022 sequences loads via refs: new doc loads first → state swaps → old doc destroy is awaited AFTER the swap, never racing the worker.
 - **Orientation "Auto" was passed as the literal string "auto"** to `nUpPages`, which `resolvePaperSize` treats as "use base orientation" (portrait Letter for everything) instead of the layout's `defaultOrient` (landscape for 2-up, portrait for 4/6/9-up). Now the modal omits the orientation key when "Auto" is selected so the primitive's smart default kicks in. Explicit Portrait/Landscape still pass through.
