@@ -23,6 +23,11 @@ export const IpcChannel = {
   WindowMinimize: "window:minimize",
   WindowMaximize: "window:maximize",
   WindowClose: "window:close",
+  /** V1.0026: renderer publishes a list of dirty tab names to main on
+   *  every store change. Main keeps a per-window snapshot so the close /
+   *  before-quit hook can show an "unsaved changes" confirmation dialog
+   *  without a synchronous IPC roundtrip (which would deadlock). */
+  NotifyDirtyTabs: "tabs:notify-dirty",
   SignatureGet: "signature:get",
   SignatureSet: "signature:set",
   SignatureClear: "signature:clear",

@@ -5,7 +5,13 @@
 
 ## Current State
 
-**Status:** **V1.0025 — File-open works again after closing the last window with X.** User dug deeper into the focus complaints and found the real issue: it's not Show Desktop or background focus — it's that **closing the last window via the red X "swallows" all subsequent file-open events**. macOS keeps the app running with zero windows; `queueOrSendOpen` saw `target = null` from `getActiveWindow()`, queued the file path into `pendingOpenFiles`, but never created a window to drain it. Path sat in the queue forever until the user manually re-opened a window via the Dock click or ⌘N.
+**Status:** **V1.0026 — Cold-start crash fix + Unsaved Changes confirmation dialog.** Two issues from V1.0025 testing:
+
+1. **JS error dialog on first open after install:** "Cannot create BrowserWindow before app is ready". V1.0025's `createMainWindow()` call in `queueOrSendOpen` fired during cold-start (before `app.whenReady`) when macOS dispatched the open-file event before the app finished initializing. Gated behind `app.isReady()` — when not ready, the path stays queued and the existing whenReady handler creates the window + drains.
+
+2. **New: Unsaved Changes confirmation.** When closing a window (X / ⌘W) or quitting the app (⌘Q) with dirty tabs, a native dialog now lists the affected tab names with **Cancel** / **Close Anyway** (or **Quit Anyway**) buttons. Renderer publishes the dirty list via a new `tabs:notify-dirty` IPC on every store change (deduped to avoid spam); main keeps a per-window snapshot. Quit aggregates across every window into a single combined dialog. Per-window close uses just that window's dirty tabs.
+
+**V1.0025 base (carried forward):** File-open works again after closing the last window with X. User dug deeper into the focus complaints and found the real issue: it's not Show Desktop or background focus — it's that **closing the last window via the red X "swallows" all subsequent file-open events**. macOS keeps the app running with zero windows; `queueOrSendOpen` saw `target = null` from `getActiveWindow()`, queued the file path into `pendingOpenFiles`, but never created a window to drain it. Path sat in the queue forever until the user manually re-opened a window via the Dock click or ⌘N.
 
 **Fix in [src/main/main.ts](src/main/main.ts) `queueOrSendOpen`:** if there are zero windows when a file-open event arrives, push the path to `pendingOpenFiles` AND call `createMainWindow()`. The new window's existing `did-finish-load` handler drains `pendingOpenFiles` for us — same path as the cold-start drain. This mirrors the existing `app.on("activate")` behaviour for Dock-icon clicks; the file-open path was just missing the same fallback.
 
@@ -486,6 +492,33 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0026: cold-start crash fix + Unsaved Changes confirmation
+
+User: "Ok it works but i got this after entering my pw, but it sstill worked" (screenshot of "A JavaScript error occurred in the main process — Cannot create BrowserWindow before app is ready"). And: "can you make it so you get an alert when closing the application, if you have unsaved edits (do it per tab)".
+
+**Bug 1 — cold-start race in V1.0025 fix.** When macOS launches WeavePDF in response to a file double-click, the `open-file` event can fire BEFORE `app.whenReady`. V1.0025's new `createMainWindow()` call in `queueOrSendOpen` then crashed with "Cannot create BrowserWindow before app is ready". The PDF still opened later (whenReady's drain handler caught the queued path), but the user got an alarming JS error dialog.
+
+**Fix:** gate the `createMainWindow()` call behind `app.isReady()`. Pre-ready: queue the path, do nothing else — the whenReady handler creates the window + drains. Post-ready (the actual scenario this fix is for, where the user has closed all windows): create immediately so the queue gets drained.
+
+**Bug 2 — feature: Unsaved Changes confirmation.** Three pieces:
+
+a) **New IPC `tabs:notify-dirty`** ([src/shared/ipc.ts](src/shared/ipc.ts), [src/preload/preload.ts](src/preload/preload.ts), [src/shared/api.ts](src/shared/api.ts)) — renderer-to-main `send` (no response). Renderer publishes a `string[]` of dirty tab names. Main keeps a `Map<windowId, string[]>` snapshot.
+
+b) **Renderer publisher** ([src/renderer/main.tsx](src/renderer/main.tsx)) — subscribes to `useDocumentStore` and re-publishes whenever the joined-name string changes (saves thousands of redundant IPC sends per session). Filters out blank tabs (no bytes) since they can't have real changes.
+
+c) **Main close interceptor** ([src/main/main.ts](src/main/main.ts)) — every BrowserWindow gets a `close` listener that, when fired with non-empty dirty list, calls `event.preventDefault()` and shows a synchronous `dialog.showMessageBoxSync` listing the affected tabs. **Cancel** = stay open; **Close Anyway** = set a per-window skip flag and re-issue `win.close()` via `setImmediate` (synchronous re-close inside the same event would recurse). The skip flag is consumed on the next close so subsequent windows still confirm.
+
+d) **App-quit interceptor** ([src/main/main.ts](src/main/main.ts) `app.on("before-quit")`) — aggregates dirty tab names from every open window into a single dialog ("3 tabs have unsaved changes"). On approval, sets `appQuittingApproved` so individual window close handlers skip their own confirmations as the app tears down.
+
+**Why showMessageBoxSync vs the async variant:** the close event gives us one opportunity to call `preventDefault()`. Going async would mean the event already fired by the time the user picked, and the close would have proceeded. The synchronous variant blocks until the user picks; we can preventDefault accurately.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.26`.
+- Bumped V1.0025 → V1.0026 per Critical Rule #12.
+- Logic walkthrough: blank tab + clean state = no dialog (zero dirty); apply edit → confirmation; cancel = stays open; close anyway = closes; ⌘Q with multiple dirty windows = one combined dialog.
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) (cold-start guard, dirtyTabsByWindowId, close interceptor, before-quit interceptor, NotifyDirtyTabs handler), [src/shared/ipc.ts](src/shared/ipc.ts) (new channel), [src/shared/api.ts](src/shared/api.ts) (new method), [src/preload/preload.ts](src/preload/preload.ts) (binding), [src/renderer/main.tsx](src/renderer/main.tsx) (store subscription + dedup + publish), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0025: ROOT CAUSE found — file-open after last-window-close was a dead-end queue
 

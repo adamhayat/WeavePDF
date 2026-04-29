@@ -38,6 +38,7 @@ const api: WeavePDFApi = {
       error?: string;
     }>,
   printWindow: () => ipcRenderer.invoke(IpcChannel.PrintWindow) as Promise<void>,
+  notifyDirtyTabs: (names) => ipcRenderer.send(IpcChannel.NotifyDirtyTabs, names),
   printPdfBytes: (bytes, documentName) =>
     ipcRenderer.invoke(IpcChannel.PrintPdfBytes, bytes, documentName) as Promise<{
       ok: boolean;

@@ -24,6 +24,9 @@ export interface WeavePDFApi {
   getDefaultPdfApp: () => Promise<{ isDefault: boolean; currentBundleId: string | null }>;
   setAsDefaultPdfApp: () => Promise<{ ok: boolean; error?: string }>;
   printWindow: () => Promise<void>;
+  /** V1.0026: publish the current list of dirty tab names to main so the
+   *  close / before-quit handler can show an "unsaved changes" dialog. */
+  notifyDirtyTabs: (names: string[]) => void;
   /** V1.0021: print clean PDF bytes via hidden BrowserWindow. Caller bakes
    *  pending overlays + applies n-up layout first; this just shows the
    *  native macOS print dialog for the supplied PDF. `documentName` is

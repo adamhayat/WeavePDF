@@ -284,7 +284,14 @@ function queueOrSendOpen(filePath: string): void {
   // clicks; we just hadn't wired the same fallback into the file-open path.
   pendingOpenFiles.push(filePath);
   logFinderSync(`  → queued (pending=${pendingOpenFiles.length})`);
-  if (BrowserWindow.getAllWindows().length === 0) {
+  // V1.0026: only create a window when app.isReady(). The open-file event
+  // fires very early during cold start (before whenReady) — calling
+  // createMainWindow at that point throws "Cannot create BrowserWindow
+  // before app is ready" and the app crashes (visible to the user as a
+  // JS error dialog). On cold start the whenReady handler creates the
+  // first window and drains pendingOpenFiles for us, so this branch is
+  // only needed for the post-close, app-still-running case.
+  if (app.isReady() && BrowserWindow.getAllWindows().length === 0) {
     logFinderSync(`  → no windows; creating one to drain the queue`);
     createMainWindow();
   }
@@ -487,6 +494,17 @@ async function withTempDir<T>(prefix: string, run: (dir: string) => Promise<T>):
   }
 }
 
+// V1.0026: per-window snapshot of dirty tab names. Renderer publishes via
+// the NotifyDirtyTabs IPC on every store change. Used by the close /
+// before-quit handlers to show an "unsaved changes" confirmation dialog.
+const dirtyTabsByWindowId = new Map<number, string[]>();
+// One-shot allow-flag set when the user clicks "Close Anyway" so the
+// preventDefault path lets the actual close go through.
+const skipUnsavedConfirmForWindowId = new Set<number>();
+// Set during app.before-quit so each window's close handler skips its
+// own confirmation (we showed one combined dialog for the quit).
+let appQuittingApproved = false;
+
 function createMainWindow(): BrowserWindow {
   const preloadPath = path.join(__dirname, "preload.js");
 
@@ -512,6 +530,51 @@ function createMainWindow(): BrowserWindow {
 
   win.once("ready-to-show", () => {
     win.show();
+  });
+
+  // V1.0026: intercept window-close to confirm unsaved changes. The
+  // renderer pushes its dirty tab list via NotifyDirtyTabs on every store
+  // change; we keep the latest snapshot and consult it here. preventDefault
+  // aborts the close; once the user accepts via the native dialog, we set
+  // the skip flag and close() again.
+  win.on("close", (event) => {
+    const winId = win.id;
+    if (skipUnsavedConfirmForWindowId.has(winId) || appQuittingApproved) {
+      // The combined-quit dialog already approved or we're past confirm.
+      skipUnsavedConfirmForWindowId.delete(winId);
+      return;
+    }
+    const dirty = dirtyTabsByWindowId.get(winId) ?? [];
+    if (dirty.length === 0) return;
+    event.preventDefault();
+    const choice = dialog.showMessageBoxSync(win, {
+      type: "warning",
+      message:
+        dirty.length === 1
+          ? "“" + dirty[0] + "” has unsaved changes."
+          : `${dirty.length} tabs have unsaved changes.`,
+      detail:
+        dirty.length === 1
+          ? "If you close this window now, your edits will be lost."
+          : "If you close this window now, edits in these tabs will be lost:\n\n• " +
+            dirty.join("\n• "),
+      buttons: ["Cancel", "Close Anyway"],
+      cancelId: 0,
+      defaultId: 0,
+    });
+    if (choice === 1) {
+      skipUnsavedConfirmForWindowId.add(winId);
+      // Re-issue the close after this tick — the current close was
+      // preventDefault'd. Doing it sync inside this handler would recurse.
+      setImmediate(() => {
+        if (!win.isDestroyed()) win.close();
+      });
+    }
+  });
+
+  win.on("closed", () => {
+    dirtyTabsByWindowId.delete(win.id);
+    skipUnsavedConfirmForWindowId.delete(win.id);
   });
 
   // Hardening: any link, window.open, or embedded <webview> in content we
@@ -581,6 +644,19 @@ async function readOpenedFile(filePath: string): Promise<OpenedFile> {
 }
 
 function registerIpc(): void {
+  // V1.0026: receive dirty-tab snapshots from each renderer. Stored
+  // per-window-id so the close + before-quit handlers can show a precise
+  // "unsaved changes" dialog without an async roundtrip during close
+  // (which would force the dialog to be interrupt-able by the close —
+  // worst-of-both-worlds UX).
+  ipcMain.on(IpcChannel.NotifyDirtyTabs, (e, names: unknown) => {
+    if (!Array.isArray(names)) return;
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return;
+    const safe = names.filter((n): n is string => typeof n === "string").slice(0, 200);
+    dirtyTabsByWindowId.set(win.id, safe);
+  });
+
   ipcMain.handle(
     IpcChannel.OpenFileDialog,
     async (e, options: OpenFileDialogOptions | undefined) => {
@@ -2772,4 +2848,48 @@ if (isCliMode) {
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
+});
+
+// V1.0026: ⌘Q / "Quit WeavePDF" with unsaved tabs across one or more
+// windows. We aggregate dirty tab names from every window into a single
+// dialog and then either let the quit proceed (setting appQuittingApproved
+// so the per-window close handlers skip their own confirmation) or cancel.
+app.on("before-quit", (event) => {
+  if (appQuittingApproved) return;
+  const allDirty: string[] = [];
+  for (const win of BrowserWindow.getAllWindows()) {
+    const list = dirtyTabsByWindowId.get(win.id) ?? [];
+    for (const name of list) allDirty.push(name);
+  }
+  if (allDirty.length === 0) return;
+  event.preventDefault();
+  const focused = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+  const choice = focused
+    ? dialog.showMessageBoxSync(focused, {
+        type: "warning",
+        message:
+          allDirty.length === 1
+            ? "“" + allDirty[0] + "” has unsaved changes."
+            : `${allDirty.length} tabs have unsaved changes.`,
+        detail:
+          allDirty.length === 1
+            ? "If you quit now, your edits will be lost."
+            : "If you quit now, edits in these tabs will be lost:\n\n• " +
+              allDirty.join("\n• "),
+        buttons: ["Cancel", "Quit Anyway"],
+        cancelId: 0,
+        defaultId: 0,
+      })
+    : dialog.showMessageBoxSync({
+        type: "warning",
+        message: `${allDirty.length} tab${allDirty.length === 1 ? "" : "s"} with unsaved changes`,
+        detail: allDirty.join("\n• "),
+        buttons: ["Cancel", "Quit Anyway"],
+        cancelId: 0,
+        defaultId: 0,
+      });
+  if (choice === 1) {
+    appQuittingApproved = true;
+    app.quit();
+  }
 });

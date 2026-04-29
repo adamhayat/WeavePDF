@@ -5,6 +5,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed + Added — V1.0026: cold-start crash fix + Unsaved Changes confirmation dialog (2026-04-29)
+- **Fixed cold-start crash** ("A JavaScript error occurred in the main process — Cannot create BrowserWindow before app is ready"). V1.0025's new `createMainWindow()` call inside `queueOrSendOpen` could fire while macOS dispatched the open-file event during cold launch, before `app.whenReady`. Now gated behind `app.isReady()` — pre-ready, the queue + the existing whenReady drain handle it; post-ready (the post-close scenario the fix is for), it creates immediately.
+- **Added Unsaved Changes confirmation dialog.** Closing a window (red X / ⌘W) or quitting the app (⌘Q) with dirty tabs now shows a native dialog listing the affected tab names with **Cancel** / **Close Anyway** (or **Quit Anyway**). App-quit aggregates across every open window into one combined dialog.
+  - New IPC `tabs:notify-dirty` ([src/shared/ipc.ts](src/shared/ipc.ts)) — renderer publishes a `string[]` of dirty tab names; main maintains a `Map<windowId, string[]>` snapshot.
+  - Renderer publisher ([src/renderer/main.tsx](src/renderer/main.tsx)) — subscribes to `useDocumentStore` and re-publishes only when the joined names change (deduped to avoid IPC spam during heavy editing).
+  - Main close + before-quit handlers ([src/main/main.ts](src/main/main.ts)) — synchronous `dialog.showMessageBoxSync` so we can preventDefault accurately. Per-window skip flag + appQuittingApproved flag prevent re-prompting after the user accepts.
+- **Bumped V1.0025 → V1.0026** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.26`.
+
 ### Fixed — V1.0025: file-open works again after closing the last window with X (2026-04-29)
 - **Root cause of the entire focus-bug saga.** Closing the last window via the red X kept WeavePDF running but with zero windows (standard macOS behavior). Subsequent double-clicks on a PDF in Finder fired `app.on("open-file")` → `queueOrSendOpen(path)` → `getActiveWindow()` returned null → path was queued in `pendingOpenFiles` → **nothing created a new window to drain the queue**. PDF appeared not to open at all.
 - **Fix** ([src/main/main.ts](src/main/main.ts) `queueOrSendOpen`): after pushing to the queue in the no-target branch, if `BrowserWindow.getAllWindows().length === 0`, call `createMainWindow()`. The new window's existing `did-finish-load` handler drains `pendingOpenFiles` automatically. Same fallback `app.on("activate")` already does for Dock-icon clicks; the file-open path was just missing it.
