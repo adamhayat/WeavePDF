@@ -34,14 +34,27 @@ fi
 # trust state. Self-signed certs report CSSMERR_TP_NOT_TRUSTED but `codesign`
 # itself accepts them — the trust check is only enforced by the strict -v
 # filter, which is meant for Apple-CA-anchored identities (Developer ID).
-if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "\"$CERT_NAME\""; then
-  echo "✓ '$CERT_NAME' identity already exists in your login keychain."
-  echo "  Nothing to do."
-  exit 0
-fi
-
 TMPDIR=$(mktemp -d)
 trap "rm -rf $TMPDIR" EXIT
+
+# V1.0027: even if the cert exists, we may still need the trust step. Skip
+# generation but fall through to trust + final-check.
+SKIP_CERT_GEN=0
+if security find-identity -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "\"$CERT_NAME\""; then
+  echo "✓ '$CERT_NAME' identity already exists. Checking trust state..."
+  SKIP_CERT_GEN=1
+  # Export the existing cert so the trust step has something to operate on.
+  security find-certificate -c "$CERT_NAME" -p > "$TMPDIR/cert.pem"
+fi
+
+if [[ "$SKIP_CERT_GEN" -eq 1 ]]; then
+  # Skip generation, jump to trust step.
+  TRUST_ONLY=1
+else
+  TRUST_ONLY=0
+fi
+
+if [[ "$TRUST_ONLY" -eq 0 ]]; then
 
 echo "Generating self-signed certificate '$CERT_NAME' (10-year validity)..."
 
@@ -112,6 +125,43 @@ if ! security set-key-partition-list \
   echo ""
   echo "     security set-key-partition-list -S apple-tool:,apple:,codesign:,unsigned: -s -k <your Mac password> \"$KEYCHAIN\""
   echo ""
+fi
+
+fi # end TRUST_ONLY=0 block
+
+# V1.0027: trust the cert as a code-signing root in the user's login
+# keychain. Without this, macOS's Keychain ACL system can't pin the
+# `WeavePDF Safe Storage` item to the cert's designated requirement —
+# it falls back to per-CDHash pinning, which means every rebuild's new
+# CDHash misses the ACL and prompts the user for their Mac password +
+# "Always Allow" all over again. Trusting the cert lets the ACL pin to
+# the cert's leaf hash (stable across rebuilds with the same key) so
+# the prompt happens ONCE for the whole project lifetime, not once per
+# update.
+#
+# This step prompts for your Mac password ONCE (to authorize the trust
+# change). After that, future `npm run package` / `npm run release`
+# rebuilds are silent — and so is opening WeavePDF after each install.
+if ! security verify-cert -c "$TMPDIR/cert.pem" -p codeSign > /dev/null 2>&1; then
+  echo "Trusting '$CERT_NAME' as a code-signing root (one Mac password prompt)..."
+  if ! security add-trusted-cert -p codeSign \
+         -k "$KEYCHAIN" \
+         "$TMPDIR/cert.pem" 2>"$TMPDIR/trust.err"; then
+    echo ""
+    echo "  ⚠️  Could not trust the cert automatically. Without trust, the"
+    echo "     macOS Keychain will re-prompt on every WeavePDF update."
+    echo ""
+    echo "     To fix manually, run (it'll ask for your Mac password once):"
+    echo ""
+    echo "     security add-trusted-cert -p codeSign -k \"$KEYCHAIN\" /tmp/weavepdf-cert.pem"
+    echo ""
+    echo "  (Saved cert to /tmp/weavepdf-cert.pem for that command.)"
+    cp "$TMPDIR/cert.pem" /tmp/weavepdf-cert.pem
+  else
+    echo "✓ Cert trusted as code-signing root."
+  fi
+else
+  echo "✓ Cert already trusted as code-signing root."
 fi
 
 # Final check (no -v: self-signed certs are reported as not-trusted but codesign

@@ -5,7 +5,13 @@
 
 ## Current State
 
-**Status:** **V1.0026 — Cold-start crash fix + Unsaved Changes confirmation dialog.** Two issues from V1.0025 testing:
+**Status:** **V1.0027 — Already-open file switches tab + Print Preview simplified to preview-only + cert-trust step in setup-local-signing.sh.** Three issues addressed in one turn:
+
+1. **Reopening a file already in a tab now switches to that tab** instead of the autosave-restore prompt + duplicate tab. Renderer's `onOpenFilePath` handler checks for an existing tab with the same `path` first; if found, calls `setActiveTab(existing.id)` and bails before any read/restore-prompt logic.
+2. **Print Preview modal stripped to preview-only.** V1.0021 introduced our own Layout/Orientation controls, but the macOS native print dialog already has identical controls — the user reported the duplicate was confusing and the values didn't match across the two dialogs. Now our modal shows a clean preview (thumbnail strip + big preview), and the native dialog owns all real print options (printer, copies, layout, orientation, paper, duplex). One source of truth.
+3. **`setup-local-signing.sh` now also trusts the WeavePDF Local cert as a code-signing root.** Without trust, macOS's Keychain ACL falls back to per-CDHash pinning so every rebuild re-prompts for the user's Mac password ("WeavePDF wants to access WeavePDF Safe Storage"). Trusting the cert lets the ACL pin to the cert's leaf hash (stable across rebuilds). One-time prompt to authorize the trust change. **Adam needs to re-run `bash scripts/setup-local-signing.sh` from a real Terminal once** — the cert-trust step needs an interactive shell because macOS shows a TouchID/password prompt that can't be driven from a non-interactive script.
+
+**V1.0026 base (carried forward):** Cold-start crash fix + Unsaved Changes confirmation dialog. Two issues from V1.0025 testing:
 
 1. **JS error dialog on first open after install:** "Cannot create BrowserWindow before app is ready". V1.0025's `createMainWindow()` call in `queueOrSendOpen` fired during cold-start (before `app.whenReady`) when macOS dispatched the open-file event before the app finished initializing. Gated behind `app.isReady()` — when not ready, the path stays queued and the existing whenReady handler creates the window + drains.
 
@@ -492,6 +498,52 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0027: already-open tab switch + Print Preview simplified + cert-trust setup
+
+User: "when opening the same file, it attempts to 'reopen it' and replace it, instead of recognizing its already open and just reopening the window with it on" + "every update you make im prompted to reenter my mac pw and always allow, can you make it so it stays authenticated through updates" + "after going through the first print flow, which works well with the preview and settings, it takes to the second page, where it shows layout and other duplicate options all over again, and different than how I set it up in the first flow".
+
+**Three fixes in one turn:**
+
+**(1) Already-open tab switch** ([src/renderer/App.tsx](src/renderer/App.tsx) `onOpenFilePath`):
+```ts
+const existing = useDocumentStore.getState().tabs.find((t) => t.path === filePath);
+if (existing) {
+  useDocumentStore.getState().setActiveTab(existing.id);
+  return;
+}
+```
+Before V1.0027 the renderer's open-file handler always read fresh disk bytes + called `loadAsTab`, which always checked the autosave-drafts slot and prompted "Restore unsaved work?" — confusing when the user just wanted the existing tab raised. Now: if a tab with the same `path` already exists, we just switch to it and exit. Any unsaved overlays are still in the store; nothing is lost.
+
+**(2) Print Preview simplified to preview-only** ([src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx)):
+
+V1.0021 added Layout (1/2/4/6/9 per sheet) + Orientation controls to our Print Preview. V1.0022 fixed the worker race + Auto-orientation behaviour. V1.0027 finally accepts the obvious: the macOS native print dialog already has those exact controls, our duplicate confused the user, and the values didn't even match across the two dialogs (because our modal baked layout INTO the PDF, while the native dialog showed "1 per sheet" since the baked PDF was already laid out).
+
+Removed: PerSheet enum + ORIENTATION_OPTIONS + selection state + nUpPages call + layoutBusy/layoutError state. Kept: thumbnail strip, big preview pane, Print/Cancel buttons, pdf.js sequenced load. Footer now reads "Pick layout (pages per sheet), orientation, and paper size in the next dialog."
+
+**(3) Cert-trust step in setup-local-signing.sh** ([scripts/setup-local-signing.sh](scripts/setup-local-signing.sh)):
+
+Without the WeavePDF Local cert being TRUSTED in the user's login keychain trust store, macOS's Keychain ACL system can't pin the `WeavePDF Safe Storage` item to the cert's designated requirement — it falls back to per-CDHash pinning, and every rebuild's new CDHash misses the ACL → the user gets a Mac password + "Always Allow" prompt on EVERY update. V1.0013 set up the cert as a code-signing IDENTITY (so codesign can use it) but didn't TRUST it (which is what Keychain ACL needs).
+
+Added trust step at the end of setup-local-signing.sh:
+```bash
+security verify-cert -c "$TMPDIR/cert.pem" -p codeSign  # idempotent check
+security add-trusted-cert -p codeSign -k "$KEYCHAIN" "$TMPDIR/cert.pem"  # one-time prompt
+```
+
+Restructured the script so the trust step runs even if the cert already exists (TRUST_ONLY=1 path), so re-running the script idempotently fixes existing setups. The `add-trusted-cert` prompts the user for their Mac password ONCE to authorize the trust change. After that, all future rebuilds keep the same designated requirement and Keychain accepts them silently.
+
+**Important caveat:** the trust step CAN'T be run from a non-interactive shell — macOS shows a TouchID/password prompt that requires an actual user-driven session. I tried to run the updated script from my computer-use bash and the `add-trusted-cert` call hung waiting for a prompt that never reached the screen. Adam needs to run `bash scripts/setup-local-signing.sh` from a real Terminal window once. After that, future updates are silent.
+
+The fallback path in the script saves the cert to `/tmp/weavepdf-cert.pem` so users hitting any issue can run the manual command directly: `security add-trusted-cert -p codeSign -k ~/Library/Keychains/login.keychain-db /tmp/weavepdf-cert.pem`.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.27`.
+- Bumped V1.0026 → V1.0027 per Critical Rule #12.
+- Print Preview UX: opens, shows clean preview (no chrome), Print → native dialog with all the real options. No duplicate controls.
+- Already-open: opening N10/N11 Contract from Finder when it's already a tab now just switches to it.
+
+**Files touched:** [src/renderer/App.tsx](src/renderer/App.tsx) (already-open tab switch), [src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx](src/renderer/components/PrintPreviewModal/PrintPreviewModal.tsx) (simplified — removed Layout/Orientation), [scripts/setup-local-signing.sh](scripts/setup-local-signing.sh) (TRUST_ONLY refactor + cert-trust step), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0026: cold-start crash fix + Unsaved Changes confirmation
 

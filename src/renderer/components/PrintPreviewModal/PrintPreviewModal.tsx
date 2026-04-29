@@ -5,93 +5,62 @@ import * as pdfjsLib from "pdfjs-dist";
 import "../../lib/pdfjs"; // ensure worker initialized
 import { u8ToAb } from "../../../shared/buffers";
 
-// Lazy import — pdf-ops is in a separate chunk we don't want to pull eagerly.
-const loadPdfOps = () => import("../../lib/pdf-ops");
-
 type Props = {
   open: boolean;
   onClose: () => void;
 };
 
-type PerSheet = 1 | 2 | 4 | 6 | 9;
-type Orientation = "auto" | "portrait" | "landscape";
-
-const PER_SHEET_OPTIONS: { value: PerSheet; label: string }[] = [
-  { value: 1, label: "1 per sheet" },
-  { value: 2, label: "2 per sheet" },
-  { value: 4, label: "4 per sheet" },
-  { value: 6, label: "6 per sheet" },
-  { value: 9, label: "9 per sheet" },
-];
-
-const ORIENTATION_OPTIONS: { value: Orientation; label: string }[] = [
-  { value: "auto", label: "Auto" },
-  { value: "portrait", label: "Portrait" },
-  { value: "landscape", label: "Landscape" },
-];
-
 /**
- * Print Preview modal — V1.0021. Modeled on macOS Preview.app's print panel:
- * thumbnail strip on the left, large preview on the right, layout controls
- * at the top. Replaces the V1.0020 path that called webContents.print() on
- * the renderer window itself (which dumped sidebar thumbnails + chrome
- * into the printed page).
+ * Print Preview modal — V1.0027 simplified.
+ *
+ * V1.0021 added layout (n-up) + orientation controls, but the macOS native
+ * print dialog ALSO has those exact same controls (Layout > Pages per
+ * Sheet, Orientation). The user reported the duplicate was confusing —
+ * "different than how I set it up in the first flow" — and frankly it was.
+ *
+ * V1.0027 makes our modal preview-only. The user sees what they're about
+ * to print (clean PDF, no app chrome — fixes the V1.0020 sidebar-bleed
+ * bug). They click Print, the native macOS dialog opens with all the real
+ * controls (printer, copies, layout, orientation, paper, duplex, color).
+ * One source of truth for the print options, one preview for "is this
+ * the right document?". No more dual-stage settings.
  *
  * Flow:
- *   1. On open, commitAllPending bakes pending overlays into the active
- *      tab's PDF bytes. From here on we treat those as the source of truth.
- *   2. Layout selector (1/2/4/6/9 per sheet) feeds nUpPages to produce a
- *      derived "print bytes" PDF. 1-per-sheet means the source bytes
- *      directly — we never re-render through pdf-lib for that case.
- *   3. pdf.js renders the print bytes for both the thumbnail strip and the
- *      big preview pane.
- *   4. "Print" → window.weavepdf.printPdfBytes(printBytes), which writes
- *      to a temp file, opens a hidden BrowserWindow, calls webContents.print
- *      with empty header/footer (no filename in margins), shows the native
- *      macOS print dialog. The user picks printer/copies/etc. there.
+ *   1. Open → commitAllPending bakes pending overlays into the active tab.
+ *   2. pdf.js renders the source bytes for thumbnails + big preview.
+ *   3. Print → window.weavepdf.printPdfBytes opens the native dialog;
+ *      user picks layout / orientation / printer there.
  */
 export function PrintPreviewModal({ open, onClose }: Props) {
   const closeRef = useRef<HTMLButtonElement>(null);
   const activeTab = useDocumentStore((s) => s.activeTab());
   const commitAllPending = useDocumentStore((s) => s.commitAllPending);
 
-  const [perSheet, setPerSheet] = useState<PerSheet>(1);
-  const [orientation, setOrientation] = useState<Orientation>("auto");
-  const [printBytes, setPrintBytes] = useState<Uint8Array | null>(null);
-  const [layoutBusy, setLayoutBusy] = useState(false);
-  const [layoutError, setLayoutError] = useState<string | null>(null);
   const [printing, setPrinting] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [pdf, setPdf] = useState<pdfjsLib.PDFDocumentProxy | null>(null);
   const [selectedPage, setSelectedPage] = useState(1);
 
-  // Refs to avoid putting pdf/loadingTask in deps (which would cause a
-  // tear-rebuild loop). The pdf.js worker race fixed in V1.0022 lives here:
-  // every load is sequenced — we await destroy of the previous proxy
-  // BEFORE swapping in the new one. Without that, rapid layout/orientation
-  // changes triggered overlapping getDocument() + destroy() against the
-  // shared worker port, which surfaced as "PDFWorker.fromPort - the worker
-  // is being destroyed".
+  // Refs avoid pdf/loadingTask appearing in deps (which would cause a
+  // tear-rebuild loop). Loads are sequenced — await destroy of the
+  // previous proxy BEFORE swapping in the new one — to dodge the
+  // pdf.js shared-worker race that V1.0022 was about.
   const pdfRef = useRef<pdfjsLib.PDFDocumentProxy | null>(null);
   const loadingTaskRef = useRef<ReturnType<typeof pdfjsLib.getDocument> | null>(null);
 
-  // Reset state on open. Important: any pdf proxy from a previous open is
-  // destroyed via the ref-based cleanup below, not here.
+  // Reset on open. pdf cleanup is owned by the unmount effect below.
   useEffect(() => {
     if (!open) {
-      setPrintBytes(null);
       setSelectedPage(1);
-      setLayoutError(null);
-      setPerSheet(1);
-      setOrientation("auto");
+      setLoadError(null);
       setPrinting(false);
-      // Hand pdf cleanup to the unmount/printBytes-null effect below.
       return;
     }
     requestAnimationFrame(() => closeRef.current?.focus());
-  }, [open]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [open]);
 
   // Bake pending overlays the moment the modal opens so the preview
-  // matches what will print. Same pattern as the V1.0020 printCurrent.
+  // matches what will print.
   useEffect(() => {
     if (!open || !activeTab) return;
     const hasPending =
@@ -103,91 +72,37 @@ export function PrintPreviewModal({ open, onClose }: Props) {
     }
   }, [open, activeTab?.id]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Build print bytes whenever layout or source bytes change.
+  // Load the active tab's bytes through pdf.js for the preview. Sequenced
+  // load: new doc loads first, state swaps, old doc destroy is awaited
+  // AFTER the swap so nothing races the shared pdf.js worker port.
   useEffect(() => {
     if (!open || !activeTab?.bytes) return;
-    let cancelled = false;
-    setLayoutBusy(true);
-    setLayoutError(null);
-    (async () => {
-      try {
-        let next: Uint8Array;
-        if (perSheet === 1) {
-          // 1-per-sheet always renders the source bytes directly. Any
-          // orientation control is a no-op here — rotating individual
-          // pages is a separate operation outside print preview's scope.
-          next = activeTab.bytes!;
-        } else {
-          // V1.0022: "Auto" must NOT be passed as a string to nUpPages
-          // because resolvePaperSize treats "auto" as "use base orientation
-          // of the paper" (i.e. portrait Letter for 2/4/6/9-up). The
-          // user-friendly default for 2-up is landscape, for 4/6/9-up is
-          // portrait — that's what nUpPages's `defaultOrient` provides
-          // when `orientation` is omitted. So when the modal says "auto",
-          // we DROP the orientation key so the primitive picks its default.
-          const { nUpPages } = await loadPdfOps();
-          const opts: Parameters<typeof nUpPages>[2] =
-            orientation === "auto" ? {} : { orientation };
-          next = await nUpPages(activeTab.bytes!, perSheet, opts);
-        }
-        if (cancelled) return;
-        setPrintBytes(next);
-      } catch (err) {
-        if (!cancelled) {
-          setLayoutError(err instanceof Error ? err.message : String(err));
-        }
-      } finally {
-        if (!cancelled) setLayoutBusy(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, [open, activeTab?.bytes, activeTab?.version, perSheet, orientation]);
-
-  // V1.0022: properly sequenced pdf.js load. The previous version had a
-  // race where rapid layout/orientation changes triggered overlapping
-  // getDocument() + destroy() calls against the shared pdf.js worker, which
-  // pdf.js surfaced as "PDFWorker.fromPort - the worker is being destroyed."
-  //
-  // Sequencing rules:
-  //   1. Each effect run gets a `cancelled` token. The cleanup sets it.
-  //   2. We never destroy() the previous pdf BEFORE the new one finishes
-  //      loading — that's what was racing the worker. Instead: load new,
-  //      then swap state, then destroy old (so the swap renders without
-  //      pdf.js worker contention).
-  //   3. If a newer effect cancelled this one mid-load, destroy the
-  //      orphaned new pdf instead of mounting it.
-  useEffect(() => {
-    if (!printBytes) return;
     let cancelled = false;
 
     (async () => {
       let task: ReturnType<typeof pdfjsLib.getDocument> | null = null;
       let loaded: pdfjsLib.PDFDocumentProxy | null = null;
       try {
-        const data = new Uint8Array(u8ToAb(printBytes));
+        const data = new Uint8Array(u8ToAb(activeTab.bytes!));
         task = pdfjsLib.getDocument({ data });
         loadingTaskRef.current = task;
         loaded = await task.promise;
         if (cancelled) {
-          // A newer effect superseded us; throw the load away cleanly.
           try { await loaded.destroy(); } catch { /* ignore */ }
           return;
         }
-        // Swap: state update first, then await destroy of the old proxy.
         const old = pdfRef.current;
         pdfRef.current = loaded;
         setPdf(loaded);
         setSelectedPage(1);
-        setLayoutError(null);
+        setLoadError(null);
         if (old) {
-          try { await old.destroy(); } catch { /* ignore — best-effort */ }
+          try { await old.destroy(); } catch { /* ignore */ }
         }
         if (loadingTaskRef.current === task) loadingTaskRef.current = null;
       } catch (err) {
         if (!cancelled) {
-          setLayoutError(err instanceof Error ? err.message : String(err));
+          setLoadError(err instanceof Error ? err.message : String(err));
         }
         if (loaded) {
           try { await loaded.destroy(); } catch { /* ignore */ }
@@ -198,9 +113,9 @@ export function PrintPreviewModal({ open, onClose }: Props) {
     return () => {
       cancelled = true;
     };
-  }, [printBytes]);
+  }, [open, activeTab?.bytes, activeTab?.version]);
 
-  // Final cleanup on unmount: destroy any in-flight task + any mounted pdf.
+  // Final cleanup on unmount.
   useEffect(() => {
     return () => {
       const t = loadingTaskRef.current;
@@ -217,12 +132,12 @@ export function PrintPreviewModal({ open, onClose }: Props) {
   }, []);
 
   const handlePrint = useCallback(async () => {
-    if (!printBytes || printing) return;
+    if (!activeTab?.bytes || printing) return;
     setPrinting(true);
     try {
       const result = await window.weavepdf.printPdfBytes(
-        u8ToAb(printBytes),
-        activeTab?.name,
+        u8ToAb(activeTab.bytes),
+        activeTab.name,
       );
       if (result.ok) {
         onClose();
@@ -230,7 +145,7 @@ export function PrintPreviewModal({ open, onClose }: Props) {
       }
       if (result.error) {
         // ok=false + no error = user cancelled in the dialog. Stay open
-        // so the user can adjust + retry.
+        // so the user can retry without re-navigating.
         alert(`Print failed: ${result.error}`);
       }
     } catch (err) {
@@ -238,9 +153,9 @@ export function PrintPreviewModal({ open, onClose }: Props) {
     } finally {
       setPrinting(false);
     }
-  }, [printBytes, printing, onClose, activeTab?.name]);
+  }, [activeTab?.bytes, activeTab?.name, printing, onClose]);
 
-  // Esc closes.
+  // Esc closes (when not mid-print).
   useEffect(() => {
     if (!open) return;
     const handler = (e: KeyboardEvent) => {
@@ -281,7 +196,7 @@ export function PrintPreviewModal({ open, onClose }: Props) {
             </div>
             <p className="mt-0.5 text-[12px] text-[var(--muted)]">
               {activeTab?.name ?? "Untitled"}
-              {numPages > 0 && ` • ${numPages} sheet${numPages === 1 ? "" : "s"}`}
+              {numPages > 0 && ` • ${numPages} page${numPages === 1 ? "" : "s"}`}
             </p>
           </div>
           <button
@@ -296,49 +211,11 @@ export function PrintPreviewModal({ open, onClose }: Props) {
           </button>
         </div>
 
-        {/* Layout controls */}
-        <div className="flex flex-wrap items-center gap-4 border-b border-[var(--panel-border)] bg-[var(--panel-bg)] px-6 py-3 text-[12px]">
-          <div className="flex items-center gap-2">
-            <span className="text-[var(--muted)]">Layout:</span>
-            <select
-              value={perSheet}
-              onChange={(e) => setPerSheet(Number(e.target.value) as PerSheet)}
-              disabled={printing || layoutBusy}
-              className="rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg-raised)] px-2 py-1 text-[12px] text-[var(--app-fg)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)]"
-              data-testid="print-preview-per-sheet"
-            >
-              {PER_SHEET_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
+        {loadError && (
+          <div className="border-b border-[var(--panel-border)] bg-[var(--panel-bg)] px-6 py-2 text-[12px] text-[var(--destructive)]">
+            Couldn’t build preview: {loadError}
           </div>
-          <div className="flex items-center gap-2">
-            <span className="text-[var(--muted)]">Orientation:</span>
-            <select
-              value={orientation}
-              onChange={(e) => setOrientation(e.target.value as Orientation)}
-              disabled={printing || layoutBusy || perSheet === 1}
-              className="rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg-raised)] px-2 py-1 text-[12px] text-[var(--app-fg)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] disabled:opacity-50"
-            >
-              {ORIENTATION_OPTIONS.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          </div>
-          {layoutBusy && (
-            <div className="flex items-center gap-1.5 text-[var(--muted)]">
-              <Loader2 className="h-3 w-3 animate-spin" />
-              <span>Building preview…</span>
-            </div>
-          )}
-          {layoutError && (
-            <div className="text-[var(--destructive)]">Couldn’t build preview: {layoutError}</div>
-          )}
-        </div>
+        )}
 
         {/* Body: thumbnail strip + main preview */}
         <div className="flex min-h-[400px] flex-1 overflow-hidden">
@@ -352,34 +229,39 @@ export function PrintPreviewModal({ open, onClose }: Props) {
         </div>
 
         {/* Footer */}
-        <div className="flex items-center justify-end gap-2 border-t border-[var(--panel-border)] bg-[var(--panel-bg)] px-6 py-3">
-          <button
-            type="button"
-            onClick={onClose}
-            disabled={printing}
-            className="rounded-md px-4 py-1.5 text-[13px] text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)] disabled:opacity-50"
-          >
-            Cancel
-          </button>
-          <button
-            type="button"
-            onClick={handlePrint}
-            disabled={!printBytes || printing || layoutBusy}
-            className="flex items-center gap-2 rounded-md bg-[var(--color-accent)] px-4 py-1.5 text-[13px] font-medium text-white hover:bg-[var(--color-accent-hover)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:ring-offset-2 focus:ring-offset-[var(--panel-bg-raised)] disabled:opacity-50"
-            data-testid="print-preview-print"
-          >
-            {printing ? (
-              <>
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                <span>Printing…</span>
-              </>
-            ) : (
-              <>
-                <Printer className="h-3.5 w-3.5" />
-                <span>Print…</span>
-              </>
-            )}
-          </button>
+        <div className="flex items-center justify-between gap-3 border-t border-[var(--panel-border)] bg-[var(--panel-bg)] px-6 py-3">
+          <p className="hidden text-[11px] text-[var(--muted)] sm:block">
+            Pick layout (pages per sheet), orientation, and paper size in the next dialog.
+          </p>
+          <div className="ml-auto flex items-center gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              disabled={printing}
+              className="rounded-md px-4 py-1.5 text-[13px] text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)] disabled:opacity-50"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handlePrint}
+              disabled={!activeTab?.bytes || printing}
+              className="flex items-center gap-2 rounded-md bg-[var(--color-accent)] px-4 py-1.5 text-[13px] font-medium text-white hover:bg-[var(--color-accent-hover)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] focus:ring-offset-2 focus:ring-offset-[var(--panel-bg-raised)] disabled:opacity-50"
+              data-testid="print-preview-print"
+            >
+              {printing ? (
+                <>
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  <span>Printing…</span>
+                </>
+              ) : (
+                <>
+                  <Printer className="h-3.5 w-3.5" />
+                  <span>Print…</span>
+                </>
+              )}
+            </button>
+          </div>
         </div>
       </div>
     </div>
@@ -447,7 +329,7 @@ function ThumbButton({
         const page = await pdf.getPage(pageNumber);
         if (cancelled) return;
         const viewport = page.getViewport({ scale: 1 });
-        const targetWidth = 130; // matches the ~150px column - padding
+        const targetWidth = 130;
         const scale = targetWidth / viewport.width;
         const scaled = page.getViewport({ scale });
         const canvas = canvasRef.current;
@@ -526,14 +408,13 @@ function PreviewPane({
         if (cancelled) return;
         const container = containerRef.current;
         if (!container) return;
-        const containerWidth = container.clientWidth - 32; // padding
+        const containerWidth = container.clientWidth - 32;
         const containerHeight = container.clientHeight - 32;
         const baseViewport = page.getViewport({ scale: 1 });
         const scale = Math.min(
           containerWidth / baseViewport.width,
           containerHeight / baseViewport.height,
         );
-        // Render at devicePixelRatio for sharpness.
         const dpr = window.devicePixelRatio || 1;
         const viewport = page.getViewport({ scale: scale * dpr });
         const canvas = canvasRef.current;

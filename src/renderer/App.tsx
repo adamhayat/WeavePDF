@@ -1018,6 +1018,17 @@ export function App() {
   useEffect(() => {
     return window.weavepdf.onOpenFilePath(async (filePath) => {
       try {
+        // V1.0027: if this file is ALREADY open in a tab, switch to it
+        // instead of re-opening. Re-opening reloads the file from disk
+        // and triggers the autosave-restore prompt, which is annoying
+        // when the user just wanted to bring the existing tab forward.
+        const existing = useDocumentStore
+          .getState()
+          .tabs.find((t) => t.path === filePath);
+        if (existing) {
+          useDocumentStore.getState().setActiveTab(existing.id);
+          return;
+        }
         const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
         const file = await window.weavepdf.readFile(filePath);
         const bytes = new Uint8Array(file.data);
