@@ -306,8 +306,9 @@ function bringWindowForward(target: BrowserWindow): void {
   target.moveTop();
   if (process.platform !== "darwin") return;
 
+  const startBounds = target.getBounds();
   logFinderSync(
-    `bringWindowForward — focused=${target.isFocused()} visible=${target.isVisible()} minimized=${target.isMinimized()}`,
+    `bringWindowForward — focused=${target.isFocused()} visible=${target.isVisible()} minimized=${target.isMinimized()} bounds=${startBounds.x},${startBounds.y},${startBounds.width}x${startBounds.height}`,
   );
 
   // Un-hide the app if it was hidden via ⌘H. show() is a no-op when not
@@ -324,6 +325,47 @@ function bringWindowForward(target: BrowserWindow): void {
     target.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
   } catch {
     // Some old Electron versions throw if the window isn't fullscreen-able.
+  }
+
+  // V1.0024: defeat macOS's "Show Desktop" gesture (Fn key / hot-corner).
+  // Show Desktop slides every window off-screen via a system animation;
+  // app.focus()/setAlwaysOnTop don't undo that animation, so the window
+  // becomes "active" but stays at its slid-off position and the user sees
+  // nothing change. setBounds with the captured pre-Show-Desktop bounds
+  // forces a reposition that breaks the Show Desktop transform. If the
+  // window's current bounds are already off-screen (caught the moment
+  // Show Desktop is active), nudge it to a known on-screen rect.
+  try {
+    const displays = require("electron").screen.getAllDisplays();
+    const onScreen = displays.some((d: { bounds: { x: number; y: number; width: number; height: number } }) => {
+      const db = d.bounds;
+      return (
+        startBounds.x + startBounds.width > db.x &&
+        startBounds.x < db.x + db.width &&
+        startBounds.y + startBounds.height > db.y &&
+        startBounds.y < db.y + db.height
+      );
+    });
+    if (!onScreen) {
+      // Window is fully off-screen (Show Desktop active). Center on the
+      // primary display so we have somewhere visible to land.
+      const primary = require("electron").screen.getPrimaryDisplay();
+      target.setBounds({
+        x: Math.max(primary.workArea.x + 40, primary.workArea.x + Math.floor((primary.workArea.width - startBounds.width) / 2)),
+        y: Math.max(primary.workArea.y + 40, primary.workArea.y + Math.floor((primary.workArea.height - startBounds.height) / 2)),
+        width: Math.min(startBounds.width, primary.workArea.width - 80),
+        height: Math.min(startBounds.height, primary.workArea.height - 80),
+      });
+      logFinderSync(`  recentered to primary display (was off-screen — likely Show Desktop)`);
+    } else {
+      // On-screen but possibly slid: re-set the same bounds to break
+      // any in-progress slide animation. setBounds is a no-op if the
+      // bounds didn't actually change at the AppKit level, so this is
+      // cheap when nothing's wrong.
+      target.setBounds(startBounds);
+    }
+  } catch (err) {
+    logFinderSync(`  bounds reset failed: ${err instanceof Error ? err.message : String(err)}`);
   }
 
   // Force the window above EVERYTHING for a beat. screen-saver level beats
@@ -370,10 +412,60 @@ function bringWindowForward(target: BrowserWindow): void {
     target.focus();
     target.moveTop();
     app.focus({ steal: true });
+    const endBounds = target.getBounds();
     logFinderSync(
-      `  after-pulse — focused=${target.isFocused()} visible=${target.isVisible()}`,
+      `  after-pulse — focused=${target.isFocused()} visible=${target.isVisible()} bounds=${endBounds.x},${endBounds.y},${endBounds.width}x${endBounds.height}`,
     );
   }, 200);
+
+  // V1.0024: retry loop. macOS's "Show Desktop" undo animation can take
+  // 300-800ms during which the previously-frontmost app stays frontmost
+  // and OUR activation requests are rejected. Trace logs from the user's
+  // own machine showed `focused=false` after the 200ms pulse on this
+  // path — every prior trick (alwaysOnTop, AppleScript, app.focus) was
+  // landing during the animation and getting dropped.
+  //
+  // Strategy: poll `isFocused()` for up to 2.5s and re-fire the activation
+  // primitives every 200ms while focus hasn't taken. Stops the moment
+  // we're focused (no further work) so this is cheap when the initial
+  // pulse already worked.
+  let retryCount = 0;
+  const RETRY_LIMIT = 12; // 12 × 200ms = 2.4s max
+  const retryFocus = (): void => {
+    if (target.isDestroyed()) return;
+    if (target.isFocused()) {
+      if (retryCount > 0) {
+        logFinderSync(`  focus took on retry ${retryCount}`);
+      }
+      return;
+    }
+    if (retryCount >= RETRY_LIMIT) {
+      logFinderSync(
+        `  retry limit hit (${RETRY_LIMIT}); giving up — window may still be backgrounded`,
+      );
+      return;
+    }
+    retryCount++;
+    target.focus();
+    target.moveTop();
+    app.focus({ steal: true });
+    // Re-fire AppleScript activate every 4th retry — Apple Events are
+    // queued but macOS's NSWorkspace coalesces duplicates, so spamming
+    // doesn't help. Once per ~800ms is the sweet spot.
+    if (retryCount % 4 === 1) {
+      try {
+        spawn("osascript", ["-e", 'tell application "WeavePDF" to activate'], {
+          detached: true,
+          stdio: "ignore",
+        }).unref();
+      } catch {
+        // ignore — best effort
+      }
+    }
+    setTimeout(retryFocus, 200);
+  };
+  // Kick off the retry loop after the main pulse finishes.
+  setTimeout(retryFocus, 300);
 }
 
 async function withTempDir<T>(prefix: string, run: (dir: string) => Promise<T>): Promise<T> {

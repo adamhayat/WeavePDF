@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0024: defeat macOS "Show Desktop" gesture on file-open (2026-04-29)
+- **Show Desktop (Fn key, Globe key, top-right hot corner) was the missed scenario.** V1.0023 fixed normal-backgrounded focus, but Show Desktop slides every window off-screen via a Mission Control transform that `app.focus()`/`setAlwaysOnTop`/AppleScript activate don't undo. The app activated correctly but the window stayed at its slid-off position; user saw nothing.
+- **Fix in [src/main/main.ts](src/main/main.ts) `bringWindowForward`:** before the focus pulse, capture `target.getBounds()` and check intersection against every display via `screen.getAllDisplays()`. If fully off-screen → reposition to a centered rect on the primary display's work area (forces a hard reposition that breaks the Show Desktop transform). If on-screen → re-`setBounds(originalBounds)` to break any in-progress slide. AppKit no-ops if the rect didn't change at the system level, so this is cheap when nothing's wrong.
+- **Logging expanded** to include bounds before AND after the pulse in `/tmp/weavepdf-quickaction.log`. Future "still backgrounded" reports can be diagnosed from the trace.
+- **Bumped V1.0023 → V1.0024** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.24`. V1.0023 reproduction was verified via computer-use + trace log (focused=true visible=true after pulse for normal background); V1.0024 adds the Show-Desktop layer.
+
 ### Fixed — V1.0023: bulletproof file-open focus on macOS (2026-04-29)
 - **Adds AppleScript activation as the final focus primitive.** `osascript -e 'tell application "WeavePDF" to activate'` goes through NSWorkspace + Apple Events, the same path the dock icon uses. macOS treats this as user-initiated and applies a more permissive activation policy than direct `app.focus({steal:true})` calls — survives Space differences, Stage Manager groups, focus-stealing prevention from concurrent apps.
 - **Window now visible across Spaces during the 200 ms focus pulse.** `setVisibleOnAllWorkspaces(true)` for the duration of the pulse so the user sees the window on their CURRENT Space, not just the one WeavePDF normally lives on. Original setting is restored after the pulse so window-management preferences aren't permanently changed.

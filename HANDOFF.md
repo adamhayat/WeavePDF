@@ -5,7 +5,11 @@
 
 ## Current State
 
-**Status:** **V1.0023 — Bulletproof focus on file-open: AppleScript activate + cross-Space visibility + tracing.** User reported again that opening a PDF (`N10 : N11 Contract.pdf` from Desktop) sometimes opens the file in a backgrounded WeavePDF window — the V1.0017 + V1.0021 stack (always-on-top + 50/120 ms retry) doesn't survive every backgrounded scenario. V1.0023 layers on the most reliable macOS primitive available:
+**Status:** **V1.0024 — Defeat macOS "Show Desktop" gesture (Fn key / hot-corner) on file-open.** I reproduced V1.0023 + traced via `/tmp/weavepdf-quickaction.log` — V1.0023 actually works for normal "WeavePDF in background" cases (focused=true after the pulse). User then clarified the actual scenario: they trigger macOS's **Show Desktop** (Fn / Globe key OR top-right hot-corner) which slides every window off-screen via a system animation. When they double-click the PDF after that, WeavePDF's app activates correctly but the window stays at its slid-off position because Show Desktop's transform isn't undone by `app.focus()`/`setAlwaysOnTop`/AppleScript activate.
+
+**Fix in [src/main/main.ts](src/main/main.ts) `bringWindowForward`:** before the focus pulse, query the window's current bounds and check whether they intersect any display. If fully off-screen (Show Desktop active), reposition to the center of the primary display's work area. If on-screen but possibly slid mid-animation, re-`setBounds` with the captured bounds to break the in-progress transform (no-op when nothing's actually moving). Logs the bounds before AND after the pulse so we can see the reposition in `/tmp/weavepdf-quickaction.log`.
+
+**V1.0023 base (carried forward):** Bulletproof focus on file-open: AppleScript activate + cross-Space visibility + tracing. AppleScript activate + cross-Space visibility + tracing.** User reported again that opening a PDF (`N10 : N11 Contract.pdf` from Desktop) sometimes opens the file in a backgrounded WeavePDF window — the V1.0017 + V1.0021 stack (always-on-top + 50/120 ms retry) doesn't survive every backgrounded scenario. V1.0023 layers on the most reliable macOS primitive available:
 - **`osascript -e 'tell application "WeavePDF" to activate'`** — AppleScript activation goes through NSWorkspace (the same path the dock icon uses) and macOS treats it as user-initiated, so focus-stealing prevention doesn't fight it. This runs alongside the existing `setAlwaysOnTop("screen-saver")` + `app.focus({ steal: true })` pulse.
 - **`setVisibleOnAllWorkspaces(true)` during the 200 ms pulse** — handles the case where the user's current Space is different from the one WeavePDF lives on. Without this, the window comes "to front" on its own Space but the user doesn't see it. We capture and restore the prior setting after the pulse so we don't permanently change window-management behaviour.
 - **Detailed tracing** — `queueOrSendOpen` and `bringWindowForward` now log every call to `/tmp/weavepdf-quickaction.log` with focus state before and after the pulse. If the focus issue STILL persists, the log will show whether `bringWindowForward` was even invoked + what state the window was in.
@@ -476,6 +480,34 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-04-29 — V1.0024: defeat macOS "Show Desktop" gesture on file-open
+
+User: "sorry it opens but it wont bring the screen to the front. maybe its only when minimizing the screen? Like i have the option to minimize by going to the top right corner and it shows desktop. I also show desktop by pressing the fn button."
+
+Cracked it. I reproduced V1.0023 via computer-use + tail of `/tmp/weavepdf-quickaction.log` and confirmed V1.0023 works for normal background cases — `focused=true visible=true minimized=false` after the pulse. The user's actual scenario is **Show Desktop** (Fn / Globe key OR top-right hot corner), which slides every window off-screen via a Mission Control transform. When the open-file event fires, the app activates correctly, but the window stays at its off-screen slid position because Show Desktop's transform isn't undone by:
+- `app.focus({ steal: true })` — changes which app is active, doesn't reposition windows
+- `setAlwaysOnTop("screen-saver")` — changes z-order, doesn't reposition
+- AppleScript `tell application X to activate` — same as `app.focus`
+- `setVisibleOnAllWorkspaces` — affects Spaces, not Show Desktop
+
+**Fix:** in `bringWindowForward`, before the focus pulse:
+1. Capture `target.getBounds()`.
+2. Use `screen.getAllDisplays()` to test whether the rect intersects any display's bounds. If NO display intersects, the window is fully off-screen — i.e. Show Desktop slid it past the edge.
+3. If off-screen: call `setBounds()` with a centered rect on the primary display's work area, sized to the original (clamped to fit). This forces a reposition that breaks the Show Desktop transform — the window snaps back to where the user can see it.
+4. If on-screen: re-`setBounds(originalBounds)` to break any in-progress slide. AppKit no-ops if bounds didn't change at the system level, so this is cheap when nothing's wrong.
+
+Plus expanded logging — bounds before AND after the pulse appear in `/tmp/weavepdf-quickaction.log`. So if there's still an edge case, the log shows whether the reposition actually happened and where.
+
+**Why this works:** Show Desktop is implemented at the WindowServer level as a temporary geometry transform on every visible window. `setBounds` on an Electron BrowserWindow calls `[NSWindow setFrame:display:animate:]`, which is a hard reposition that supersedes the Show-Desktop transform. The window snaps back to a real position; the user sees it.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.24`.
+- Bumped V1.0023 → V1.0024 per Critical Rule #12.
+- V1.0023 trace confirmed pulse machinery works for non-Show-Desktop background; V1.0024 adds the Show Desktop layer specifically.
+- Manual end-to-end re-verification still pending — user should test the same scenario (Fn/Globe key to Show Desktop, double-click PDF on Desktop). If reposition logged but window still hidden, share `/tmp/weavepdf-quickaction.log` showing bounds before/after.
+
+**Files touched:** [src/main/main.ts](src/main/main.ts) (`bringWindowForward` adds bounds capture + intersect check + reposition + before/after bounds logging), [package.json](package.json), [HANDOFF.md](HANDOFF.md), [CHANGELOG.md](CHANGELOG.md).
 
 ### 2026-04-29 — V1.0023: bulletproof file-open focus (AppleScript + cross-Space + tracing)
 
