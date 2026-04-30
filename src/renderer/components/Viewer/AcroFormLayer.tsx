@@ -83,8 +83,18 @@ export function AcroFormLayer({ pdf, pageNumber, zoom, pageHeightPt }: Props) {
   return (
     <div className="absolute inset-0 z-[6]" data-testid="acroform-layer">
       {widgets.map((widget, index) => (
+        // V1.0039: key MUST be stable across `applyEdit` re-renders. Earlier
+        // we keyed on `${name}-${index}-${activeTab.version}` — version
+        // bumps every applyEdit (e.g. on field commit), which made React
+        // unmount and remount the entire DOM for every widget, including
+        // the one the user just Tab'd into. Effect: type in field A, press
+        // Tab, the browser focuses field B, our blur on A triggers
+        // setFormFields → applyEdit → version++ → ALL widgets remount → B
+        // loses focus mid-key, and the next-typed character goes into the
+        // void. Stable key keeps the same input element in the DOM, so
+        // browser-native Tab navigation survives the async commit.
         <FieldWidget
-          key={`${widget.name}-${index}-${activeTab.version}`}
+          key={`${widget.name}-${index}`}
           widget={widget}
           zoom={zoom}
           pageHeightPt={pageHeightPt}

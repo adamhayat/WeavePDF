@@ -5,7 +5,16 @@
 
 ## Current State
 
-**Status:** **V1.0038 — Form-field text actually has horizontal padding now.** V1.0037's setFontSize-only fix only handled vertical padding; the user shipped a screenshot showing "hello" still flush against the left border. Real fix: set the widget's `BorderStyle.W` to 3pt + call `form.updateFieldAppearances()` to bake the `/AP` stream into the PDF. pdf-lib's appearance generator uses `widget rect - 2*(borderWidth + 1)` for the content rect, so width=3 gives 8pt total horizontal padding (4pt each side). Border COLOR isn't set, so no visible line. Verified by dumping the generated stream — content clip at (4, 4)→(375, 18), text Tm at x=4. QA-tested 3 scenarios (text+checkbox combo, no-op, all 14 text fields) without regression.
+**Status:** **V1.0039 — Tab moves to the next fillable field now.** User reported: click field A, type, press Tab to go to field B, type — field B stayed empty. Reproduced live via computer-use against `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf`. **Two-layer fix needed** — first attempt only patched the inner layer:
+
+1. **Inner: `<FieldWidget>` was keyed on `${name}-${index}-${activeTab.version}`.** Stabilised the key in [src/renderer/components/Viewer/AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx) so commits don't remount widgets within a page. Necessary but insufficient.
+2. **Outer: `<PageCanvas>` was keyed on `${id}-${version}-${page}` in [src/renderer/components/Viewer/Viewer.tsx](src/renderer/components/Viewer/Viewer.tsx).** Every `applyEdit` bumped `version`, remounting the entire page subtree — including AcroFormLayer's `<input>` elements. The defensive comment at the call site claimed this was needed to "force a fresh canvas after edits," but PageCanvas's render `useEffect` already depends on `pdf` and re-runs the canvas+textLayer build on every `pdf` prop change. The version-in-key was the actual bug.
+
+After both fixes, end-to-end test passed via computer-use: clicked Postal Code → typed `M5V 3A8` → Tab → typed `Adam Hayat` → Tab → typed `me@adamhayat.ca`. All three fields retained their values, baked appearances rendered correctly. Postal Code, Contact, Email all populated as expected.
+
+**Open follow-up the user just raised: drop the "Restore unsaved work?" prompt entirely; surface drafts in a left-sidebar Revisions tab instead.** Defer this to V1.0040 — it's a sidebar-UI change beyond the Tab-fix scope and shouldn't block the Tab release.
+
+**V1.0038 base (carried forward):** Form-field text actually has horizontal padding now. V1.0037's setFontSize-only fix only handled vertical padding; the user shipped a screenshot showing "hello" still flush against the left border. Real fix: set the widget's `BorderStyle.W` to 3pt + call `form.updateFieldAppearances()` to bake the `/AP` stream into the PDF. pdf-lib's appearance generator uses `widget rect - 2*(borderWidth + 1)` for the content rect, so width=3 gives 8pt total horizontal padding (4pt each side). Border COLOR isn't set, so no visible line. Verified by dumping the generated stream — content clip at (4, 4)→(375, 18), text Tm at x=4. QA-tested 3 scenarios (text+checkbox combo, no-op, all 14 text fields) without regression.
 
 **V1.0037 base (carried forward):** Fillable text padding while editing AND after commit. Two complementary fixes:
 

@@ -155,14 +155,22 @@ export function Viewer() {
       <div className="mx-auto flex w-fit flex-col items-center gap-6 px-10 py-8">
         {rows.map((pages, rowIdx) => (
           <div
-            key={`row-${activeTab.version}-${rowIdx}`}
+            key={`row-${activeTab.id}-${rowIdx}`}
             className={pages.length === 2 ? "flex flex-row items-start gap-3" : ""}
           >
             {pages.map((p) => (
               <PageCanvas
-                // Include version so edits (which destroy + replace the pdf.js
-                // document) force PageCanvas to remount with a fresh canvas.
-                key={`${activeTab.id}-${activeTab.version}-${p}`}
+                // V1.0039: key MUST be stable across applyEdit. Earlier we
+                // included `activeTab.version` to "force a fresh canvas after
+                // edits", but PageCanvas already re-runs its render effect on
+                // every `pdf` prop change (deps include `pdf`), so the canvas
+                // refreshes without remounting. Keying on version was making
+                // every applyEdit unmount + remount the entire page subtree —
+                // including AcroFormLayer's <input>s, which is why typing into
+                // form field A and pressing Tab to field B caused field B to
+                // miss the next keystrokes (the input element didn't exist
+                // yet at that moment).
+                key={`${activeTab.id}-${p}`}
                 ref={(el) => {
                   if (el) pageRefs.current.set(p, el);
                   else pageRefs.current.delete(p);
