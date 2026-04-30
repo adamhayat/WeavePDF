@@ -5,12 +5,21 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Changed + Added + Fixed — V1.0036: fillable PDFs editable on page + form text no longer doubled + save clears autosave draft synchronously (2026-04-29)
+- **Fillable PDF fields render directly on the page.** Text fields, checkboxes, radio buttons, and dropdown widgets from pdf.js annotations are placed at their real PDF coordinates in [src/renderer/components/Viewer/AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx). Open a fillable PDF and type/check/select in place — no banner, no Fill button, no modal-first flow.
+- **Field edits write back to the real AcroForm.** Text fields commit on blur; checkboxes/radio/dropdowns commit on change through `setFormFields` + `applyEdit`, so the tab becomes dirty and normal save/export/undo behaviour applies.
+- **Removed V1.0035 FillableBanner.** The stopgap "This is a fillable PDF → Fill form" banner is gone; the page is the interface. FormFillModal remains as a palette fallback.
+- **Form text no longer renders doubled / crossed-out.** When the user typed "Hello" in a text widget, both the HTML `<input>` overlay AND pdf.js's re-rendered widget appearance dictionary (after `setFormFields` baked the value) showed the same text slightly offset. V1.0036 makes the input text `color: transparent` by default so only pdf.js's bake renders; on focus, switches to opaque black so the user can see their typing; on blur, returns to transparent. Caret stays visible always.
+- **Save now clears the autosave draft synchronously.** V1.0035's tightened autosave required `tab.history.length > 0`, but after `markClean` clears history, the persistence hook waited 1500 ms (debounce) before clearing the draft on disk. Closing the tab inside that window left the draft stranded → next reopen still prompted "Restore unsaved work?". V1.0036 [src/renderer/App.tsx](src/renderer/App.tsx) `saveActiveAs` calls `await window.weavepdf.drafts.clear(...)` immediately after `writeFile` succeeds, before `markClean`. Belt-and-braces: clears both the old `draftKey` and the new `targetPath`.
+- **Bumped V1.0035 → V1.0036** per Critical Rule #12.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.36`. Codex's manual Playwright smoke against `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf` found 14 text + 5 checkbox widgets and verified in-place fill works.
+
 ### Fixed + Added — V1.0035: spurious "Restore unsaved work?" suppressed + FillableBanner for AcroForm PDFs (2026-04-29)
 - **No more spurious restore prompts.** Autosave now requires a committed change (`tab.history.length > 0`) before persisting a draft — pure pending overlays alone (e.g. an accidental shape from clicking a fillable PDF's annotation layer) no longer trigger a draft. User reported the prompt firing on a fillable PDF where no intentional edits were made; that's resolved. The V1.0026 close-confirm dialog still warns on intentional close so real pending overlays aren't lost silently.
 - **FillableBanner surfaces FormFillModal for AcroForm PDFs.** New banner ([src/renderer/components/FillableBanner/FillableBanner.tsx](src/renderer/components/FillableBanner/FillableBanner.tsx)) detects form fields on active-tab change via `getFormFields` and shows: "This is a fillable PDF. N form fields detected. [Fill form] [Don't suggest again] [×]". Click "Fill form" → opens the existing FormFillModal which lists each field and writes values back via `setFormFields`. Per-tab dismissal + global localStorage suppress flag. Lazy-loads `pdf-ops` so the boot path stays light.
-- **In-place form-widget rendering** (typing directly on the page where the field is) is still pending — substantial feature, V1.0036+. V1.0035's banner unblocks usability today.
+- **In-place form-widget rendering** was still pending in V1.0035 and shipped next in V1.0036.
 - **Bumped V1.0034 → V1.0035** per Critical Rule #12.
-- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.35`. The autosave change is one condition tightening; the banner is new lazy code with no boot-path impact.
+- **Tests:** `npm run typecheck` clean against `weavepdf@1.0.35`. The autosave change is one condition tightening; the banner was new lazy code with no boot-path impact.
 
 ### Fixed — V1.0034: Convert fallback restored after notification bridge miss (2026-04-29)
 - **Fixed `Convert to PDF` doing nothing from Finder right-click.** V1.0033's warm-app notification path returned immediately after posting to the bridge. On the user's live Finder Sync path, that notification was not reaching WeavePDF, so the action never fell back to the proven `NSWorkspace.open` URL dispatch.

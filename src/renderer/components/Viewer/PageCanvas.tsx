@@ -8,6 +8,7 @@ import { StickyPromptOverlay } from "./StickyPromptOverlay";
 import { PendingTextLayer } from "./PendingTextLayer";
 import { PendingImageLayer } from "./PendingImageLayer";
 import { PendingShapeLayer } from "./PendingShapeLayer";
+import { AcroFormLayer } from "./AcroFormLayer";
 import { bytesToBlob } from "../../../shared/buffers";
 
 type Props = {
@@ -711,6 +712,14 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         className="rounded-[var(--radius-page)]"
       />
       <div ref={textLayerRef} className="textLayer" aria-hidden={false} />
+      {pageSize && (
+        <AcroFormLayer
+          pdf={pdf}
+          pageNumber={pageNumber}
+          zoom={zoom}
+          pageHeightPt={pageSize.h}
+        />
+      )}
       {toolActive && (
         <div
           onClick={isDragTool ? undefined : handleInteractionClick}

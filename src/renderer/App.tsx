@@ -19,7 +19,6 @@ import { CommandPalette, type PaletteAction } from "./components/CommandPalette/
 import { ContextMenu } from "./components/ContextMenu/ContextMenu";
 import { LinkPopover } from "./components/LinkPopover/LinkPopover";
 import { DefaultPdfBanner } from "./components/DefaultPdfBanner/DefaultPdfBanner";
-import { FillableBanner } from "./components/FillableBanner/FillableBanner";
 
 // Modal components — rendered conditionally based on `*Open` state in the ui
 // store. None of them are visible at boot, so we lazy-load each so its bundle
@@ -567,6 +566,20 @@ export function App() {
       if (!targetPath) return;
       const result = await window.weavepdf.writeFile(targetPath, toArrayBuffer(refreshed.bytes));
       if (result.ok) {
+        // V1.0036: clear the autosave draft slots BEFORE markClean, while
+        // we still have the previous draftKey. The autosave hook would do
+        // this on its next debounced flush after history clears, but the
+        // user can close the tab inside the 1500 ms window and the
+        // scheduled flush gets GC'd — leaving a stale draft on disk that
+        // re-prompts "Restore unsaved work?" on the next reopen even
+        // though the file has been saved. Clear synchronously instead.
+        const oldDraftKey = refreshed.draftKey;
+        await window.weavepdf.drafts.clear(oldDraftKey).catch(() => {});
+        if (oldDraftKey !== targetPath) {
+          // Belt-and-braces: virtual → saved transitions also nuke the
+          // would-be new slot in case anything queued a write before us.
+          await window.weavepdf.drafts.clear(targetPath).catch(() => {});
+        }
         markClean(refreshed.id, targetPath);
       } else {
         alert(`Save failed: ${result.error}`);
@@ -1342,7 +1355,6 @@ export function App() {
     <div className="flex h-full flex-col bg-[var(--app-bg)] text-[var(--app-fg)]">
       <Titlebar onOpen={openFile} onSave={() => saveCurrent(false)} onExport={exportCombined} />
       <DefaultPdfBanner />
-      <FillableBanner />
       {hasDocs && activeTab?.bytes && (
         <Toolstrip
           onSave={() => saveCurrent(false)}
