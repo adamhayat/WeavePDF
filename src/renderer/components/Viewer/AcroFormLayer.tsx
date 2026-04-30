@@ -153,9 +153,13 @@ function FieldWidget({
       <input
         aria-label={widget.name}
         data-testid="acroform-text"
-        className="acroform-text-input absolute rounded-[2px] border border-transparent bg-transparent px-1 text-[12px] leading-none outline-none transition-colors hover:border-[rgba(59,76,202,0.35)] focus:border-[var(--color-accent)] focus:bg-white focus:ring-1 focus:ring-[var(--color-accent)] disabled:opacity-60"
+        className="acroform-text-input absolute rounded-[2px] border border-transparent bg-transparent text-[12px] leading-normal outline-none transition-colors hover:border-[rgba(59,76,202,0.35)] focus:border-[var(--color-accent)] focus:bg-white focus:ring-1 focus:ring-[var(--color-accent)] disabled:opacity-60"
         style={{
           ...style,
+          paddingLeft: Math.max(6, 4 * zoom),
+          paddingRight: Math.max(6, 4 * zoom),
+          paddingTop: 0,
+          paddingBottom: 0,
           // Transparent text by default → only pdf.js shows the value.
           // Caret stays visible so the user can see the focus position.
           color: "transparent",

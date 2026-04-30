@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0037: fillable text padding while editing AND after commit (2026-04-29)
+- **Active fillable text fields no longer glue typed text to the border.** The in-page AcroForm text overlay uses a zoom-aware horizontal inset (`max(6px, 4pt * zoom)`) and normal line-height while focused.
+- **Baked appearance has padding too.** `setFormFields` ([src/renderer/lib/pdf-ops.ts](src/renderer/lib/pdf-ops.ts)) now calls `field.setFontSize(target)` after `setText` where `target = max(8, min(14, fieldHeight - 6))`. pdf-lib's default font size 0 (auto-fit) was scaling text to fill the entire field height — text touched top + bottom borders even after commit. Field of 22pt height → 14pt font → 8pt total padding (4pt top + 4pt bottom).
+- **Verified** programmatically against `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf` (20 fields, 22pt-tall text fields → 14pt target font → output PDF 269,772 bytes, opens cleanly).
+- **Bumped V1.0036 → V1.0037** per Critical Rule #12.
+
 ### Changed + Added + Fixed — V1.0036: fillable PDFs editable on page + form text no longer doubled + save clears autosave draft synchronously (2026-04-29)
 - **Fillable PDF fields render directly on the page.** Text fields, checkboxes, radio buttons, and dropdown widgets from pdf.js annotations are placed at their real PDF coordinates in [src/renderer/components/Viewer/AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx). Open a fillable PDF and type/check/select in place — no banner, no Fill button, no modal-first flow.
 - **Field edits write back to the real AcroForm.** Text fields commit on blur; checkboxes/radio/dropdowns commit on change through `setFormFields` + `applyEdit`, so the tab becomes dirty and normal save/export/undo behaviour applies.

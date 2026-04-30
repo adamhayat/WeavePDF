@@ -5,7 +5,16 @@
 
 ## Current State
 
-**Status:** **V1.0036 — Fillable PDFs editable directly on page + form text no longer renders doubled + save clears autosave draft synchronously.** Three fixes layered into one version:
+**Status:** **V1.0037 — Fillable text padding while editing AND after commit.** Two complementary fixes:
+
+1. **HTML input padding while focused** (Codex, [AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx)): focused text inputs use a zoom-aware horizontal inset (`max(6px, 4pt * zoom)`) and normal line-height so the typed text + caret have breathing room from the widget border while editing.
+2. **pdf-lib baked-appearance padding after commit** ([pdf-ops.ts](src/renderer/lib/pdf-ops.ts) `setFormFields`): pdf-lib's default appearance uses font size 0 (auto-fit), scaling text to fill the entire field height — touches top + bottom borders. V1.0037 calls `field.setFontSize(target)` after `setText` where `target = max(8, min(14, fieldHeight - 6))`. The user's contract has 22pt-tall text fields → 14pt font → 4pt top + 4pt bottom padding visible after commit + pdf.js re-render.
+
+Verified programmatically against the user's `/Users/adamhayat/Desktop/2026-CCC-Credit-Card-Authorization-Form-fillable.pdf`: 20 fields total, text fields 22pt tall, target font 14pt, output PDF written cleanly (269,772 bytes).
+
+Pending: user also flagged "opening for the first time, especially when it asks for my Mac password, is a bit glitchy." That's the first-run safeStorage Keychain prompt visual disruption — flagged for follow-up. App is signed with the trusted `WeavePDF Local` cert per V1.0027 setup so subsequent installs should be silent; first-install one-time prompt is acceptable until Apple Developer ID notarization.
+
+**V1.0036 base (carried forward):** Fillable PDFs editable directly on page + form text no longer renders doubled + save clears autosave draft synchronously. Three fixes layered into one version:
 
 A. **Fillable PDFs editable directly on the page** (Codex). New [src/renderer/components/Viewer/AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx), mounted by [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx). For each visible page, reads pdf.js widget annotations (`page.getAnnotations({ intent: "display" })`) and renders real HTML controls at the annotation rectangle: text inputs, checkboxes, radio buttons, dropdowns. Text commits on blur; button/select controls commit on change. Commits reuse `setFormFields` + `applyEdit`. The V1.0035 FillableBanner was removed; FormFillModal remains as palette-only fallback.
 

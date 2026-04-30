@@ -1027,6 +1027,28 @@ export async function setFormFields(
       const field = form.getField(v.name);
       if (v.kind === "text" && field instanceof PDFTextField) {
         field.setText(v.value);
+        // V1.0037: pdf-lib's default appearance generator uses a font size
+        // of 0 (auto-fit), which scales the text to fill the entire field
+        // height — text ends up flush against top + bottom + left borders
+        // with no internal padding, which the user reads as "appended to
+        // the border". Set an explicit size that leaves ~3pt of breathing
+        // room top + bottom. setFontSize after setText regenerates the
+        // appearance stream with the new size.
+        try {
+          const widgets = field.acroField.getWidgets();
+          const rect = widgets[0]?.getRectangle();
+          if (rect) {
+            const fieldHeight = Math.abs(rect.height);
+            // Leave 6pt total padding (3pt top, 3pt bottom). Clamp 8..14pt
+            // — typical form-field font range; smaller fields still get
+            // 8pt minimum for readability.
+            const target = Math.max(8, Math.min(14, fieldHeight - 6));
+            field.setFontSize(target);
+          }
+        } catch {
+          // Some fields don't support setFontSize (e.g. multiline with
+          // explicit DA); leave as-is rather than abort.
+        }
       } else if (v.kind === "checkbox" && field instanceof PDFCheckBox) {
         if (v.checked) field.check();
         else field.uncheck();
