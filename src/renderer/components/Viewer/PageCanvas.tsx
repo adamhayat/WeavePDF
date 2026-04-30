@@ -283,6 +283,12 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
   const pointerDownDrag = (e: React.PointerEvent<HTMLDivElement>) => {
     if (!isDragTool) return;
     e.stopPropagation();
+    // V1.0042: pointer-down on the tool overlay also drops any prior pending
+    // selection. Without this, clicking on the page while a drag tool is
+    // active wouldn't reach Viewer's background pointer-down (it stops
+    // propagation here), so handles on a previously-placed image/text/shape
+    // would stay visible until the user pressed Escape or switched tabs.
+    useUIStore.getState().clearAllPendingSelections();
     const rect = (e.currentTarget as HTMLDivElement).getBoundingClientRect();
     dragStart.current = { x: e.clientX - rect.left, y: e.clientY - rect.top };
     if (tool === "draw") {
