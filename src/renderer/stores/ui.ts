@@ -35,7 +35,7 @@ type UIStore = {
   // Most-recently-used colours (max 6) — shown in ColorPopover as a quick
   // re-pick strip. Capped to the most recent unique entries.
   recentColors: Array<{ r: number; g: number; b: number }>;
-  sidebarTab: "pages" | "outline";
+  sidebarTab: "pages" | "outline" | "revisions";
   // Page layout in the viewer:
   //   single — vertical scroll, one page wide (default)
   //   spread — two pages side-by-side, no cover offset

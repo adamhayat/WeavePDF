@@ -75,11 +75,6 @@ const RecentDraftsModal = lazy(() =>
     default: m.RecentDraftsModal,
   })),
 );
-const RestoreDraftModal = lazy(() =>
-  import("./components/RestoreDraftModal/RestoreDraftModal").then((m) => ({
-    default: m.RestoreDraftModal,
-  })),
-);
 const PrintPreviewModal = lazy(() =>
   import("./components/PrintPreviewModal/PrintPreviewModal").then((m) => ({
     default: m.PrintPreviewModal,
@@ -301,15 +296,6 @@ export function App() {
   // the tab or quitting the app.
   useDraftPersistence();
 
-  // When loadAsTab finds an autosaved draft for a path being opened, it
-  // surfaces here so the user can choose Restore / Open original / Cancel.
-  // The promise resolver lets the caller wait for the user's pick.
-  const [restorePrompt, setRestorePrompt] = useState<{
-    manifest: DraftManifest;
-    record: DraftRecord;
-    resolve: (choice: "restore" | "discard" | "cancel") => void;
-  } | null>(null);
-
   // Password-prompt state. When `loadAsTab` hits an encrypted PDF it stashes
   // the original bytes + filename + a pair of resolver callbacks here; the
   // PasswordModal consumes them, calls qpdf.decrypt, and returns the plaintext
@@ -405,26 +391,10 @@ export function App() {
 
   const loadAsTab = useCallback(
     async (payload: LoadedPayload) => {
-      // If we have a real path and an autosaved draft sits in the user's
-      // draft slot, prompt before opening — they may want to resume.
-      if (payload.path) {
-        const existing = await window.weavepdf.drafts.load(payload.path);
-        if (existing) {
-          const choice = await new Promise<"restore" | "discard" | "cancel">(
-            (resolve) => {
-              setRestorePrompt({ manifest: existing.manifest, record: existing, resolve });
-            },
-          );
-          if (choice === "cancel") return;
-          if (choice === "restore") {
-            await openTabFromDraft(existing, payload);
-            return;
-          }
-          // Discard fall-through: clear the slot, then continue to a clean open.
-          await window.weavepdf.drafts.clear(payload.path);
-        }
-      }
-
+      // V1.0040: removed the "Restore unsaved work?" modal that fired on every
+      // open with an autosaved draft. Drafts now surface in the left-sidebar
+      // Revisions tab — no interruption just for opening a file. The slot is
+      // preserved on the new tab's draftKey so restore from the sidebar works.
       let bytes = payload.bytes;
       // V1.0020: explicit flag instead of `bytes === payload.bytes` identity
       // check below. The identity comparison silently flipped to `false` if
@@ -775,7 +745,6 @@ export function App() {
     welcomeOpen ||
     contextMenuOpen ||
     measurePromptOpen ||
-    !!restorePrompt ||
     !!passwordPrompt ||
     !!encryptPrompt;
 
@@ -1365,7 +1334,7 @@ export function App() {
       <div className="flex min-h-0 flex-1">
         {hasDocs && activeTab?.bytes ? (
           <>
-            <Sidebar />
+            <Sidebar onRestoreRevision={handleRestoreFromList} />
             <main className="relative flex min-w-0 flex-1 flex-col">
               <Viewer />
               {searchOpen && activeTab && <SearchBar />}
@@ -1478,25 +1447,6 @@ export function App() {
         )}
       </Suspense>
       <LinkPopover />
-      {restorePrompt && (
-        <Suspense fallback={null}>
-          <RestoreDraftModal
-            manifest={restorePrompt.manifest}
-            onRestore={() => {
-              restorePrompt.resolve("restore");
-              setRestorePrompt(null);
-            }}
-            onDiscardAndOpen={() => {
-              restorePrompt.resolve("discard");
-              setRestorePrompt(null);
-            }}
-            onCancel={() => {
-              restorePrompt.resolve("cancel");
-              setRestorePrompt(null);
-            }}
-          />
-        </Suspense>
-      )}
       <CommandPalette open={paletteOpen} onClose={closePalette} actions={actions} />
     </div>
   );

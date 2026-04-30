@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Changed + Added + Removed — V1.0040: drafts surface in a Revisions sidebar tab; "Restore unsaved work?" modal is gone (2026-04-29, computer-use verified)
+- **Removed the modal that fired on every reopen.** [src/renderer/App.tsx](src/renderer/App.tsx) `loadAsTab` no longer calls `drafts.load` to open `RestoreDraftModal`. Opening a file always goes straight to a clean view. Deleted `src/renderer/components/RestoreDraftModal/` outright.
+- **Added the Revisions sidebar tab.** New [src/renderer/components/Sidebar/RevisionsPanel.tsx](src/renderer/components/Sidebar/RevisionsPanel.tsx) renders next to PAGES and OUTLINE. Lists autosaved drafts whose `sourcePath` or `draftKey` matches the active tab; each entry shows relative time + a one-line summary ("committed edits · 264 KB") with `Restore` (purple) and trash buttons. Restore reuses `handleRestoreFromList` from App.tsx, so the existing draft-load pipeline handles the actual restore.
+- **Autosave no longer nukes the slot when state goes empty.** V1.0035 cleared the slot whenever `tab.history.length === 0` to keep things tidy. That paired with the modal (which surfaced the slot first), but in the new model it would wipe a user's draft within seconds of reopening a file. V1.0040 [src/renderer/hooks/useDraftPersistence.ts](src/renderer/hooks/useDraftPersistence.ts) just returns when there's no state — the prior draft persists quietly until the user picks Restore or Delete in the panel. Explicit save (⌘S) and explicit Delete in the Revisions panel still clear the slot.
+- **Verified live via computer-use:** Opened `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf` → no modal. Revisions tab showed `14m ago · committed edits · 264 KB`. Clicked Restore → new tab with `M5V 3A8 / Adam Hayat / me@adamhayat.ca` populated.
+- **Bumped V1.0039 → V1.0040** per Critical Rule #12.
+
 ### Fixed — V1.0039: Tab key actually moves to the next fillable field now (2026-04-29, computer-use verified)
 - **Reproduced the bug live first.** Opened `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf` via computer-use, clicked Postal Code, typed "M5V 3A8", pressed Tab, typed "Adam Hayat" — Postal Code retained "M5V 3A8" but the Contact field stayed empty. Pressing Tab moved the browser focus to the next field, but the keystrokes that followed went into nothing.
 - **Two-layer root cause.** First attempt only patched the inner layer and the bug still reproduced; had to fix the parent too.

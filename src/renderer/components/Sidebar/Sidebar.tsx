@@ -25,9 +25,19 @@ const loadPdfOps = () => import("../../lib/pdf-ops");
 import { u8ToAb } from "../../../shared/buffers";
 import { cn } from "../../lib/cn";
 import { OutlinePanel } from "./OutlinePanel";
+import { RevisionsPanel } from "./RevisionsPanel";
 import { PromptModal } from "../PromptModal/PromptModal";
+import type { DraftManifest } from "../../../shared/ipc";
 
-export function Sidebar() {
+type Props = {
+  /**
+   * Restore a draft from the Revisions tab. Implementation lives in App.tsx
+   * because draft restore touches the file system and tab/document store.
+   */
+  onRestoreRevision: (manifest: DraftManifest) => Promise<void>;
+};
+
+export function Sidebar({ onRestoreRevision }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const setCurrentPage = useDocumentStore((s) => s.setCurrentPage);
   const selectPage = useDocumentStore((s) => s.selectPage);
@@ -133,9 +143,18 @@ export function Sidebar() {
         >
           Outline
         </SidebarTabButton>
+        <SidebarTabButton
+          active={sidebarTab === "revisions"}
+          onClick={() => setSidebarTab("revisions")}
+          testId="sidebar-tab-revisions"
+        >
+          Revisions
+        </SidebarTabButton>
       </div>
       {sidebarTab === "outline" ? (
         <OutlinePanel />
+      ) : sidebarTab === "revisions" ? (
+        <RevisionsPanel onRestore={onRestoreRevision} />
       ) : selectedCount > 0 ? (
         <div className="flex h-10 shrink-0 items-center justify-between border-b border-[var(--panel-border)] pl-3 pr-1">
           <div className="flex items-center gap-2">
@@ -184,7 +203,7 @@ export function Sidebar() {
         </div>
       )}
 
-      {sidebarTab !== "outline" && <div
+      {sidebarTab === "pages" && <div
         className="acr-scroll flex-1 overflow-y-auto p-3"
         onMouseDown={(e) => {
           // Clicking empty space clears the selection.

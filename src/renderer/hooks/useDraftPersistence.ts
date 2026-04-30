@@ -46,25 +46,18 @@ export function useDraftPersistence(): void {
       // V1.0035: only autosave drafts when the user has APPLIED at least
       // one edit (`tab.history.length > 0`). Pure pending overlays — a
       // single click that created a tiny shape, an accidental highlight on
-      // a fillable PDF's annotation layer — were noisy: they triggered a
-      // "Restore unsaved work?" prompt on every reopen for changes the
-      // user didn't intend. Real edits get committed via applyEdit, which
-      // grows history; THAT's the signal worth restoring across launches.
-      // Tradeoff: a user who draws a shape, doesn't commit, then walks
-      // away and the laptop dies, won't see the shape back. The V1.0026
-      // close-confirm dialog still warns them on intentional close so
-      // they can save first.
+      // a fillable PDF's annotation layer — were noisy. Real edits get
+      // committed via applyEdit, which grows history; THAT's the signal
+      // worth restoring across launches.
+      //
+      // V1.0040: when state goes empty, do NOTHING — we no longer clear the
+      // slot. The old behaviour wiped the slot on every reopen, which paired
+      // fine with the modal (the modal already surfaced the draft). With the
+      // Revisions sidebar tab, we want the prior draft to persist quietly
+      // until the user picks Restore or Delete in the panel. Explicit saves
+      // and explicit Delete-from-Revisions still clear the slot.
       const hasState = tab.history.length > 0;
-      if (!hasState) {
-        // Nuke any stale slot from a previous edit cycle.
-        try {
-          await window.weavepdf.drafts.clear(tab.draftKey);
-          lastSig.current.delete(tab.draftKey);
-        } catch {
-          /* ignore */
-        }
-        return;
-      }
+      if (!hasState) return;
 
       // Cheap signature: counts + version + zoom/page + first 32 bytes of
       // the bytes hash via length/version. If unchanged, nothing to do.

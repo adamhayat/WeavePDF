@@ -5,7 +5,19 @@
 
 ## Current State
 
-**Status:** **V1.0039 — Tab moves to the next fillable field now.** User reported: click field A, type, press Tab to go to field B, type — field B stayed empty. Reproduced live via computer-use against `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf`. **Two-layer fix needed** — first attempt only patched the inner layer:
+**Status:** **V1.0040 — "Restore unsaved work?" modal is gone; drafts surface in a Revisions sidebar tab instead.** User asked: "stop asking me if I want to reopen the original copy. Maybe instead of asking when a file opens, just keep a 'revision history' tab on the left sidebar for the file?" — also flagged that the modal fired even with no real changes.
+
+Three changes:
+
+1. **Removed the modal entirely.** [src/renderer/App.tsx](src/renderer/App.tsx) `loadAsTab` no longer calls `drafts.load` + opens `RestoreDraftModal`. Files always open clean. Deleted `src/renderer/components/RestoreDraftModal/`.
+2. **New Revisions sidebar tab.** [src/renderer/components/Sidebar/RevisionsPanel.tsx](src/renderer/components/Sidebar/RevisionsPanel.tsx) — third tab next to PAGES and OUTLINE. Lists drafts whose `sourcePath`/`draftKey` matches the active tab. Each entry shows relative time + summary ("committed edits · 264 KB") with [Restore] and trash buttons. Restore reuses the existing `handleRestoreFromList` callback from App.tsx, so the same in-memory draft pipeline handles the load. Lazy refresh on `activeTab.version` bump so freshly autosaved drafts surface without tab switching.
+3. **Autosave stops nuking the slot when state goes empty.** [src/renderer/hooks/useDraftPersistence.ts](src/renderer/hooks/useDraftPersistence.ts) — V1.0035 used to call `drafts.clear` whenever `tab.history.length === 0` to keep the slot tidy. That paired fine with the modal (which surfaced the slot first), but in the new model it would wipe the user's draft seconds after they reopened a file they intended to come back to. V1.0040 just returns when there's no state — the prior draft persists quietly until the user picks Restore or Delete in the Revisions panel. Explicit save (⌘S) and explicit Delete from the panel still clear the slot.
+
+**Verified live via computer-use:** Opened the user's `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf` from Desktop → file opened directly with NO modal. Switched to Revisions tab → showed prior `14m ago / committed edits · 264 KB` entry. Clicked Restore → new tab opened with `M5V 3A8 / Adam Hayat / me@adamhayat.ca` all populated.
+
+**Note on "phantom drafts" the user mentioned:** No `applyEdit` fires on file open without user action — every `applyEdit` caller in the codebase is user-initiated. The most likely source of past phantom-feeling drafts is checkbox toggles (every change commits) or text-field blurs that pre-V1.0036 had transparent CSS that hid typed text. With V1.0036+ the typing is visible; with V1.0040 the modal won't interrupt either way.
+
+**V1.0039 base (carried forward):** Tab moves to the next fillable field now. User reported: click field A, type, press Tab to go to field B, type — field B stayed empty. Reproduced live via computer-use against `2026-CCC-Credit-Card-Authorization-Form-fillable.pdf`. **Two-layer fix needed** — first attempt only patched the inner layer:
 
 1. **Inner: `<FieldWidget>` was keyed on `${name}-${index}-${activeTab.version}`.** Stabilised the key in [src/renderer/components/Viewer/AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx) so commits don't remount widgets within a page. Necessary but insufficient.
 2. **Outer: `<PageCanvas>` was keyed on `${id}-${version}-${page}` in [src/renderer/components/Viewer/Viewer.tsx](src/renderer/components/Viewer/Viewer.tsx).** Every `applyEdit` bumped `version`, remounting the entire page subtree — including AcroFormLayer's `<input>` elements. The defensive comment at the call site claimed this was needed to "force a fresh canvas after edits," but PageCanvas's render `useEffect` already depends on `pdf` and re-runs the canvas+textLayer build on every `pdf` prop change. The version-in-key was the actual bug.
