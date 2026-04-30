@@ -140,6 +140,13 @@ type UIStore = {
   setSelectedPendingImage: (id: string | null) => void;
   setSelectedPendingText: (id: string | null) => void;
   setSelectedPendingShape: (id: string | null) => void;
+  /**
+   * Drop selection from every pending-edit kind in one call. Used by the
+   * Viewer's background-click handler so clicking off a placed image/text/
+   * shape removes its selection chrome (resize handles, X delete badge,
+   * font-size +/-, etc.) — same affordance as Figma/Keynote.
+   */
+  clearAllPendingSelections: () => void;
   setEditingPendingText: (id: string | null) => void;
   openContextMenu: (x: number, y: number, items: ContextMenuItem[]) => void;
   closeContextMenu: () => void;
@@ -266,6 +273,13 @@ export const useUIStore = create<UIStore>((set) => ({
   setSelectedPendingImage: (id) => set({ selectedPendingImageId: id }),
   setSelectedPendingText: (id) => set({ selectedPendingTextId: id }),
   setSelectedPendingShape: (id) => set({ selectedPendingShapeId: id }),
+  clearAllPendingSelections: () =>
+    set({
+      selectedPendingImageId: null,
+      selectedPendingTextId: null,
+      selectedPendingShapeId: null,
+      editingPendingTextId: null,
+    }),
   setEditingPendingText: (id) => set({ editingPendingTextId: id }),
   openContextMenu: (x, y, items) => set({ contextMenu: { x, y, items } }),
   closeContextMenu: () => set({ contextMenu: null }),

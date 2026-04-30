@@ -224,6 +224,7 @@ function PendingText({ edit, zoom, pageHeightPx, tabId }: PendingTextProps) {
       }}
       data-testid="pending-text"
       data-edit-id={edit.id}
+      data-pending-element="text"
       data-x-pt={edit.xPt.toFixed(2)}
       data-y-pt={edit.yPt.toFixed(2)}
     >

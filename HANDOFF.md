@@ -5,7 +5,13 @@
 
 ## Current State
 
-**Status:** **V1.0040 — "Restore unsaved work?" modal is gone; drafts surface in a Revisions sidebar tab instead.** User asked: "stop asking me if I want to reopen the original copy. Maybe instead of asking when a file opens, just keep a 'revision history' tab on the left sidebar for the file?" — also flagged that the modal fired even with no real changes.
+**Status:** **V1.0041 — selection chrome on placed elements clears on background click + ⌘S now saves in place for opened files.** Two user-reported bugs from the V1.0040 session:
+
+1. **Selection handles around placed elements stayed visible after the user clicked elsewhere.** Image crop/X handles, text font-size +/- and X delete badge, shape resize handles all persisted because nothing deselected on outside click. Fix in [src/renderer/components/Viewer/Viewer.tsx](src/renderer/components/Viewer/Viewer.tsx): the scroller now has an `onPointerDown` that calls `clearAllPendingSelections()` whenever the click target isn't inside a `[data-pending-element]` ancestor (or an interactive control). Each pending layer (image, text, shape) calls `e.stopPropagation()` in its own pointer-down so the scroller handler only fires for true background clicks. Added a new `clearAllPendingSelections` action to [stores/ui.ts](src/renderer/stores/ui.ts) that wipes `selectedPendingImageId`, `selectedPendingTextId`, `selectedPendingShapeId`, `editingPendingTextId` in one call. Two shape variants (rect, ellipse) were missing `e.stopPropagation()` and got it added.
+
+2. **⌘S didn't save.** Pre-V1.0041 `addTab` defaulted `saveInPlace: false`. The save flow's `mustPrompt = forceSaveAs || !targetPath || !refreshed.saveInPlace` meant the FIRST ⌘S on an opened file always opened a Save-As dialog. The user expected ⌘S to overwrite the file they just opened (every other Mac app works that way) and reading the dialog as "Save As" interrupted them mid-edit. Fix in [stores/document.ts](src/renderer/stores/document.ts): `saveInPlace: init.saveInPlace ?? !!init.path`. Tabs with a real path now save in place by default; decrypted-encrypted files explicitly drop their `path` to `null` (existing logic in App.tsx) so they still route to Save-As — Critical Rule #6 holds. Virtual tabs (combine / image-import) also have `path === null` → still Save-As. Only normal opened files become quiet ⌘S.
+
+**V1.0040 base (carried forward):** "Restore unsaved work?" modal is gone; drafts surface in a Revisions sidebar tab instead. User asked: "stop asking me if I want to reopen the original copy. Maybe instead of asking when a file opens, just keep a 'revision history' tab on the left sidebar for the file?" — also flagged that the modal fired even with no real changes.
 
 Three changes:
 

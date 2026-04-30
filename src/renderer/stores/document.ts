@@ -234,7 +234,15 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       id,
       name: init.name,
       path: init.path,
-      saveInPlace: init.saveInPlace ?? false,
+      // V1.0041: default `saveInPlace` to `true` whenever the tab has a real
+      // disk path. Pre-V1.0041 we defaulted to `false`, which routed every
+      // first ⌘S into a Save-As dialog — confusing UX (user expects ⌘S to
+      // overwrite the file they just opened). Decrypted files, virtual tabs
+      // (combine / image-import / new), and anywhere `init.path === null`
+      // still get `false` so we never silently overwrite an encrypted
+      // original or a synthesised in-memory document. Critical Rule #6 is
+      // upheld: the path-less case still routes to Save-As.
+      saveInPlace: init.saveInPlace ?? !!init.path,
       draftKey: init.draftKey ?? init.path ?? `weavepdf-virtual://${id}`,
       sizeBytes: init.sizeBytes,
       bytes: init.bytes,

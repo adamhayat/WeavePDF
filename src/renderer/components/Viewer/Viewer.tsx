@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef } from "react";
 import { useDocumentStore } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import { PageCanvas } from "./PageCanvas";
@@ -7,6 +7,7 @@ export function Viewer() {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const setCurrentPage = useDocumentStore((s) => s.setCurrentPage);
   const viewMode = useUIStore((s) => s.viewMode);
+  const clearAllPendingSelections = useUIStore((s) => s.clearAllPendingSelections);
   const scrollerRef = useRef<HTMLDivElement>(null);
   const pageRefs = useRef<Map<number, HTMLDivElement>>(new Map());
   // During smooth scroll triggered by programmatic nav (search, thumbnail click),
@@ -145,12 +146,35 @@ export function Viewer() {
     return out;
   }, [activeTab, viewMode]);
 
+  // V1.0041: clicking on the page background (not on a placed pending image,
+  // text, or shape) drops their selection chrome — same affordance as Figma,
+  // Keynote, Acrobat. Each pending element calls e.stopPropagation() in its
+  // own pointerdown handlers, so this fires ONLY for true background clicks.
+  // We also exclude clicks that originate inside the AcroFormLayer (form
+  // <input>s) so typing in a fillable field doesn't deselect a placed sig.
+  const handleBackgroundPointerDown = useCallback(
+    (e: React.PointerEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+      // Inside any pending element (image / text / shape) — they handle
+      // their own selection, don't override.
+      if (target.closest("[data-pending-element]")) return;
+      // Inside an interactive control (toolbar, menu, button, input, link).
+      // Mostly redundant here since those live outside the scroller, but
+      // belt-and-braces against future re-parenting.
+      if (target.closest("input, textarea, button, select, [role='button']")) return;
+      clearAllPendingSelections();
+    },
+    [clearAllPendingSelections],
+  );
+
   if (!activeTab?.pdf) return null;
 
   return (
     <div
       ref={scrollerRef}
       className="acr-scroll relative flex-1 overflow-auto bg-[var(--app-bg)]"
+      onPointerDown={handleBackgroundPointerDown}
     >
       <div className="mx-auto flex w-fit flex-col items-center gap-6 px-10 py-8">
         {rows.map((pages, rowIdx) => (

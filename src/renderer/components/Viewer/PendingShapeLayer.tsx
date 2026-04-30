@@ -167,9 +167,10 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: Bo
       className="absolute z-20"
       style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
       data-testid="pending-shape"
+      data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
-      onPointerDown={(e) => { setSelectedId(shape.id); startDrag(e, "move"); }}
+      onPointerDown={(e) => { e.stopPropagation(); setSelectedId(shape.id); startDrag(e, "move"); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
     >
@@ -301,9 +302,10 @@ function LineShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: L
       className="absolute z-20"
       style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
       data-testid="pending-shape"
+      data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
-      onPointerDown={(e) => { setSelectedId(shape.id); startDrag(e, "move"); }}
+      onPointerDown={(e) => { e.stopPropagation(); setSelectedId(shape.id); startDrag(e, "move"); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
     >
@@ -459,6 +461,7 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shap
       className="absolute z-20"
       style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
       data-testid="pending-shape"
+      data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
       onPointerDown={startDrag}
@@ -557,6 +560,7 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape:
       className="absolute z-20"
       style={{ left: leftPx, top: topPx, width: MARKER_W * zoom, height: MARKER_H * zoom }}
       data-testid="pending-shape"
+      data-pending-element="shape"
       data-shape-kind="sticky"
       data-shape-id={shape.id}
       onPointerDown={startDrag}

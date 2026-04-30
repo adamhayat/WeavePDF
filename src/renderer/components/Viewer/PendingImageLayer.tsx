@@ -313,10 +313,14 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
       style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
       data-testid="pending-image"
       data-edit-id={edit.id}
+      data-pending-element="image"
       onPointerDown={
         cropping
           ? cropPointerDown
           : (e) => {
+              // Stop propagation so Viewer's background-click deselect
+              // doesn't immediately undo the selection we're about to make.
+              e.stopPropagation();
               setSelectedId(edit.id);
               startDrag(e, "move");
             }
