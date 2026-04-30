@@ -5,7 +5,9 @@
 
 ## Current State
 
-**Status:** **V1.0037 — Fillable text padding while editing AND after commit.** Two complementary fixes:
+**Status:** **V1.0038 — Form-field text actually has horizontal padding now.** V1.0037's setFontSize-only fix only handled vertical padding; the user shipped a screenshot showing "hello" still flush against the left border. Real fix: set the widget's `BorderStyle.W` to 3pt + call `form.updateFieldAppearances()` to bake the `/AP` stream into the PDF. pdf-lib's appearance generator uses `widget rect - 2*(borderWidth + 1)` for the content rect, so width=3 gives 8pt total horizontal padding (4pt each side). Border COLOR isn't set, so no visible line. Verified by dumping the generated stream — content clip at (4, 4)→(375, 18), text Tm at x=4. QA-tested 3 scenarios (text+checkbox combo, no-op, all 14 text fields) without regression.
+
+**V1.0037 base (carried forward):** Fillable text padding while editing AND after commit. Two complementary fixes:
 
 1. **HTML input padding while focused** (Codex, [AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx)): focused text inputs use a zoom-aware horizontal inset (`max(6px, 4pt * zoom)`) and normal line-height so the typed text + caret have breathing room from the widget border while editing.
 2. **pdf-lib baked-appearance padding after commit** ([pdf-ops.ts](src/renderer/lib/pdf-ops.ts) `setFormFields`): pdf-lib's default appearance uses font size 0 (auto-fit), scaling text to fill the entire field height — touches top + bottom borders. V1.0037 calls `field.setFontSize(target)` after `setText` where `target = max(8, min(14, fieldHeight - 6))`. The user's contract has 22pt-tall text fields → 14pt font → 4pt top + 4pt bottom padding visible after commit + pdf.js re-render.

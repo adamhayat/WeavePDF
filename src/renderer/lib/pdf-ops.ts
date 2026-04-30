@@ -1027,27 +1027,46 @@ export async function setFormFields(
       const field = form.getField(v.name);
       if (v.kind === "text" && field instanceof PDFTextField) {
         field.setText(v.value);
-        // V1.0037: pdf-lib's default appearance generator uses a font size
-        // of 0 (auto-fit), which scales the text to fill the entire field
-        // height — text ends up flush against top + bottom + left borders
-        // with no internal padding, which the user reads as "appended to
-        // the border". Set an explicit size that leaves ~3pt of breathing
-        // room top + bottom. setFontSize after setText regenerates the
-        // appearance stream with the new size.
+        // V1.0038: pdf-lib's appearance generator computes the content
+        // rect inside a text widget as
+        //   contentRect = widgetRect - 2 * (borderWidth + 1)
+        // (see node_modules/pdf-lib/cjs/api/form/appearances.js). With the
+        // default borderWidth of 0, content gets just 1pt of internal
+        // padding — invisible at 100% zoom — so typed text appears flush
+        // against the left/top/bottom borders.
+        //
+        // Fix: set the widget's BorderStyle width to ~3pt. pdf-lib will
+        // then build the appearance with 3+1=4pt of internal padding
+        // per side. Border COLOR is left unset, so the border doesn't
+        // visibly draw — we get padding for free without a visible line.
+        // Plus set an explicit font size that fits the padded content
+        // area so text doesn't get auto-sized to fill the whole widget.
         try {
           const widgets = field.acroField.getWidgets();
-          const rect = widgets[0]?.getRectangle();
-          if (rect) {
+          for (const widget of widgets) {
+            const rect = widget.getRectangle();
             const fieldHeight = Math.abs(rect.height);
-            // Leave 6pt total padding (3pt top, 3pt bottom). Clamp 8..14pt
-            // — typical form-field font range; smaller fields still get
-            // 8pt minimum for readability.
-            const target = Math.max(8, Math.min(14, fieldHeight - 6));
+            // Pick a border-width that gives meaningful padding without
+            // dwarfing tiny fields. 3pt for normal fields (~22pt tall),
+            // 1pt for cramped ones (≤16pt).
+            const padBorder = fieldHeight >= 16 ? 3 : 1;
+            const bs = widget.getOrCreateBorderStyle();
+            bs.setWidth(padBorder);
+          }
+          // Font size: clamp to leave breathing room above/below text.
+          const firstRect = widgets[0]?.getRectangle();
+          if (firstRect) {
+            const fieldHeight = Math.abs(firstRect.height);
+            // padBorder*2 + padding*2 = padding total per axis; leave
+            // ~4pt extra for visible cap height. Clamp 8..14pt.
+            const padBorder = fieldHeight >= 16 ? 3 : 1;
+            const usable = fieldHeight - 2 * (padBorder + 1);
+            const target = Math.max(8, Math.min(14, usable - 2));
             field.setFontSize(target);
           }
         } catch {
-          // Some fields don't support setFontSize (e.g. multiline with
-          // explicit DA); leave as-is rather than abort.
+          // Some fields don't support setFontSize / setBorderStyle (e.g.
+          // multiline with explicit DA); leave as-is rather than abort.
         }
       } else if (v.kind === "checkbox" && field instanceof PDFCheckBox) {
         if (v.checked) field.check();
@@ -1062,6 +1081,21 @@ export async function setFormFields(
     } catch {
       // Unknown field / type mismatch — skip rather than abort the whole save.
     }
+  }
+  // V1.0038: explicitly generate appearance streams for every dirty field.
+  // pdf-lib's setText only updates /V (the value); without /AP, viewers
+  // (Preview, pdf.js) auto-generate appearances at render time using their
+  // own padding rules — which ignore our BorderStyle width hack and re-flush
+  // the text to the border. updateFieldAppearances bakes the actual /AP
+  // stream into the PDF using pdf-lib's drawTextField (which DOES respect
+  // BorderStyle.W for content-rect inset). Now every viewer renders the
+  // same padded text we computed.
+  try {
+    form.updateFieldAppearances();
+  } catch {
+    // Font-embed failures or unusual field types — fall through to save
+    // without baking; viewer-side auto-appearance still works (just no
+    // padding control).
   }
   if (opts.flatten) {
     try {

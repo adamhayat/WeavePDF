@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed — V1.0038: form-field text actually has horizontal padding now (2026-04-29, programmatically verified)
+- **V1.0037 didn't fix horizontal padding.** The user shipped a screenshot showing typed "hello" still flush against the left border. Root cause: V1.0037 only set font size (vertical fit) but didn't change the content rect inset. pdf-lib's appearance generator computes content rect as `widget rect - 2*(borderWidth + 1)`. With default border width 0, content rect was inset only 1pt — invisible at 100% zoom.
+- **Fix in `setFormFields`** ([src/renderer/lib/pdf-ops.ts](src/renderer/lib/pdf-ops.ts)): set the widget's `BorderStyle.W` to 3pt for normal-height fields (1pt for fields ≤16pt). Border COLOR isn't set, so no visible line draws — pdf-lib's appearance constructs the border path but never strokes/fills it. The 3pt width DOES feed into the content-rect calculation: `rect - 2*(3+1) = 8pt total inset`. Plus call `form.updateFieldAppearances()` so the `/AP` stream is baked into the PDF (without it, viewers auto-generate appearances at render time and ignore our BorderStyle width).
+- **Verified programmatically:** dumped the resulting `/AP` stream — content clip at `(4, 4) → (375, 18)` (4pt inset on all sides), text positioning matrix `Tm 4 6.692` (left padding 4pt). Compared to V1.0037 output which had clip at `(1, 1) → (378, 21)` and `Tm 1 6.692`. Verified all three QA scenarios (text+checkbox combo, no-op, all 14 text fields) work without regression.
+- **Bumped V1.0037 → V1.0038** per Critical Rule #12.
+
 ### Fixed — V1.0037: fillable text padding while editing AND after commit (2026-04-29)
 - **Active fillable text fields no longer glue typed text to the border.** The in-page AcroForm text overlay uses a zoom-aware horizontal inset (`max(6px, 4pt * zoom)`) and normal line-height while focused.
 - **Baked appearance has padding too.** `setFormFields` ([src/renderer/lib/pdf-ops.ts](src/renderer/lib/pdf-ops.ts)) now calls `field.setFontSize(target)` after `setText` where `target = max(8, min(14, fieldHeight - 6))`. pdf-lib's default font size 0 (auto-fit) was scaling text to fill the entire field height — text touched top + bottom borders even after commit. Field of 22pt height → 14pt font → 8pt total padding (4pt top + 4pt bottom).
