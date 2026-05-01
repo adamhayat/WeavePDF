@@ -18,3 +18,4 @@ playwright-report
 playwright/.cache
 resources/fixtures/*.pdf
 !resources/fixtures/.gitkeep
+.claude/
