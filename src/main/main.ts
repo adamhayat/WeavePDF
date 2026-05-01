@@ -1,4 +1,4 @@
-import { app, BrowserWindow, Menu, nativeTheme, ipcMain, dialog, shell, safeStorage, session } from "electron";
+import { app, BrowserWindow, Menu, nativeImage, nativeTheme, ipcMain, dialog, shell, safeStorage, session } from "electron";
 import { readFile, stat, writeFile, unlink, mkdtemp, mkdir, readdir, rm } from "node:fs/promises";
 import { existsSync, readFileSync, realpathSync, appendFileSync } from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
@@ -1360,6 +1360,56 @@ group.wait()
     out.sort((a, b) => b.savedAt.localeCompare(a.savedAt));
     return out;
   });
+
+  // V1.0043: Drag a single thumbnail page out to Finder/Desktop and produce
+  // a real PDF file. Renderer cancels the browser's default drag (so the
+  // browser doesn't try to drag the canvas as an image), forwards the source
+  // bytes + page number here, we extract the page with pdf-lib into the OS
+  // tempdir, and call `webContents.startDrag()` to start the OS-level drag
+  // with file payload. Drop on Finder/Desktop creates the file; drop inside
+  // the app or back on the sidebar is a no-op (no drop target).
+  ipcMain.on(
+    IpcChannel.PagesStartDrag,
+    async (
+      event,
+      payload: { bytes: ArrayBuffer; pageNumber: number; fileName: string },
+    ) => {
+      try {
+        const { PDFDocument } = await import("pdf-lib");
+        const src = await PDFDocument.load(new Uint8Array(payload.bytes));
+        const out = await PDFDocument.create();
+        const idx = Math.max(0, payload.pageNumber - 1);
+        if (idx >= src.getPageCount()) return;
+        const [copied] = await out.copyPages(src, [idx]);
+        out.addPage(copied);
+        const pageBytes = await out.save();
+        // Sanitise the filename so a tab name with slashes/colons doesn't
+        // escape the tempdir or break the write.
+        const safeName = payload.fileName.replace(/[/:\0]+/g, "_") || "page.pdf";
+        const tmpDir = await mkdtemp(path.join(os.tmpdir(), "weavepdf-drag-"));
+        const tmpPath = path.join(tmpDir, safeName);
+        await writeFile(tmpPath, pageBytes);
+        // Use the app icon for the drag image. nativeImage from the bundled
+        // icon.png — small enough to fit the OS drag affordance. Path is
+        // `Contents/Resources/resources/icon.png` in the packaged .app and
+        // a repo-relative path in dev — handle both. Empty fallback keeps
+        // the drag working if the icon is missing for any reason (an empty
+        // image still satisfies startDrag's required-arg contract).
+        const iconCandidates = [
+          path.join(process.resourcesPath, "resources", "icon.png"),
+          path.join(process.resourcesPath, "icon.png"),
+          path.resolve(__dirname, "..", "..", "resources", "icon.png"),
+        ];
+        const iconPath = iconCandidates.find((p) => existsSync(p));
+        const icon = iconPath
+          ? nativeImage.createFromPath(iconPath).resize({ width: 64 })
+          : nativeImage.createEmpty();
+        event.sender.startDrag({ file: tmpPath, icon });
+      } catch (err) {
+        console.warn("[pages:start-drag] failed:", err);
+      }
+    },
+  );
 
   ipcMain.handle(
     IpcChannel.BlessDerivedPath,

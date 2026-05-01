@@ -5,6 +5,13 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Added — V1.0043: drag a sidebar thumbnail to Finder with ⌥ Option to extract that page (2026-04-30)
+- **Hold ⌥ Option and drag a page thumbnail from the sidebar to Finder / Desktop / any folder window.** A real `<source basename> - page <n>.pdf` file is created at the drop location — same outcome as Adobe Acrobat's drag-out.
+- **Implementation:** new `pages:start-drag` IPC channel ([src/shared/ipc.ts](src/shared/ipc.ts), [src/preload/preload.ts](src/preload/preload.ts), [src/main/main.ts](src/main/main.ts)). The renderer's thumbnail dragstart calls `e.preventDefault()` (always) and then fires the IPC only when `e.altKey` is held. Main extracts the page with pdf-lib, writes it into a freshly-minted `os.tmpdir()/weavepdf-drag-XXXX/` slot, then calls `webContents.startDrag({file, icon})` to start the OS-level drag with file payload. The macOS app icon doubles as the drag image.
+- **Why the Option modifier:** plain drag in the thumbnail panel is bound to @dnd-kit's pointer-based sortable reorder. An earlier draft left the thumb plain-`draggable` and native drag swallowed every gesture, breaking reorder (in-sidebar drags came back to WeavePDF as a new tab opened from the temp file). The Option gate cleanly separates the two gestures: plain drag = reorder, ⌥+drag = export. Tooltip on each thumb mentions both.
+- **Verified live via computer-use:** dragged thumb-2 to Desktop → `ServiceOntario-S20260430000500061 - page 2.pdf` (137KB) appeared on Desktop, opens cleanly as a single-page PDF.
+- **Bumped V1.0042 → V1.0043** per Critical Rule #12.
+
 ### Fixed — V1.0042: deselect also fires when a drag tool is still active (2026-04-30, computer-use verified)
 - **V1.0041's deselect missed the in-tool case.** Drawing a Rect, then clicking on the page background while still in Rect mode left the resize handles + X badge visible. Reason: PageCanvas's tool-overlay `pointerDownDrag` calls `e.stopPropagation()`, so the click never reached Viewer's background pointer-down handler.
 - **Fix in [src/renderer/components/Viewer/PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx):** `pointerDownDrag` now calls `useUIStore.getState().clearAllPendingSelections()` at the top, before stopping propagation. Mirrors the natural "click off to deselect, drag to draw the next shape" UX from Figma/Keynote.

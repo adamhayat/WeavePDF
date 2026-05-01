@@ -94,6 +94,16 @@ export const IpcChannel = {
   DraftsLoad: "drafts:load",
   DraftsClear: "drafts:clear",
   DraftsList: "drafts:list",
+  /**
+   * Begin a native OS drag-and-drop carrying a single extracted PDF page as
+   * a real file. Renderer fires this from a thumbnail's `dragstart` after
+   * `e.preventDefault()`; main extracts the page with pdf-lib, writes it
+   * into the per-app tempdir, then calls `webContents.startDrag()` so the
+   * drag continues with file payload — drop on Finder/Desktop creates the
+   * single-page PDF; drop inside the sidebar is rejected by the OS (no drop
+   * zone) and the temp file is cleaned up later by macOS.
+   */
+  PagesStartDrag: "pages:start-drag",
 } as const;
 
 /**

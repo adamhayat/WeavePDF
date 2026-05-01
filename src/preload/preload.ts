@@ -151,6 +151,10 @@ const api: WeavePDFApi = {
     list: () =>
       ipcRenderer.invoke(IpcChannel.DraftsList) as Promise<import("../shared/ipc").DraftManifest[]>,
   },
+  pages: {
+    startDrag: (payload: { bytes: ArrayBuffer; pageNumber: number; fileName: string }) =>
+      ipcRenderer.send(IpcChannel.PagesStartDrag, payload),
+  },
   platform: process.platform,
 };
 

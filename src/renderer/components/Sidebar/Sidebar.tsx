@@ -473,6 +473,38 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
         type="button"
         {...attributes}
         {...listeners}
+        // V1.0043: Hold ⌥ Option while dragging a thumbnail to Finder /
+        // Desktop to extract that page as a single-page PDF — same outcome
+        // as Adobe Acrobat's drag-out. The Option requirement is a UX
+        // tradeoff: a plain drag has to stay reserved for @dnd-kit's
+        // sortable reorder (which is also pointer-based), so we use Option
+        // as the disambiguator. Tooltip on the button mentions the gesture.
+        //
+        // Implementation: `draggable={true}` lets the browser fire a native
+        // dragstart. We always `preventDefault()` so the browser's default
+        // drag image (a transparent canvas) doesn't appear; if Option is
+        // held, we then fire the IPC that asks main to extract the page,
+        // write a temp file, and call `webContents.startDrag()` with a
+        // real file payload + app icon. Without Option, dragstart is just
+        // suppressed and @dnd-kit's PointerSensor takes over for reorder.
+        draggable={!!tab.bytes}
+        onDragStart={(e) => {
+          // Always cancel the browser's default native drag — its drag
+          // image is a useless canvas snapshot, and we don't want a
+          // "no-drop" cursor flashing during a normal reorder gesture.
+          e.preventDefault();
+          if (!e.altKey || !tab.bytes) return;
+          // Snapshot bytes — store reference may move while the drag flies.
+          // Slice to a fresh buffer to detach from the Uint8Array view.
+          const slice = tab.bytes.slice().buffer;
+          const baseName = tab.name.replace(/\.pdf$/i, "");
+          window.weavepdf.pages.startDrag({
+            bytes: slice,
+            pageNumber,
+            fileName: `${baseName} - page ${pageNumber}.pdf`,
+          });
+        }}
+        title={`Page ${pageNumber} — drag to reorder, or hold ⌥ and drag to Finder to extract this page`}
         onClick={(e) => {
           if (e.metaKey || e.ctrlKey) onActivate("toggle");
           else if (e.shiftKey) onActivate("range");

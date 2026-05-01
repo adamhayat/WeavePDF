@@ -1,7 +1,7 @@
 {
   "name": "weavepdf",
   "productName": "WeavePDF",
-  "version": "1.0.42",
+  "version": "1.0.43",
   "description": "Local-first, Mac-native PDF editor. No cloud, no account, no subscription.",
   "main": ".vite/build/main.js",
   "private": true,

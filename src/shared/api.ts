@@ -139,6 +139,17 @@ export interface WeavePDFApi {
     /** List every saved draft (newest first). Drives the Recent Drafts modal. */
     list: () => Promise<DraftManifest[]>;
   };
+  pages: {
+    /** Start a native OS drag carrying a single-page PDF extracted from the
+     *  given source bytes. Call from a `dragstart` handler after
+     *  `e.preventDefault()` — Electron's `webContents.startDrag()` initiates
+     *  its own OS drag with file payload, replacing the browser's default. */
+    startDrag: (payload: {
+      bytes: ArrayBuffer;
+      pageNumber: number;
+      fileName: string;
+    }) => void;
+  };
   platform: NodeJS.Platform;
 }
 
