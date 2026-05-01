@@ -5,6 +5,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Changed — V1.0045: drag any sidebar thumbnail to Finder (whole tile is draggable now); reorder moved to right-click menu (2026-05-01)
+- **The entire thumbnail is draggable to Finder/Desktop.** No handle, no modifier, no special target — drag from anywhere on the thumbnail card. The V1.0044 small ↗ handle was too fiddly to find; user reported the drag still didn't escape the window. V1.0045 makes the thumbnail's wrapper `<div>` `draggable={true}` and routes `onDragStart` directly to the existing `pages:start-drag` IPC. Tooltip on each thumb: "Page N — click to view, drag to Finder to extract this page".
+- **Reorder moved to the right-click menu.** Plain drag is now reserved exclusively for drag-out, so the @dnd-kit drag-to-reorder gesture is gone. New "Move up" / "Move down" items at the top of the context menu — call a tight `movePage(pageNumber, ±1)` helper that swaps two indices in the page-order array and reuses `reorderPages` + `applyEdit`. Disabled at the ends and for multi-page selection.
+- **Implementation note:** the `<div>` wrapper is the draggable element, not the inner `<button>`. Chromium does not initiate a native drag on a `<button>` ancestor (the button captures mousedown for its own click-handling and dragstart never fires). Inner button stays for keyboard + a11y with `draggable={false}` explicitly set, and the canvas has `pointerEvents: none` so drags initiated on the thumbnail bitmap still bubble up to the draggable div.
+- **Bumped V1.0044 → V1.0045** per Critical Rule #12.
+
 ### Fixed + Changed — V1.0044: drag-out works via a dedicated ↗ handle; ⌥ Option modifier removed (2026-04-30, computer-use verified)
 - **V1.0043 didn't actually drag-out.** User reported: "when i drag, it stays in the window and wont work when moving to another window or show desktop." Two distinct bugs:
   - **Lazy `await import("pdf-lib")` in main added ~100–200 ms of latency** between the user's `dragstart` and `webContents.startDrag()` firing — long enough that the OS treated the gesture as aborted. Fix in [src/main/main.ts](src/main/main.ts): pre-import `PDFDocument from "pdf-lib"` at the top so the first call is hot. Drops to ~10 ms.

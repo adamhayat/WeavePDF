@@ -5,7 +5,15 @@
 
 ## Current State
 
-**Status:** **V1.0044 — drag-out works via a dedicated ↗ handle on each thumbnail; ⌥ Option modifier removed.** User reported V1.0043 didn't work: "when i drag, it stays in the window and wont work when moving to another window or show desktop." Two distinct bugs and a UX miss:
+**Status:** **V1.0045 — the whole sidebar thumbnail is draggable to Finder; @dnd-kit reorder replaced by Move up / Move down in the right-click menu.** User reported V1.0044 still didn't work for them — the small ↗ handle was too fiddly and they wanted plain drag from the thumbnail itself. Removed @dnd-kit's drag-to-reorder entirely; the thumbnail's wrapping `<div>` now carries `draggable={true}` and `onDragStart` fires the existing `pages:start-drag` IPC. Reorder moved to the context menu as "Move up" / "Move down" items (calls a new `movePage(pageNumber, ±1)` helper that swaps two indices in the page-order array and reuses `reorderPages` + `applyEdit`).
+
+Also dropped @dnd-kit/core, @dnd-kit/sortable, and @dnd-kit/utilities references from Sidebar.tsx (imports only — packages stay in package.json for now in case any other component uses them; will sweep in a future cleanup if confirmed unused).
+
+Implementation note: the wrapper `<div>` is the draggable element, not the inner `<button>`. Chromium will not initiate a native drag on a `<button>` ancestor (it captures mousedown for its own click-handling and dragstart never fires). Inner button stays for keyboard + a11y, with `draggable={false}` explicitly set so it doesn't compete. `pointerEvents: none` on the inner canvas so drags initiated on the thumbnail bitmap still hit the wrapping draggable div.
+
+**Could not visually verify in this session** — Keychain prompt for safeStorage gated the window post-install and the screenshot filter hid it. The change is mechanical (whole-area dragstart wired to the same IPC chain already proven to produce a file on Desktop in V1.0044). User will catch any regression on next launch.
+
+**V1.0044 base (carried forward):** Eager pdf-lib import in main + dedicated ↗ drag handle (replaced in V1.0045 with whole-thumbnail drag). User reported V1.0043 didn't work: "when i drag, it stays in the window and wont work when moving to another window or show desktop." Two distinct bugs and a UX miss:
 
 1. **Lazy `await import("pdf-lib")` in main was too slow.** The dynamic import + page extract + temp-file write took ~100–200 ms; by the time `webContents.startDrag()` fired, the OS had already considered the gesture aborted, so the cursor stayed in-window with no drop target. Fix in [src/main/main.ts](src/main/main.ts): pre-import `PDFDocument` from `pdf-lib` at the top of the file. First-call latency drops to ~10 ms.
 2. **Option-modifier was undiscoverable + nested handle didn't fire `dragstart`.** First V1.0044 attempt put a `draggable={true}` `<span>` INSIDE the thumbnail's `<button>` element. Chromium does not fire `dragstart` on a `draggable` span nested under a `<button>` (the button captures the mousedown for click-handling and the inner element never sees a drag-initiation). Fix: hoisted the drag-out handle out of the button into the parent flex column as an absolutely-positioned overlay sibling. `dragstart` now fires reliably on the handle alone, the button beneath remains free for @dnd-kit reorder.

@@ -1,20 +1,10 @@
-import { useEffect, useRef, useState, useMemo } from "react";
-import {
-  DndContext,
-  closestCenter,
-  PointerSensor,
-  useSensor,
-  useSensors,
-  type DragEndEvent,
-} from "@dnd-kit/core";
-import {
-  SortableContext,
-  useSortable,
-  verticalListSortingStrategy,
-  arrayMove,
-} from "@dnd-kit/sortable";
-import { CSS } from "@dnd-kit/utilities";
-import { RotateCw, RotateCcw, Trash2, ArrowUpRight } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+// V1.0045: removed @dnd-kit's drag-to-reorder. The thumbnail's plain
+// drag is now reserved for HTML5 native drag-out (drag a page to Finder
+// to extract it as a one-page PDF). Reorder lives in the right-click
+// menu via "Move up" / "Move down" — same end result, no gesture
+// disambiguation needed.
+import { RotateCw, RotateCcw, Trash2 } from "lucide-react";
 import { useDocumentStore, type DocumentTab } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
@@ -47,15 +37,6 @@ export function Sidebar({ onRestoreRevision }: Props) {
   const sidebarTab = useUIStore((s) => s.sidebarTab);
   const setSidebarTab = useUIStore((s) => s.setSidebarTab);
   const [pageLabelPrompt, setPageLabelPrompt] = useState<{ pageNumber: number } | null>(null);
-
-  const sensors = useSensors(
-    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
-  );
-
-  const pageIds = useMemo(
-    () => (activeTab ? Array.from({ length: activeTab.numPages }, (_, i) => `p-${i + 1}`) : []),
-    [activeTab?.numPages, activeTab?.id, activeTab?.version],
-  );
 
   if (!open || !activeTab?.pdf) return null;
 
@@ -91,20 +72,18 @@ export function Sidebar({ onRestoreRevision }: Props) {
     await applyEdit(activeTab.id, newBytes);
   };
 
-  const handleDragEnd = async (e: DragEndEvent) => {
-    const { active, over } = e;
-    if (!over || active.id === over.id || !activeTab.bytes) return;
-    const oldIndex = pageIds.indexOf(String(active.id));
-    const newIndex = pageIds.indexOf(String(over.id));
-    if (oldIndex < 0 || newIndex < 0) return;
-    // 0-based indices in new display order.
-    const newOrder = arrayMove(
-      Array.from({ length: activeTab.numPages }, (_, i) => i),
-      oldIndex,
-      newIndex,
-    );
+  // V1.0045: explicit reorder by index swap, called from the right-click
+  // "Move up" / "Move down" menu items. Replaces the @dnd-kit drag-to-
+  // reorder so plain drag on the thumbnail can be reserved for HTML5
+  // native drag-out (drag a page out to Finder).
+  const movePage = async (pageNumber: number, delta: -1 | 1) => {
+    if (!activeTab.bytes) return;
+    const newIndex = pageNumber - 1 + delta;
+    if (newIndex < 0 || newIndex >= activeTab.numPages) return;
+    const order = Array.from({ length: activeTab.numPages }, (_, i) => i);
+    [order[pageNumber - 1], order[newIndex]] = [order[newIndex], order[pageNumber - 1]];
     const { reorderPages } = await loadPdfOps();
-    const newBytes = await reorderPages(activeTab.bytes, newOrder);
+    const newBytes = await reorderPages(activeTab.bytes, order);
     await applyEdit(activeTab.id, newBytes, { newCurrentPage: newIndex + 1 });
   };
 
@@ -210,123 +189,129 @@ export function Sidebar({ onRestoreRevision }: Props) {
           if (e.target === e.currentTarget) clearSelection(activeTab.id);
         }}
       >
-        <DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
-          <SortableContext items={pageIds} strategy={verticalListSortingStrategy}>
-            <div className="flex flex-col gap-3">
-              {pageIds.map((id, i) => {
-                const pageNumber = i + 1;
-                return (
-                  <SortableThumb
-                    key={`${activeTab.id}-${activeTab.version}-${id}`}
-                    id={id}
-                    pdf={activeTab.pdf!}
-                    pageNumber={pageNumber}
-                    active={activeTab.currentPage === pageNumber}
-                    selected={activeTab.selectedPages.has(pageNumber)}
-                    onActivate={(mode) => {
-                      if (mode === "set") {
-                        setCurrentPage(activeTab.id, pageNumber);
-                        selectPage(activeTab.id, pageNumber, "set");
-                      } else {
-                        selectPage(activeTab.id, pageNumber, mode);
-                      }
-                    }}
-                    onContextMenu={(clientX, clientY) => {
-                      const selection = activeTab.selectedPages.has(pageNumber) && activeTab.selectedPages.size > 1
-                        ? Array.from(activeTab.selectedPages).sort((a, b) => a - b)
-                        : [pageNumber];
-                      const multi = selection.length > 1;
-                      useUIStore.getState().openContextMenu(clientX, clientY, [
-                        {
-                          kind: "item",
-                          label: multi ? "Rotate left 90°" : "Rotate left 90°",
-                          shortcut: "⌘[",
-                          onClick: async () => {
-                            if (!activeTab.bytes) return;
-                            const { rotatePages } = await loadPdfOps();
-                            const b = await rotatePages(activeTab.bytes, selection, -90);
-                            await applyEdit(activeTab.id, b);
-                          },
-                        },
-                        {
-                          kind: "item",
-                          label: "Rotate right 90°",
-                          shortcut: "⌘]",
-                          onClick: async () => {
-                            if (!activeTab.bytes) return;
-                            const { rotatePages } = await loadPdfOps();
-                            const b = await rotatePages(activeTab.bytes, selection, 90);
-                            await applyEdit(activeTab.id, b);
-                          },
-                        },
-                        {
-                          kind: "item",
-                          label: "Rotate 180°",
-                          onClick: async () => {
-                            if (!activeTab.bytes) return;
-                            const { rotatePages } = await loadPdfOps();
-                            const b = await rotatePages(activeTab.bytes, selection, 180);
-                            await applyEdit(activeTab.id, b);
-                          },
-                        },
-                        { kind: "separator" },
-                        {
-                          kind: "item",
-                          label: multi ? `Duplicate ${selection.length} pages` : "Duplicate page",
-                          disabled: multi, // multi-duplicate is ambiguous
-                          onClick: async () => {
-                            if (!activeTab.bytes) return;
-                            const { duplicatePage } = await loadPdfOps();
-                            const b = await duplicatePage(activeTab.bytes, pageNumber);
-                            await applyEdit(activeTab.id, b);
-                          },
-                        },
-                        {
-                          kind: "item",
-                          label: multi ? `Extract ${selection.length} pages…` : "Extract page…",
-                          onClick: async () => {
-                            if (!activeTab.bytes) return;
-                            const { extractPages } = await loadPdfOps();
-                            const extracted = await extractPages(activeTab.bytes, selection);
-                            const result = await window.weavepdf.saveFileDialog({
-                              title: "Extract Pages",
-                              suggestedName: activeTab.name.replace(/\.pdf$/i, "") + `-extract.pdf`,
-                              extensions: ["pdf"],
-                            });
-                            if (result.canceled) return;
-                            const w = await window.weavepdf.writeFile(result.path, u8ToAb(extracted));
-                            if (!w.ok) alert(`Extract failed: ${w.error}`);
-                          },
-                        },
-                        { kind: "separator" },
-                        {
-                          kind: "item",
-                          label: "Set page label…",
-                          disabled: multi,
-                          onClick: () => setPageLabelPrompt({ pageNumber }),
-                        },
-                        { kind: "separator" },
-                        {
-                          kind: "item",
-                          label: multi ? `Delete ${selection.length} pages` : "Delete page",
-                          danger: true,
-                          disabled: selection.length === activeTab.numPages,
-                          onClick: async () => {
-                            if (!activeTab.bytes) return;
-                            const { deletePages } = await loadPdfOps();
-                            const b = await deletePages(activeTab.bytes, selection);
-                            await applyEdit(activeTab.id, b);
-                          },
-                        },
-                      ]);
-                    }}
-                    tab={activeTab}
-                  />
-                );
-              })}
-            </div>
-          </SortableContext>
-        </DndContext>
+        <div className="flex flex-col gap-3">
+          {Array.from({ length: activeTab.numPages }, (_, i) => i + 1).map((pageNumber) => (
+            <Thumb
+              key={`${activeTab.id}-${activeTab.version}-${pageNumber}`}
+              pdf={activeTab.pdf!}
+              pageNumber={pageNumber}
+              active={activeTab.currentPage === pageNumber}
+              selected={activeTab.selectedPages.has(pageNumber)}
+              tab={activeTab}
+              onActivate={(mode) => {
+                if (mode === "set") {
+                  setCurrentPage(activeTab.id, pageNumber);
+                  selectPage(activeTab.id, pageNumber, "set");
+                } else {
+                  selectPage(activeTab.id, pageNumber, mode);
+                }
+              }}
+              onContextMenu={(clientX, clientY) => {
+                const selection =
+                  activeTab.selectedPages.has(pageNumber) && activeTab.selectedPages.size > 1
+                    ? Array.from(activeTab.selectedPages).sort((a, b) => a - b)
+                    : [pageNumber];
+                const multi = selection.length > 1;
+                useUIStore.getState().openContextMenu(clientX, clientY, [
+                  {
+                    kind: "item",
+                    label: "Move up",
+                    disabled: multi || pageNumber === 1,
+                    onClick: () => void movePage(pageNumber, -1),
+                  },
+                  {
+                    kind: "item",
+                    label: "Move down",
+                    disabled: multi || pageNumber === activeTab.numPages,
+                    onClick: () => void movePage(pageNumber, 1),
+                  },
+                  { kind: "separator" },
+                  {
+                    kind: "item",
+                    label: multi ? "Rotate left 90°" : "Rotate left 90°",
+                    shortcut: "⌘[",
+                    onClick: async () => {
+                      if (!activeTab.bytes) return;
+                      const { rotatePages } = await loadPdfOps();
+                      const b = await rotatePages(activeTab.bytes, selection, -90);
+                      await applyEdit(activeTab.id, b);
+                    },
+                  },
+                  {
+                    kind: "item",
+                    label: "Rotate right 90°",
+                    shortcut: "⌘]",
+                    onClick: async () => {
+                      if (!activeTab.bytes) return;
+                      const { rotatePages } = await loadPdfOps();
+                      const b = await rotatePages(activeTab.bytes, selection, 90);
+                      await applyEdit(activeTab.id, b);
+                    },
+                  },
+                  {
+                    kind: "item",
+                    label: "Rotate 180°",
+                    onClick: async () => {
+                      if (!activeTab.bytes) return;
+                      const { rotatePages } = await loadPdfOps();
+                      const b = await rotatePages(activeTab.bytes, selection, 180);
+                      await applyEdit(activeTab.id, b);
+                    },
+                  },
+                  { kind: "separator" },
+                  {
+                    kind: "item",
+                    label: multi ? `Duplicate ${selection.length} pages` : "Duplicate page",
+                    disabled: multi,
+                    onClick: async () => {
+                      if (!activeTab.bytes) return;
+                      const { duplicatePage } = await loadPdfOps();
+                      const b = await duplicatePage(activeTab.bytes, pageNumber);
+                      await applyEdit(activeTab.id, b);
+                    },
+                  },
+                  {
+                    kind: "item",
+                    label: multi ? `Extract ${selection.length} pages…` : "Extract page…",
+                    onClick: async () => {
+                      if (!activeTab.bytes) return;
+                      const { extractPages } = await loadPdfOps();
+                      const extracted = await extractPages(activeTab.bytes, selection);
+                      const result = await window.weavepdf.saveFileDialog({
+                        title: "Extract Pages",
+                        suggestedName: activeTab.name.replace(/\.pdf$/i, "") + `-extract.pdf`,
+                        extensions: ["pdf"],
+                      });
+                      if (result.canceled) return;
+                      const w = await window.weavepdf.writeFile(result.path, u8ToAb(extracted));
+                      if (!w.ok) alert(`Extract failed: ${w.error}`);
+                    },
+                  },
+                  { kind: "separator" },
+                  {
+                    kind: "item",
+                    label: "Set page label…",
+                    disabled: multi,
+                    onClick: () => setPageLabelPrompt({ pageNumber }),
+                  },
+                  { kind: "separator" },
+                  {
+                    kind: "item",
+                    label: multi ? `Delete ${selection.length} pages` : "Delete page",
+                    danger: true,
+                    disabled: selection.length === activeTab.numPages,
+                    onClick: async () => {
+                      if (!activeTab.bytes) return;
+                      const { deletePages } = await loadPdfOps();
+                      const b = await deletePages(activeTab.bytes, selection);
+                      await applyEdit(activeTab.id, b);
+                    },
+                  },
+                ]);
+              }}
+            />
+          ))}
+        </div>
       </div>}
     </aside>
     <PromptModal
@@ -409,7 +394,6 @@ function SidebarIcon({
 }
 
 type ThumbProps = {
-  id: string;
   pdf: PDFDocumentProxy;
   pageNumber: number;
   active: boolean;
@@ -419,9 +403,7 @@ type ThumbProps = {
   onContextMenu: (clientX: number, clientY: number) => void;
 };
 
-function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate, onContextMenu }: ThumbProps) {
-  const { attributes, listeners, setNodeRef, transform, transition, isDragging } =
-    useSortable({ id });
+function Thumb({ pdf, pageNumber, active, selected, tab, onActivate, onContextMenu }: ThumbProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
 
@@ -457,32 +439,60 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
     };
   }, [pdf, pageNumber, tab.version]);
 
+  // V1.0045: the entire thumbnail is HTML5-draggable. Plain drag from anywhere
+  // on the page card → drag-out. No modifier, no dedicated handle, no per-app
+  // training. Reorder lives in the right-click menu's "Move up / Move down".
+  // Implementation: the wrapping <div> (NOT a <button>) carries
+  // `draggable={true}` because Chromium will not initiate a native drag on a
+  // <button> ancestor (the button intercepts mousedown for its own click and
+  // dragstart never fires). Click-to-select stays on an inner <button> so
+  // keyboard + a11y remain intact.
+  const handleDragStart = (e: React.DragEvent<HTMLDivElement>) => {
+    if (!tab.bytes) return;
+    // Cancel the browser's default native drag (uses the canvas image as the
+    // drag image, looks bad). Electron's `webContents.startDrag()` will begin
+    // a new OS-level drag with the file payload + WeavePDF app icon.
+    e.preventDefault();
+    const slice = tab.bytes.slice().buffer;
+    const baseName = tab.name.replace(/\.pdf$/i, "");
+    window.weavepdf.pages.startDrag({
+      bytes: slice,
+      pageNumber,
+      fileName: `${baseName} - page ${pageNumber}.pdf`,
+    });
+  };
+
   return (
     <div
-      ref={setNodeRef}
-      style={{
-        transform: CSS.Transform.toString(transform),
-        transition,
-        opacity: isDragging ? 0.4 : 1,
+      draggable={!!tab.bytes}
+      onDragStart={handleDragStart}
+      onContextMenu={(e) => {
+        e.preventDefault();
+        onContextMenu(e.clientX, e.clientY);
       }}
+      title={
+        tab.bytes
+          ? `Page ${pageNumber} — click to view, drag to Finder to extract this page`
+          : `Page ${pageNumber}`
+      }
       className="group relative flex flex-col items-center gap-1.5"
       data-testid="thumb-row"
       data-page-number={pageNumber}
     >
       <button
         type="button"
-        {...attributes}
-        {...listeners}
         onClick={(e) => {
           if (e.metaKey || e.ctrlKey) onActivate("toggle");
           else if (e.shiftKey) onActivate("range");
           else onActivate("set");
         }}
-        onContextMenu={(e) => {
-          e.preventDefault();
-          onContextMenu(e.clientX, e.clientY);
-        }}
-        className="relative"
+        // The button is intentionally non-draggable so dragstart fires on the
+        // outer <div> instead. (Buttons stop dragstart from bubbling to
+        // ancestors, but with draggable={false} on the button, the drag
+        // gesture never starts on the button at all — it begins on the div
+        // wrapping it.)
+        draggable={false}
+        className="relative cursor-default"
         aria-label={`Page ${pageNumber}`}
         data-testid="thumb-button"
         data-selected={selected || undefined}
@@ -500,7 +510,7 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
         >
           <canvas
             ref={canvasRef}
-            style={{ width: "100%", height: "100%", display: "block" }}
+            style={{ width: "100%", height: "100%", display: "block", pointerEvents: "none" }}
           />
           {selected && (
             <div className="pointer-events-none absolute right-1.5 top-1.5 flex h-4 w-4 items-center justify-center rounded-full bg-[var(--color-accent)] text-white">
@@ -521,66 +531,6 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
       >
         {pageNumber}
       </span>
-      {/*
-        V1.0044: Drag-out handle. Plain drag on the thumbnail is bound to
-        @dnd-kit's sortable reorder, so the drag-to-Finder gesture lives on
-        this dedicated handle. It's an absolutely-positioned overlay sibling
-        of the button (NOT a child) — Chromium will not fire a fresh
-        `dragstart` on a `draggable=true` element nested inside a `<button>`
-        ancestor, because the button captures the mousedown for its own
-        click-handling and the pointer events never reach the inner span.
-        Hoisting the span out into the parent's `relative` flex column makes
-        it a top-level draggable in the page tree, so dragstart fires
-        reliably on the handle alone.
-        Pre-V1.0044 attempts: ⌥ Option modifier on the whole thumbnail (V1.0043,
-        fragile UX + extraction latency aborted the gesture); same handle but
-        nested inside the button (V1.0044a, dragstart never fired).
-      */}
-      {tab.bytes && (
-        <span
-          role="button"
-          tabIndex={-1}
-          draggable={true}
-          onPointerDown={(e) => {
-            // Don't activate the page click or @dnd-kit's pointer sensor.
-            e.stopPropagation();
-          }}
-          onMouseDown={(e) => {
-            // Mousedown also stops here so the button beneath doesn't see it.
-            e.stopPropagation();
-          }}
-          onClick={(e) => {
-            e.stopPropagation();
-            e.preventDefault();
-          }}
-          onDragStart={(e) => {
-            // Cancel the browser's default drag (which would be the icon as
-            // a transparent PNG); Electron's `webContents.startDrag()` will
-            // begin a new OS-level drag with the file payload + app icon.
-            e.preventDefault();
-            if (!tab.bytes) return;
-            const slice = tab.bytes.slice().buffer;
-            const baseName = tab.name.replace(/\.pdf$/i, "");
-            window.weavepdf.pages.startDrag({
-              bytes: slice,
-              pageNumber,
-              fileName: `${baseName} - page ${pageNumber}.pdf`,
-            });
-          }}
-          title={`Drag to Finder / Desktop to extract page ${pageNumber} as a PDF`}
-          aria-label={`Drag page ${pageNumber} to Finder`}
-          className={cn(
-            "absolute top-1 left-1 z-10 flex h-5 w-5 cursor-grab items-center justify-center rounded-full",
-            "bg-[var(--panel-bg-raised)] text-[var(--muted)] shadow ring-1 ring-[var(--panel-border)]",
-            "transition-opacity duration-150 hover:text-[var(--color-accent)] active:cursor-grabbing",
-            "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
-            selected && "opacity-100",
-          )}
-          data-testid="thumb-drag-out"
-        >
-          <ArrowUpRight className="h-3 w-3" strokeWidth={2.2} />
-        </span>
-      )}
     </div>
   );
 }
