@@ -5,7 +5,15 @@
 
 ## Current State
 
-**Status:** **V1.0043 — drag a thumbnail to Finder/Desktop with ⌥ Option to extract that page as a single-page PDF.** User asked for Acrobat-style drag-out from the sidebar thumbnail panel.
+**Status:** **V1.0044 — drag-out works via a dedicated ↗ handle on each thumbnail; ⌥ Option modifier removed.** User reported V1.0043 didn't work: "when i drag, it stays in the window and wont work when moving to another window or show desktop." Two distinct bugs and a UX miss:
+
+1. **Lazy `await import("pdf-lib")` in main was too slow.** The dynamic import + page extract + temp-file write took ~100–200 ms; by the time `webContents.startDrag()` fired, the OS had already considered the gesture aborted, so the cursor stayed in-window with no drop target. Fix in [src/main/main.ts](src/main/main.ts): pre-import `PDFDocument` from `pdf-lib` at the top of the file. First-call latency drops to ~10 ms.
+2. **Option-modifier was undiscoverable + nested handle didn't fire `dragstart`.** First V1.0044 attempt put a `draggable={true}` `<span>` INSIDE the thumbnail's `<button>` element. Chromium does not fire `dragstart` on a `draggable` span nested under a `<button>` (the button captures the mousedown for click-handling and the inner element never sees a drag-initiation). Fix: hoisted the drag-out handle out of the button into the parent flex column as an absolutely-positioned overlay sibling. `dragstart` now fires reliably on the handle alone, the button beneath remains free for @dnd-kit reorder.
+3. **UX:** the V1.0043 ⌥ Option modifier is gone. The handle (a small ↗ in the top-left, visible on hover or when the page is selected) is a discoverable affordance with its own `title` ("Drag to Finder / Desktop to extract page X as a PDF"). Plain drag from the rest of the thumbnail still does @dnd-kit reorder.
+
+Verified live via computer-use: opened the 4-page ServiceOntario PDF, hovered thumbnail 2 → handle appeared → dragged the handle to a desktop spot → `ServiceOntario-S20260430000500061 - page 2.pdf` (137KB) appeared on Desktop. Reorder via plain-button drag continues to work.
+
+**V1.0043 base (carried forward):** Initial drag-out scaffolding (IPC + main extract + webContents.startDrag). User asked for Acrobat-style drag-out from the sidebar thumbnail panel.
 
 Wired Electron's `webContents.startDrag()` through a new `pages:start-drag` IPC channel: renderer fires it from the thumbnail's `dragstart` handler when ⌥ Option is held, main process extracts the page with pdf-lib, writes it into the per-app tempdir, then calls `webContents.startDrag({file, icon})` to begin the OS-level drag with file payload. Drop on Finder/Desktop creates the file (`<source basename> - page <n>.pdf`); drop inside the sidebar/window is ignored by the OS.
 

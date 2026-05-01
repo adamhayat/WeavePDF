@@ -24,6 +24,13 @@ import forge from "node-forge";
 import { SignPdf } from "@signpdf/signpdf";
 import { P12Signer } from "@signpdf/signer-p12";
 import { pdflibAddPlaceholder } from "@signpdf/placeholder-pdf-lib";
+// Eagerly imported in V1.0044 so the `pages:start-drag` IPC handler can
+// extract a page synchronously enough that Electron's `webContents.startDrag()`
+// fires while the OS still considers the user mid-gesture. The pre-V1.0044
+// `await import("pdf-lib")` added ~50–100 ms of cold-load latency on the
+// first drag, long enough that the OS dropped the gesture before startDrag
+// took effect — the user saw "drag stays in the window" with no drop target.
+import { PDFDocument as PDFLibDocument } from "pdf-lib";
 
 // Vite defines these at build time. See @electron-forge/plugin-vite docs.
 declare const MAIN_WINDOW_VITE_DEV_SERVER_URL: string | undefined;
@@ -1375,9 +1382,8 @@ group.wait()
       payload: { bytes: ArrayBuffer; pageNumber: number; fileName: string },
     ) => {
       try {
-        const { PDFDocument } = await import("pdf-lib");
-        const src = await PDFDocument.load(new Uint8Array(payload.bytes));
-        const out = await PDFDocument.create();
+        const src = await PDFLibDocument.load(new Uint8Array(payload.bytes));
+        const out = await PDFLibDocument.create();
         const idx = Math.max(0, payload.pageNumber - 1);
         if (idx >= src.getPageCount()) return;
         const [copied] = await out.copyPages(src, [idx]);

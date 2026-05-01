@@ -5,6 +5,14 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased] — Features + hardening
 
+### Fixed + Changed — V1.0044: drag-out works via a dedicated ↗ handle; ⌥ Option modifier removed (2026-04-30, computer-use verified)
+- **V1.0043 didn't actually drag-out.** User reported: "when i drag, it stays in the window and wont work when moving to another window or show desktop." Two distinct bugs:
+  - **Lazy `await import("pdf-lib")` in main added ~100–200 ms of latency** between the user's `dragstart` and `webContents.startDrag()` firing — long enough that the OS treated the gesture as aborted. Fix in [src/main/main.ts](src/main/main.ts): pre-import `PDFDocument from "pdf-lib"` at the top so the first call is hot. Drops to ~10 ms.
+  - **Drag handle nested inside a `<button>` never fired `dragstart`.** Chromium does not initiate native drag on a `draggable` element nested under a `<button>` ancestor — the button captures mousedown for its own click-handling and the inner element never sees the drag-initiation. Fix in [src/renderer/components/Sidebar/Sidebar.tsx](src/renderer/components/Sidebar/Sidebar.tsx): hoisted the handle out of the button into the parent flex column as an absolutely-positioned overlay sibling.
+- **⌥ Option modifier is gone.** The V1.0043 modifier was undiscoverable; the V1.0044 handle is a small ↗ icon in the top-left of each thumbnail, visible on hover or when the page is selected, with a `title` attribute that reads "Drag to Finder / Desktop to extract page X as a PDF". Plain drag from the rest of the thumbnail still triggers @dnd-kit reorder.
+- **Verified live via computer-use** against the 4-page ServiceOntario receipt: hovered thumb-2 → handle appeared → dragged handle to Desktop → `ServiceOntario-S20260430000500061 - page 2.pdf` (137KB) appeared. Reorder gesture (plain drag of the button body) untouched.
+- **Bumped V1.0043 → V1.0044** per Critical Rule #12.
+
 ### Added — V1.0043: drag a sidebar thumbnail to Finder with ⌥ Option to extract that page (2026-04-30)
 - **Hold ⌥ Option and drag a page thumbnail from the sidebar to Finder / Desktop / any folder window.** A real `<source basename> - page <n>.pdf` file is created at the drop location — same outcome as Adobe Acrobat's drag-out.
 - **Implementation:** new `pages:start-drag` IPC channel ([src/shared/ipc.ts](src/shared/ipc.ts), [src/preload/preload.ts](src/preload/preload.ts), [src/main/main.ts](src/main/main.ts)). The renderer's thumbnail dragstart calls `e.preventDefault()` (always) and then fires the IPC only when `e.altKey` is held. Main extracts the page with pdf-lib, writes it into a freshly-minted `os.tmpdir()/weavepdf-drag-XXXX/` slot, then calls `webContents.startDrag({file, icon})` to start the OS-level drag with file payload. The macOS app icon doubles as the drag image.

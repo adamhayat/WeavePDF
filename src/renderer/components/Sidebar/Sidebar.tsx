@@ -14,7 +14,7 @@ import {
   arrayMove,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
-import { RotateCw, RotateCcw, Trash2 } from "lucide-react";
+import { RotateCw, RotateCcw, Trash2, ArrowUpRight } from "lucide-react";
 import { useDocumentStore, type DocumentTab } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
@@ -465,7 +465,7 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
         transition,
         opacity: isDragging ? 0.4 : 1,
       }}
-      className="flex flex-col items-center gap-1.5"
+      className="group relative flex flex-col items-center gap-1.5"
       data-testid="thumb-row"
       data-page-number={pageNumber}
     >
@@ -473,38 +473,6 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
         type="button"
         {...attributes}
         {...listeners}
-        // V1.0043: Hold ⌥ Option while dragging a thumbnail to Finder /
-        // Desktop to extract that page as a single-page PDF — same outcome
-        // as Adobe Acrobat's drag-out. The Option requirement is a UX
-        // tradeoff: a plain drag has to stay reserved for @dnd-kit's
-        // sortable reorder (which is also pointer-based), so we use Option
-        // as the disambiguator. Tooltip on the button mentions the gesture.
-        //
-        // Implementation: `draggable={true}` lets the browser fire a native
-        // dragstart. We always `preventDefault()` so the browser's default
-        // drag image (a transparent canvas) doesn't appear; if Option is
-        // held, we then fire the IPC that asks main to extract the page,
-        // write a temp file, and call `webContents.startDrag()` with a
-        // real file payload + app icon. Without Option, dragstart is just
-        // suppressed and @dnd-kit's PointerSensor takes over for reorder.
-        draggable={!!tab.bytes}
-        onDragStart={(e) => {
-          // Always cancel the browser's default native drag — its drag
-          // image is a useless canvas snapshot, and we don't want a
-          // "no-drop" cursor flashing during a normal reorder gesture.
-          e.preventDefault();
-          if (!e.altKey || !tab.bytes) return;
-          // Snapshot bytes — store reference may move while the drag flies.
-          // Slice to a fresh buffer to detach from the Uint8Array view.
-          const slice = tab.bytes.slice().buffer;
-          const baseName = tab.name.replace(/\.pdf$/i, "");
-          window.weavepdf.pages.startDrag({
-            bytes: slice,
-            pageNumber,
-            fileName: `${baseName} - page ${pageNumber}.pdf`,
-          });
-        }}
-        title={`Page ${pageNumber} — drag to reorder, or hold ⌥ and drag to Finder to extract this page`}
         onClick={(e) => {
           if (e.metaKey || e.ctrlKey) onActivate("toggle");
           else if (e.shiftKey) onActivate("range");
@@ -514,7 +482,7 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
           e.preventDefault();
           onContextMenu(e.clientX, e.clientY);
         }}
-        className="group"
+        className="relative"
         aria-label={`Page ${pageNumber}`}
         data-testid="thumb-button"
         data-selected={selected || undefined}
@@ -553,6 +521,66 @@ function SortableThumb({ id, pdf, pageNumber, active, selected, tab, onActivate,
       >
         {pageNumber}
       </span>
+      {/*
+        V1.0044: Drag-out handle. Plain drag on the thumbnail is bound to
+        @dnd-kit's sortable reorder, so the drag-to-Finder gesture lives on
+        this dedicated handle. It's an absolutely-positioned overlay sibling
+        of the button (NOT a child) — Chromium will not fire a fresh
+        `dragstart` on a `draggable=true` element nested inside a `<button>`
+        ancestor, because the button captures the mousedown for its own
+        click-handling and the pointer events never reach the inner span.
+        Hoisting the span out into the parent's `relative` flex column makes
+        it a top-level draggable in the page tree, so dragstart fires
+        reliably on the handle alone.
+        Pre-V1.0044 attempts: ⌥ Option modifier on the whole thumbnail (V1.0043,
+        fragile UX + extraction latency aborted the gesture); same handle but
+        nested inside the button (V1.0044a, dragstart never fired).
+      */}
+      {tab.bytes && (
+        <span
+          role="button"
+          tabIndex={-1}
+          draggable={true}
+          onPointerDown={(e) => {
+            // Don't activate the page click or @dnd-kit's pointer sensor.
+            e.stopPropagation();
+          }}
+          onMouseDown={(e) => {
+            // Mousedown also stops here so the button beneath doesn't see it.
+            e.stopPropagation();
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            e.preventDefault();
+          }}
+          onDragStart={(e) => {
+            // Cancel the browser's default drag (which would be the icon as
+            // a transparent PNG); Electron's `webContents.startDrag()` will
+            // begin a new OS-level drag with the file payload + app icon.
+            e.preventDefault();
+            if (!tab.bytes) return;
+            const slice = tab.bytes.slice().buffer;
+            const baseName = tab.name.replace(/\.pdf$/i, "");
+            window.weavepdf.pages.startDrag({
+              bytes: slice,
+              pageNumber,
+              fileName: `${baseName} - page ${pageNumber}.pdf`,
+            });
+          }}
+          title={`Drag to Finder / Desktop to extract page ${pageNumber} as a PDF`}
+          aria-label={`Drag page ${pageNumber} to Finder`}
+          className={cn(
+            "absolute top-1 left-1 z-10 flex h-5 w-5 cursor-grab items-center justify-center rounded-full",
+            "bg-[var(--panel-bg-raised)] text-[var(--muted)] shadow ring-1 ring-[var(--panel-border)]",
+            "transition-opacity duration-150 hover:text-[var(--color-accent)] active:cursor-grabbing",
+            "opacity-0 group-hover:opacity-100 focus-visible:opacity-100",
+            selected && "opacity-100",
+          )}
+          data-testid="thumb-drag-out"
+        >
+          <ArrowUpRight className="h-3 w-3" strokeWidth={2.2} />
+        </span>
+      )}
     </div>
   );
 }
