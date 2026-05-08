@@ -296,6 +296,20 @@ export function App() {
   // the tab or quitting the app.
   useDraftPersistence();
 
+  // V1.0051: push the dirty-tab list to main on every change so the
+  // window-close + ⌘Q handlers can show the "unsaved changes" confirmation
+  // dialog. Pre-V1.0051 this wire was missing — main always saw an empty
+  // list and the dialog never fired, so a stray ⌘W silently discarded
+  // pending edits. Joining the names keeps the dep array a stable string so
+  // the effect only re-fires when the dirty SET actually changes.
+  const dirtyTabNames = tabs.filter((t) => t.dirty).map((t) => t.name);
+  const dirtyTabKey = dirtyTabNames.join(" ");
+  useEffect(() => {
+    window.weavepdf.notifyDirtyTabs(dirtyTabNames);
+    // dirtyTabKey is the stable signal; dirtyTabNames is closed over.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirtyTabKey]);
+
   // Password-prompt state. When `loadAsTab` hits an encrypted PDF it stashes
   // the original bytes + filename + a pair of resolver callbacks here; the
   // PasswordModal consumes them, calls qpdf.decrypt, and returns the plaintext
@@ -467,6 +481,30 @@ export function App() {
     [openTabFromDraft],
   );
 
+  // V1.0051: open a saved-version snapshot in a fresh tab. We deliberately
+  // pass `path: null` so the next ⌘S routes through Save-As — the user
+  // explicitly chose to roll back, but they should still confirm where the
+  // restored bytes land (Critical Rule #6 spirit).
+  const handleRestoreSnapshot = useCallback(
+    async (filePath: string, savedAt: string) => {
+      const buf = await window.weavepdf.snapshots.read(filePath, savedAt);
+      if (!buf) {
+        alert(`Couldn't read that saved version.`);
+        return;
+      }
+      const bytes = new Uint8Array(buf);
+      const baseName = filePath.split("/").pop() ?? "document.pdf";
+      const stamp = new Date(savedAt).toLocaleString();
+      await loadAsTab({
+        name: `${baseName.replace(/\.pdf$/i, "")} (${stamp}).pdf`,
+        path: null,
+        sizeBytes: bytes.byteLength,
+        bytes,
+      });
+    },
+    [loadAsTab],
+  );
+
   const openFile = useCallback(async () => {
     const result = await window.weavepdf.openFileDialog({
       filters: [
@@ -514,13 +552,21 @@ export function App() {
     }
   }, [loadAsTab]);
 
-  const saveCurrent = useCallback(
-    async (forceSaveAs: boolean) => {
-      if (!activeTab?.bytes) return;
+  // V1.0053: pulled out of saveCurrent so we can save a SPECIFIC tab by id
+  // (not just the active one). The unsaved-changes dialog's Save / Save All
+  // path needs this to iterate dirty tabs without flipping the active tab
+  // back and forth. Returns true on a successful write (or no-op), false if
+  // the user canceled a Save-As dialog or the write errored — main consumes
+  // the boolean to decide whether to proceed with the deferred close/quit.
+  const saveTabById = useCallback(
+    async (tabId: string, forceSaveAs: boolean): Promise<boolean> => {
+      const tab0 = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
+      // Tab gone or empty — count as a no-op success so the close path proceeds.
+      if (!tab0?.bytes) return true;
       // Bake any floating text edits into the PDF before writing to disk.
-      await commitAllPending(activeTab.id);
-      const refreshed = useDocumentStore.getState().tabs.find((t) => t.id === activeTab.id);
-      if (!refreshed?.bytes) return;
+      await commitAllPending(tabId);
+      const refreshed = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
+      if (!refreshed?.bytes) return true;
       let targetPath = refreshed.path;
       const mustPrompt = forceSaveAs || !targetPath || !refreshed.saveInPlace;
       if (mustPrompt) {
@@ -530,11 +576,12 @@ export function App() {
           suggestedName: suggested,
           extensions: ["pdf"],
         });
-        if (result.canceled) return;
+        if (result.canceled) return false;
         targetPath = result.path;
       }
-      if (!targetPath) return;
-      const result = await window.weavepdf.writeFile(targetPath, toArrayBuffer(refreshed.bytes));
+      if (!targetPath) return false;
+      const savedBytes = toArrayBuffer(refreshed.bytes);
+      const result = await window.weavepdf.writeFile(targetPath, savedBytes);
       if (result.ok) {
         // V1.0036: clear the autosave draft slots BEFORE markClean, while
         // we still have the previous draftKey. The autosave hook would do
@@ -550,13 +597,58 @@ export function App() {
           // would-be new slot in case anything queued a write before us.
           await window.weavepdf.drafts.clear(targetPath).catch(() => {});
         }
+        // V1.0051: write a saved-version snapshot so the user can roll
+        // back later via the Revisions sidebar. Fire-and-forget — the save
+        // itself succeeded; a snapshot-write failure shouldn't surface to
+        // the user (worst case: that one save isn't in the rollback list).
+        // Clone the buffer because writeFile may have transferred it.
+        void window.weavepdf.snapshots
+          .save(targetPath, refreshed.bytes.slice().buffer as ArrayBuffer)
+          .catch(() => {});
         markClean(refreshed.id, targetPath);
+        return true;
       } else {
         alert(`Save failed: ${result.error}`);
+        return false;
       }
     },
-    [activeTab, markClean, commitAllPending],
+    [markClean, commitAllPending],
   );
+
+  const saveCurrent = useCallback(
+    async (forceSaveAs: boolean) => {
+      if (!activeTab) return;
+      await saveTabById(activeTab.id, forceSaveAs);
+    },
+    [activeTab, saveTabById],
+  );
+
+  // V1.0053: respond to a "Save" click in main's unsaved-changes dialog.
+  // Iterate every dirty tab and save it (Save-As as needed for path-less
+  // tabs); report success/failure back so main proceeds with the deferred
+  // close/quit only when every save lands. We bail on the first failure
+  // so the user lands on the tab whose save was canceled — typical case
+  // is they hit Cancel in a Save-As dialog.
+  useEffect(() => {
+    const cleanup = window.weavepdf.onSaveAllRequest(() => {
+      void (async () => {
+        const dirtyIds = useDocumentStore
+          .getState()
+          .tabs.filter((t) => t.dirty)
+          .map((t) => t.id);
+        let allOk = true;
+        for (const id of dirtyIds) {
+          const ok = await saveTabById(id, false);
+          if (!ok) {
+            allOk = false;
+            break;
+          }
+        }
+        window.weavepdf.notifySaveAllComplete(allOk);
+      })();
+    });
+    return cleanup;
+  }, [saveTabById]);
 
   const exportCombined = useCallback(async () => {
     if (tabs.length === 0) return;
@@ -1334,7 +1426,7 @@ export function App() {
       <div className="flex min-h-0 flex-1">
         {hasDocs && activeTab?.bytes ? (
           <>
-            <Sidebar onRestoreRevision={handleRestoreFromList} />
+            <Sidebar onRestoreRevision={handleRestoreFromList} onRestoreSnapshot={handleRestoreSnapshot} />
             <main className="relative flex min-w-0 flex-1 flex-col">
               <Viewer />
               {searchOpen && activeTab && <SearchBar />}

@@ -1,13 +1,11 @@
 import { useEffect, useRef, useState } from "react";
 import { Search, X, ChevronUp, ChevronDown, Replace } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
-import { useUIStore } from "../../stores/ui";
+import { useUIStore, type SearchMatch } from "../../stores/ui";
 import { cn } from "../../lib/cn";
 // Lazy-loaded so the pdf-lib chunk doesn't pull at boot. Replace is a
 // heavy edit op that only runs on click; the chunk parses then.
 const loadPdfOps = () => import("../../lib/pdf-ops");
-
-type Match = { pageNumber: number; matchIndex: number; matchCount: number };
 
 export function SearchBar() {
   const activeTab = useDocumentStore((s) => s.activeTab());
@@ -16,11 +14,13 @@ export function SearchBar() {
   const query = useUIStore((s) => s.searchQuery);
   const setQuery = useUIStore((s) => s.setSearchQuery);
   const closeSearch = useUIStore((s) => s.closeSearch);
+  const matches = useUIStore((s) => s.searchMatches);
+  const cursor = useUIStore((s) => s.searchCursor);
+  const setSearchResults = useUIStore((s) => s.setSearchResults);
+  const setSearchCursor = useUIStore((s) => s.setSearchCursor);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const replaceInputRef = useRef<HTMLInputElement>(null);
-  const [matches, setMatches] = useState<Match[]>([]);
-  const [cursor, setCursor] = useState(0);
   const [searching, setSearching] = useState(false);
   const [replaceOpen, setReplaceOpen] = useState(false);
   const [replacement, setReplacement] = useState("");
@@ -32,13 +32,14 @@ export function SearchBar() {
     inputRef.current?.select();
   }, []);
 
-  // Naive search: walk every page's text content, collect matches.
-  // Phase 0 quality — good enough for short/mid docs; will upgrade to
-  // incremental streaming in Phase 4 if we see perf issues on 300+ pg PDFs.
+  // Walk every page's text content, locate the query in each text item, and
+  // compute its bounding rectangle in PDF point space. The rects feed into
+  // SearchHighlightLayer (mounted under each PageCanvas) which paints the
+  // yellow highlights. Single-item matching only — queries that span across
+  // pdf.js text items are uncommon enough to defer.
   useEffect(() => {
     if (!activeTab?.pdf || !query.trim()) {
-      setMatches([]);
-      setCursor(0);
+      setSearchResults([], 0);
       return;
     }
     const pdf = activeTab.pdf;
@@ -47,30 +48,100 @@ export function SearchBar() {
     setSearching(true);
 
     (async () => {
-      const all: Match[] = [];
+      const all: SearchMatch[] = [];
       for (let p = 1; p <= pdf.numPages; p++) {
         if (cancelled) return;
         const page = await pdf.getPage(p);
         const content = await page.getTextContent();
-        const text = content.items
-          .map((i) => ("str" in i ? i.str : ""))
-          .join(" ")
-          .toLowerCase();
-        let from = 0;
-        let count = 0;
-        while (true) {
-          const idx = text.indexOf(q, from);
-          if (idx === -1) break;
-          count++;
-          from = idx + q.length;
+        for (const raw of content.items) {
+          if (!("str" in raw)) continue;
+          const item = raw as {
+            str: string;
+            transform: number[];
+            width: number;
+            height?: number;
+          };
+          const str = item.str;
+          if (!str) continue;
+          const lower = str.toLowerCase();
+          let from = 0;
+          while (true) {
+            const idx = lower.indexOf(q, from);
+            if (idx === -1) break;
+            // Item is positioned by transform [a, b, c, d, e, f]; (e, f) is
+            // the baseline origin in PDF user space. Font size approximates
+            // to abs(d) (vertical scale of the transform). item.width is the
+            // horizontal advance of str at that scale.
+            const fontSize = Math.abs(item.transform[3] || item.transform[0]) || 12;
+            const baselineX = item.transform[4];
+            const baselineY = item.transform[5];
+            const charWidth = item.width / Math.max(1, str.length);
+            const matchX = baselineX + idx * charWidth;
+            const matchWidth = q.length * charWidth;
+            // Visible glyph extent runs from ~descent (15% below baseline)
+            // up to ~ascent (85% above). A rect of [baseline-0.15*fs, fs*1.0]
+            // covers the line cleanly without overlapping the next row.
+            const rectY = baselineY - 0.15 * fontSize;
+            all.push({
+              globalIndex: all.length,
+              pageNumber: p,
+              xPt: matchX,
+              yPt: rectY,
+              widthPt: matchWidth,
+              heightPt: fontSize,
+            });
+            from = idx + q.length;
+          }
         }
-        for (let i = 0; i < count; i++) {
-          all.push({ pageNumber: p, matchIndex: i, matchCount: count });
+      }
+      // V1.0048: also search uncommitted pending text edits — Edit Text
+      // overlays + Add Text overlays — so `1019` is findable as soon as the
+      // user types it, before they save. Without this pass, ⌘F looked
+      // broken on freshly-edited text because it only searches the baked
+      // PDF bytes pdf.js parsed at open time.
+      // V1.0049: width comes from canvas measureText (1 pt = 1 CSS px in the
+      // canvas font shorthand) so the highlight rect matches the rendered
+      // glyph extent instead of a 0.55 average that under-covered short
+      // capital-letter words like `PIN`.
+      const measureCanvas = document.createElement("canvas");
+      const measureCtx = measureCanvas.getContext("2d");
+      for (const edit of activeTab.pendingTextEdits) {
+        if (!edit.text) continue;
+        const lower = edit.text.toLowerCase();
+        if (measureCtx) {
+          measureCtx.font = `${edit.size}px Helvetica, sans-serif`;
+        }
+        let from = 0;
+        while (true) {
+          const idx = lower.indexOf(q, from);
+          if (idx === -1) break;
+          let matchX = edit.xPt;
+          let matchWidth = q.length * edit.size * 0.55;
+          if (measureCtx) {
+            const beforeWidth = measureCtx.measureText(edit.text.slice(0, idx)).width;
+            const matchTextWidth = measureCtx.measureText(edit.text.slice(idx, idx + q.length)).width;
+            matchX = edit.xPt + beforeWidth;
+            matchWidth = matchTextWidth;
+          }
+          const rectY = edit.yPt - 0.15 * edit.size;
+          all.push({
+            globalIndex: all.length,
+            pageNumber: edit.page,
+            xPt: matchX,
+            yPt: rectY,
+            widthPt: matchWidth,
+            heightPt: edit.size,
+            // PendingTextLayer wraps rendered text in a div with px-0.5
+            // (2 CSS pixels) horizontal padding for the hover/selection
+            // ring. The visible text sits 2 px right of edit.xPt * zoom;
+            // SearchHighlightLayer adds this offset back at render time.
+            extraLeftCssPx: 2,
+          });
+          from = idx + q.length;
         }
       }
       if (cancelled) return;
-      setMatches(all);
-      setCursor(0);
+      setSearchResults(all, 0);
       setSearching(false);
       if (all.length > 0 && activeTab) {
         setCurrentPage(activeTab.id, all[0].pageNumber);
@@ -80,12 +151,22 @@ export function SearchBar() {
     return () => {
       cancelled = true;
     };
-  }, [query, activeTab?.id, activeTab?.pdf]);
+  }, [
+    query,
+    activeTab?.id,
+    activeTab?.pdf,
+    // Re-run when pending edits change so newly-typed text is searchable
+    // immediately. Adding/removing/replacing the array swaps its reference;
+    // editing a property of the same tab leaves the array reference intact.
+    activeTab?.pendingTextEdits,
+    setSearchResults,
+    setCurrentPage,
+  ]);
 
   const goto = (next: number) => {
     if (matches.length === 0) return;
     const wrapped = (next + matches.length) % matches.length;
-    setCursor(wrapped);
+    setSearchCursor(wrapped);
     if (activeTab) setCurrentPage(activeTab.id, matches[wrapped].pageNumber);
   };
 

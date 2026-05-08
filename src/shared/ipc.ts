@@ -33,6 +33,14 @@ export const IpcChannel = {
    *  before-quit hook can show an "unsaved changes" confirmation dialog
    *  without a synchronous IPC roundtrip (which would deadlock). */
   NotifyDirtyTabs: "tabs:notify-dirty",
+  /** V1.0053: when the user clicks "Save" in the unsaved-changes dialog,
+   *  main asks the renderer to save all dirty tabs and report back. Main
+   *  defers the window close (or app quit) until SaveAllComplete arrives —
+   *  if `ok` is true, main proceeds with close/quit; if false (a save
+   *  failed or the user canceled a Save-As mid-flow), main does NOT close
+   *  and the user stays in the editor with their dirty tabs intact. */
+  RequestSaveAll: "tabs:request-save-all",
+  SaveAllComplete: "tabs:save-all-complete",
   SignatureGet: "signature:get",
   SignatureSet: "signature:set",
   SignatureClear: "signature:clear",
@@ -95,6 +103,17 @@ export const IpcChannel = {
   DraftsClear: "drafts:clear",
   DraftsList: "drafts:list",
   /**
+   * V1.0051: per-file *saved* version history — distinct from drafts (which
+   * track unsaved work). Every successful Save writes a snapshot of the
+   * saved bytes to userData/snapshots/<sha256(path)>/<isoTimestamp>.pdf.
+   * Last 20 snapshots per file are retained; older ones are pruned on
+   * write. RevisionsPanel surfaces this list so the user can roll back to a
+   * prior saved state.
+   */
+  SnapshotsSave: "snapshots:save",
+  SnapshotsList: "snapshots:list",
+  SnapshotsRead: "snapshots:read",
+  /**
    * Begin a native OS drag-and-drop carrying a single extracted PDF page as
    * a real file. Renderer fires this from a thumbnail's `dragstart` after
    * `e.preventDefault()`; main extracts the page with pdf-lib, writes it
@@ -138,6 +157,17 @@ export type DraftRecord = {
   manifest: DraftManifest;
   /** Null when nothing was committed yet — caller should load the original bytes. */
   currentBytes: ArrayBuffer | null;
+};
+
+/**
+ * V1.0051: a single point-in-time snapshot of a saved file. Returned in
+ * lists so the Revisions sidebar can render dated entries and offer
+ * one-click restore.
+ */
+export type SnapshotEntry = {
+  /** ISO-8601 timestamp; doubles as the snapshot's stable id within a file. */
+  savedAt: string;
+  sizeBytes: number;
 };
 
 /**

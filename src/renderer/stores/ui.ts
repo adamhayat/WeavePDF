@@ -2,11 +2,32 @@ import { create } from "zustand";
 import type { AppTheme } from "../../shared/ipc";
 import type { MenuItem as ContextMenuItem } from "../components/ContextMenu/ContextMenu";
 
+// Per-match rectangle in PDF point space (Y=0 at bottom of page). Computed
+// once when the search query changes; consumed by SearchHighlightLayer to
+// paint the yellow/orange highlights on top of each rendered page.
+export type SearchMatch = {
+  globalIndex: number;
+  pageNumber: number;
+  xPt: number;
+  yPt: number;
+  widthPt: number;
+  heightPt: number;
+  // Extra CSS-pixel offset applied at render time, independent of zoom.
+  // Used for matches inside pending text edits, whose rendered HTML
+  // wrapper has `px-0.5` (2 CSS pixels) horizontal padding — without
+  // this offset the highlight rect sits 2 px left of the visible text.
+  extraLeftCssPx?: number;
+};
+
 type UIStore = {
   theme: AppTheme;
   sidebarOpen: boolean;
   searchOpen: boolean;
   searchQuery: string;
+  // V1.0047: highlights for the current ⌘F query. Driven by SearchBar; read
+  // by SearchHighlightLayer mounted under each PageCanvas.
+  searchMatches: SearchMatch[];
+  searchCursor: number;
   paletteOpen: boolean;
   compressOpen: boolean;
   signatureOpen: boolean;
@@ -90,6 +111,8 @@ type UIStore = {
   openSearch: () => void;
   closeSearch: () => void;
   setSearchQuery: (q: string) => void;
+  setSearchResults: (matches: SearchMatch[], cursor: number) => void;
+  setSearchCursor: (cursor: number) => void;
   openPalette: () => void;
   closePalette: () => void;
   togglePalette: () => void;
@@ -157,6 +180,8 @@ export const useUIStore = create<UIStore>((set) => ({
   sidebarOpen: true,
   searchOpen: false,
   searchQuery: "",
+  searchMatches: [],
+  searchCursor: 0,
   paletteOpen: false,
   compressOpen: false,
   signatureOpen: false,
@@ -199,8 +224,11 @@ export const useUIStore = create<UIStore>((set) => ({
   toggleSidebar: () => set((s) => ({ sidebarOpen: !s.sidebarOpen })),
   setSidebarOpen: (open) => set({ sidebarOpen: open }),
   openSearch: () => set({ searchOpen: true }),
-  closeSearch: () => set({ searchOpen: false, searchQuery: "" }),
+  closeSearch: () =>
+    set({ searchOpen: false, searchQuery: "", searchMatches: [], searchCursor: 0 }),
   setSearchQuery: (q) => set({ searchQuery: q }),
+  setSearchResults: (matches, cursor) => set({ searchMatches: matches, searchCursor: cursor }),
+  setSearchCursor: (cursor) => set({ searchCursor: cursor }),
   openPalette: () => set({ paletteOpen: true }),
   closePalette: () => set({ paletteOpen: false }),
   togglePalette: () => set((s) => ({ paletteOpen: !s.paletteOpen })),

@@ -9,7 +9,17 @@ import { PendingTextLayer } from "./PendingTextLayer";
 import { PendingImageLayer } from "./PendingImageLayer";
 import { PendingShapeLayer } from "./PendingShapeLayer";
 import { AcroFormLayer } from "./AcroFormLayer";
+import { SearchHighlightLayer } from "./SearchHighlightLayer";
 import { bytesToBlob } from "../../../shared/buffers";
+import type { OcrBox } from "../../../shared/ipc";
+
+// V1.0052: OCR results cached per (tab × edit-version × page). Survives
+// PageCanvas remounts within a session — multiple page components share one
+// cache. The version-in-key invalidates naturally after every applyEdit so
+// edits to one page don't poison cached boxes on another. ocrInFlight blocks
+// re-prompts while a slow OCR call is still resolving.
+const ocrCache = new Map<string, OcrBox[]>();
+const ocrInFlight = new Set<string>();
 
 type Props = {
   pdf: PDFDocumentProxy;
@@ -27,6 +37,11 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
   const [pageSize, setPageSize] = useState<{ w: number; h: number } | null>(null); // in PDF points
   const [visible, setVisible] = useState(false);
+  // V1.0046: track whether the canvas has been painted at least once. Until
+  // it has, we suppress the white page background + drop shadow so dark-mode
+  // users don't see a stark white rectangle "flash" between tab open and
+  // pdf.js's first render. See the wrapper div below.
+  const [painted, setPainted] = useState(false);
 
   const tool = useUIStore((s) => s.tool);
   const setTool = useUIStore((s) => s.setTool);
@@ -102,6 +117,8 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         return;
       }
       if (cancelled) return;
+      // First paint complete — reveal the white page background + shadow.
+      setPainted(true);
 
       textLayerDiv.replaceChildren();
       textLayerDiv.style.setProperty("--scale-factor", String(zoom));
@@ -477,14 +494,150 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
     // Keep the tool active so users can make multiple shapes in a row.
   };
 
+  // V1.0052: Edit Text on image-only PDFs via Apple Vision OCR. When the
+  // user clicks on a page with no pdf.js text spans, render the page canvas
+  // to PNG, run OCR (cached per page+version), find the box nearest the
+  // click, and seed a pending text edit using OCR's text + position + size.
+  // Same whiteout-and-retype flow as the text-layer path — just a different
+  // source for the original-text rectangle.
+  const runOcrFallback = async (e: React.MouseEvent<HTMLDivElement>) => {
+    if (!pageSize || !containerRef.current || !canvasRef.current) return;
+    const activeTab = useDocumentStore.getState().activeTab();
+    if (!activeTab) return;
+
+    const cacheKey = `${activeTab.id}-${activeTab.version}-${pageNumber}`;
+    if (ocrInFlight.has(cacheKey)) return;
+    let boxes = ocrCache.get(cacheKey);
+    if (!boxes) {
+      const ok = window.confirm(
+        "No editable text on this page.\n\nRun OCR to make scanned text editable? (~2s)",
+      );
+      if (!ok) return;
+      const ocrAvailable = await window.weavepdf.ocr.available();
+      if (!ocrAvailable) {
+        alert(
+          "OCR helper isn't built. Reinstall WeavePDF to enable scanned-text editing.",
+        );
+        return;
+      }
+      ocrInFlight.add(cacheKey);
+      try {
+        const blob = await new Promise<Blob | null>((res) =>
+          canvasRef.current!.toBlob((b) => res(b), "image/png"),
+        );
+        if (!blob) {
+          alert("Couldn't read this page's image.");
+          return;
+        }
+        const pngBytes = await blob.arrayBuffer();
+        boxes = await window.weavepdf.ocr.runImage(pngBytes);
+        if (boxes.length === 0) {
+          alert("No text detected on this page.");
+          return;
+        }
+        ocrCache.set(cacheKey, boxes);
+      } finally {
+        ocrInFlight.delete(cacheKey);
+      }
+    }
+
+    // Click position in normalized image space, bottom-left origin to match
+    // Apple Vision boundingBox.
+    const pageRect = containerRef.current.getBoundingClientRect();
+    const clickX = (e.clientX - pageRect.left) / pageRect.width;
+    const clickYTop = (e.clientY - pageRect.top) / pageRect.height;
+    const clickYBottom = 1 - clickYTop;
+
+    // Containment first (the user clicked directly on a glyph), nearest-by-
+    // center as fallback within ~5% of the page so far-misclicks bail out
+    // instead of grabbing some random box across the page.
+    let chosen: OcrBox | null = null;
+    for (const b of boxes) {
+      if (
+        clickX >= b.x &&
+        clickX <= b.x + b.w &&
+        clickYBottom >= b.y &&
+        clickYBottom <= b.y + b.h
+      ) {
+        chosen = b;
+        break;
+      }
+    }
+    if (!chosen) {
+      let bestDist = Infinity;
+      for (const b of boxes) {
+        const cx = b.x + b.w / 2;
+        const cy = b.y + b.h / 2;
+        const d = (cx - clickX) ** 2 + (cy - clickYBottom) ** 2;
+        if (d < bestDist) {
+          bestDist = d;
+          chosen = b;
+        }
+      }
+      if (!chosen || bestDist > 0.0025) {
+        alert("No text near that point. Click closer to visible text.");
+        return;
+      }
+    }
+
+    // OCR boxes are normalized 0..1 with bottom-left origin — same
+    // convention as PDF user space. Multiply by page-point dimensions to
+    // land in PDF coords directly.
+    const xPt = chosen.x * pageSize.w;
+    const yPtBaseline = chosen.y * pageSize.h;
+    const widthPt = chosen.w * pageSize.w;
+    const heightPt = chosen.h * pageSize.h;
+    // OCR box height ≈ font size in points (visible glyph extent including
+    // descenders). Good enough — exact font fidelity is deferred per
+    // Critical Rule #3 anyway.
+    const fontSizePt = heightPt;
+    // Same V1.0049 bearing nudge as the pdf.js path: pdf-lib's drawText
+    // baseline-origin includes the new font's left side bearing, which would
+    // push glyph 0 right of the OCR box's left edge.
+    const bearingNudge = fontSizePt * 0.06;
+    const xPtAdjusted = Math.max(0, xPt - bearingNudge);
+
+    const newId = addPendingTextEdit(activeTab.id, {
+      page: pageNumber,
+      xPt: xPtAdjusted,
+      yPt: yPtBaseline,
+      size: fontSizePt,
+      // OCR doesn't tell us the original font family — default to Helvetica.
+      // True font fidelity needs font extraction + re-embedding (deferred).
+      fontName: "Helvetica",
+      text: chosen.text,
+      whiteout: {
+        x: xPt - 0.5,
+        y: yPtBaseline - 0.5,
+        width: widthPt + 1,
+        height: heightPt + 1,
+      },
+    });
+    useUIStore.getState().setSelectedPendingText(newId);
+    useUIStore.getState().setEditingPendingText(newId);
+    setTool("none");
+  };
+
   // Click-to-edit on existing text: when the edit-text tool is active,
   // intercept clicks on the text layer spans, read their position + font
   // size, and stage a PendingTextEdit that will whiteout the original
   // region and draw the user's new text in its place.
   const onTextLayerClick = async (e: React.MouseEvent<HTMLDivElement>) => {
     if (tool !== "editText" || !pageSize) return;
+    if (!containerRef.current) return;
     const span = (e.target as HTMLElement).closest("span") as HTMLElement | null;
-    if (!span || !containerRef.current) return;
+    if (!span) {
+      // V1.0052: image-only page → run OCR and pick the box nearest the click.
+      // Only fires when pdf.js has zero text spans on this page, so a misclick
+      // between paragraphs on a normal text-PDF stays a no-op (matches
+      // pre-V1.0052 behavior).
+      const layerHasText = textLayerRef.current?.querySelector("span") != null;
+      if (layerHasText) return;
+      e.preventDefault();
+      e.stopPropagation();
+      await runOcrFallback(e);
+      return;
+    }
     e.preventDefault();
     e.stopPropagation();
     const pageRect = containerRef.current.getBoundingClientRect();
@@ -508,20 +661,44 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
     const isBold = Number.isFinite(weight) ? weight >= 600 : /bold/i.test(style.fontWeight);
     const isItalic = /italic|oblique/i.test(style.fontStyle);
     const fontName = matchStandardFont(style.fontFamily, isBold, isItalic);
+    // V1.0048: pdf.js's TextLayer paints each item at its real font size in
+    // CSS pixels (`style.fontSize`). Reading that and dividing by zoom gives
+    // an exact PDF-point value — the previous `heightPt * 0.85` was a guess
+    // off the bounding box, which produced a smaller-looking replacement
+    // than the original (visible side-by-side in dense table rows).
+    const fontSizePx = parseFloat(style.fontSize);
+    const fontSizePt = Number.isFinite(fontSizePx) && fontSizePx > 0 ? fontSizePx / zoom : heightPt * 0.85;
+    // V1.0049: pdf.js's TextLayer span left edge corresponds to the visible
+    // glyph start (which includes the *original* font's left side bearing).
+    // pdf-lib draws starting at the baseline origin and lets the new font's
+    // own left side bearing push the first glyph right — net effect is the
+    // replacement appears shifted ~0.05–0.10 fontSize to the right of the
+    // original. Subtract a small empirical offset so the replacement lands
+    // closer to where the original text was visible. Imperfect (true font
+    // fidelity needs font extraction + re-embedding per Critical Rule #3),
+    // but visually it removes the user-visible drift on common edits.
+    const bearingNudge = fontSizePt * 0.06;
+    const xPtAdjusted = Math.max(0, xPt - bearingNudge);
     const activeTab = useDocumentStore.getState().activeTab();
     if (!activeTab) return;
     const newId = addPendingTextEdit(activeTab.id, {
       page: pageNumber,
-      xPt,
+      xPt: xPtAdjusted,
       yPt: yPtBaseline,
-      size: heightPt * 0.85, // span height ~ font size in CSS pixels; shrink a touch
+      size: fontSizePt,
       text,
       fontName,
       whiteout: {
-        x: xPt - 1,
-        y: yPtBaseline - 2,
-        width: widthPt + 2,
-        height: heightPt + 4,
+        // V1.0050: keep the whiteout tight to the bounding box — the prior
+        // `(+1, +2, +2, +4)` padding ate into adjacent table-cell borders
+        // when the original text sat close to a border. The pdf.js
+        // bounding box already covers the visible glyph extent; a small
+        // 0.5pt margin catches sub-pixel anti-aliasing without eating
+        // anything meaningful.
+        x: xPt - 0.5,
+        y: yPtBaseline - 0.5,
+        width: widthPt + 1,
+        height: heightPt + 1,
       },
     });
     // Open the pending text immediately in edit mode — the original span's
@@ -707,8 +884,21 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
       ref={setRefs}
       data-page={pageNumber}
       data-edit-text={tool === "editText" ? "1" : undefined}
-      className="relative rounded-[var(--radius-page)] bg-white shadow-[var(--page-shadow)]"
-      style={{ width: dims?.w ?? 612, height: dims?.h ?? 792 }}
+      className="relative rounded-[var(--radius-page)]"
+      style={{
+        // Until pdf.js gives us real dims, render at zero size so the
+        // viewer's flex column has nothing to show — avoids the default
+        // 612x792 placeholder briefly flashing for landscape / non-letter
+        // PDFs. The placeholder is harmless in light mode but produces a
+        // very visible white-on-dark flash in dark mode.
+        width: dims?.w ?? 0,
+        height: dims?.h ?? 0,
+        // V1.0046: only show white background + drop shadow once the canvas
+        // has painted. Before that, the wrapper inherits the app background
+        // and is effectively invisible — no white flash on tab open.
+        background: painted ? "#fff" : "transparent",
+        boxShadow: painted ? "var(--page-shadow)" : "none",
+      }}
       onClick={tool === "editText" ? onTextLayerClick : undefined}
       onContextMenu={onContextMenu}
     >
@@ -786,6 +976,13 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
             </svg>
           )}
         </div>
+      )}
+      {dims && (
+        <SearchHighlightLayer
+          pageNumber={pageNumber}
+          zoom={zoom}
+          pageHeightPx={dims.h}
+        />
       )}
       {dims && (
         <>

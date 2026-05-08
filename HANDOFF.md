@@ -5,7 +5,88 @@
 
 ## Current State
 
-**Status:** **V1.0045 — the whole sidebar thumbnail is draggable to Finder; @dnd-kit reorder replaced by Move up / Move down in the right-click menu.** User reported V1.0044 still didn't work for them — the small ↗ handle was too fiddly and they wanted plain drag from the thumbnail itself. Removed @dnd-kit's drag-to-reorder entirely; the thumbnail's wrapping `<div>` now carries `draggable={true}` and `onDragStart` fires the existing `pages:start-drag` IPC. Reorder moved to the context menu as "Move up" / "Move down" items (calls a new `movePage(pageNumber, ±1)` helper that swaps two indices in the page-order array and reuses `reorderPages` + `applyEdit`).
+**Status:** **V1.0054 — print no longer outputs blank pages.** User: "When i try to print a document, it comes out blank and doesnt print." Reproduced live and root-caused: Electron 32 deprecated and Electron 35 removed the bundled PDFium plugin that used to render `loadFile(some.pdf)` inside a `BrowserWindow` with `plugins: true`. We're on Electron 41. The print path (V1.0021 / V1.0028) loaded the temp PDF in a hidden BrowserWindow + called `webContents.print()` — post-Electron-32 the hidden window stays blank, so print() queued blank pages while reporting `success`.
+
+**Fix.** [main.ts](src/main/main.ts) — replaced the hidden-BrowserWindow path with `spawn("/usr/bin/lp", […])`. macOS CUPS understands PDF natively (no PDFium needed), so feeding the temp PDF directly to lp prints the actual content. PrintOptions map cleanly to CUPS flags: `-d` (deviceName), `-t` (job title), `-n` (copies), `-o sides=...` (duplex), `-o landscape` (orientation), `-o ColorModel=Gray` (mono), `-o page-ranges=...` (ranges). Drivers without a given capability (e.g. Brother HL-2240 has no duplex) silently ignore it. lp returns 0 as soon as the job is spooled; we delete the temp PDF after.
+
+**Bonus.** The elaborate `webRequest.onBeforeRequest` filter, `setPermissionRequestHandler`, and per-print session partition that hardened the hidden BrowserWindow are all gone. `lp`/CUPS don't execute embedded JavaScript or AcroForm scripts, so a malicious PDF can't phone home through the print path.
+
+Typecheck clean against `weavepdf@1.0.54`. User confirmed the printer now produces real output to the Brother HL-2240.
+
+**V1.0053 base (carried forward):** unsaved-changes dialog now offers Save / Cancel / Don't Save. User shipped a screenshot of the V1.0051 dialog ("'Merged-20260507041828.pdf' has unsaved changes — Close Anyway / Cancel") and pointed out the Save option was missing. Standard Mac apps offer Save / Cancel / Don't Save; we were doing only Cancel / Close Anyway, forcing the user to manually save before closing.
+
+**Behavior.** Buttons are now `[Save | Cancel | Don't Save]` with Save as default and Cancel as `cancelId`. When the user clicks Save, main sends `RequestSaveAll` to the renderer and defers the close/quit. Renderer iterates every dirty tab via the new `saveTabById(tabId, forceSaveAs)` helper (extracted from `saveCurrent`) and replies with `SaveAllComplete(ok)`. If all saves landed, main proceeds with the deferred close/quit; if any failed or a Save-As was canceled, main stays open with the user on the failed tab. Same flow for both window-close (`win.on("close")`) and app-quit (`app.before-quit`) dialogs — main routes the reply via `pendingCloseAfterSaveByWinId` and `pendingQuitAfterSave` state.
+
+**Refactor.** `saveCurrent` is now a thin wrapper around `saveTabById(activeTab.id, ...)`; the heavy lifting (commit pending edits → optional Save-As prompt → writeFile → snapshot + draft cleanup → markClean) lives in `saveTabById` and returns a boolean for the caller to act on.
+
+Typecheck clean against `weavepdf@1.0.53`. Live verification + repackage pending.
+
+**V1.0052 base (carried forward):** Edit Text now falls back to OCR on image-only PDFs. User asked whether stylized / scanned text in PDFs (e.g. an Instagram screenshot inside a Merged PDF, a scanned receipt) could be made editable. Yes for plain document scans; visually rough for stylized overlays (whiteout leaves a visible white rectangle over busy backgrounds). Shipped case 1 — image-only document scans — and called out the case-2 limit explicitly.
+
+**Flow.** Click in Edit Text mode → if pdf.js has zero text spans on the page, `window.confirm("No editable text on this page. Run OCR to make scanned text editable? (~2s)")`. If accepted: render the canvas to PNG via `canvas.toBlob` → feed to `window.weavepdf.ocr.runImage` (the existing Apple Vision Swift helper). Cache returned `OcrBox[]` per `${tabId}-${version}-${pageNumber}` in a module-level `Map` so subsequent clicks on the same page are instant. Match the click point to the OCR box that contains it (fallback: nearest-by-center within 5% of the page), then seed a pending text edit using the box's text + position + height. Same whiteout-and-retype flow as the pdf.js TextLayer path — just a different source for the original-text rectangle. A module-level `ocrInFlight` set blocks re-prompts while the 1–3 second OCR call is still resolving.
+
+**Coords.** Apple Vision returns normalized 0..1, bottom-left origin — same convention as PDF user space — so `box.x * pageSize.w / box.y * pageSize.h / box.w * pageSize.w / box.h * pageSize.h` lands directly in PDF points. OCR box height ≈ font size in points. The V1.0049 `0.06 * fontSize` left-bearing nudge applies as-is.
+
+**Misclick protection.** If pdf.js *does* have text spans on the page but the user clicked between them, the click stays a silent no-op — OCR only kicks in on genuinely image-only pages, so a misclick on a normal PDF doesn't surprise-prompt for OCR.
+
+**Honest limits.** Whiteout is pure white, so this works cleanly on plain white-background scans. On stylized overlay text (white-with-drop-shadow over a photo, like the user's Niagara Falls Instagram screenshot), the whiteout leaves a visible white rectangle and the replacement is plain Helvetica without outline / shadow. Background-color sampling and font-style preservation are deferred until a real use case calls for them.
+
+Typecheck clean against `weavepdf@1.0.52`. Verification pending — install needs a repackage; the user mentioned `Merged-20260507035407.pdf` on Desktop as the test PDF.
+
+**V1.0051 base (carried forward):** "unsaved changes" dialog actually fires + saved versions show up in Revisions. User reported two related bugs from V1.0050: ⌘W / quit didn't prompt before discarding edits, and old saved versions weren't appearing in Revisions. Both rooted in missing wires.
+
+1. **Quit / close dialog never fired.** V1.0026 designed a per-window dirty-tab snapshot kept in [main.ts](src/main/main.ts) so the close handler could decide whether to show a confirmation — but the renderer never published the snapshot via `window.weavepdf.notifyDirtyTabs(names)`. Main always saw an empty list, the handler short-circuited, and ⌘W silently discarded uncommitted edits. Fix in [App.tsx](src/renderer/App.tsx): added a `useEffect` keyed on a stable `dirtyTabKey` (joined names) that pushes the dirty list to main on every change.
+
+2. **Older saved versions vanished.** Drafts are single-slot-per-file (one `current.pdf` per source path), so every Save overwrote the previous draft and the user had no way to roll back to a prior saved state. Built a saved-version snapshot system distinct from drafts:
+   - New IPC channels `snapshots:save / snapshots:list / snapshots:read` ([ipc.ts](src/shared/ipc.ts), [preload.ts](src/preload/preload.ts), [api.ts](src/shared/api.ts)).
+   - Main-side handlers in [main.ts](src/main/main.ts) write each successful Save to `userData/snapshots/<sha256(path)>/<isoTimestamp>.pdf`, capping at 20 per file (oldest pruned on write). Local-only per Critical Rule #1.
+   - [App.tsx](src/renderer/App.tsx) `saveActiveAs` fires `snapshots.save` after `writeFile` succeeds (fire-and-forget so a snapshot-write failure doesn't surface to the user).
+   - [RevisionsPanel.tsx](src/renderer/components/Sidebar/RevisionsPanel.tsx) merges drafts and snapshots into one chronological list, uses `Save` vs `FileClock` icons to distinguish them, and offers Restore for both. Snapshot Restore opens the bytes in a new tab with `path: null` so the next ⌘S routes to Save-As — keeps Critical Rule #6's spirit (rollback is intentional but the user still confirms where the bytes land).
+
+Typecheck clean against `weavepdf@1.0.51`. Verification pending — installing locally next.
+
+**V1.0050 base (carried forward):** whiteout no longer eats borders + highlight aligns with rendered text. Two more refinements on the same Edit Text + ⌘F flow:
+
+1. **Whiteout was eating table borders.** When the user edited text in a cell with a tight border (e.g. `15%` in the Notes cell), the whiteout's `(+1, +2, +2, +4)` padding extended past the original glyphs and erased the border above the cell. Fix in [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx): tightened to a 0.5 pt margin all around. The pdf.js span bounding box already covers the visible glyph extent — the half-point margin only catches sub-pixel anti-aliasing.
+
+2. **Highlight rect was 2 CSS pixels left of the rendered text.** V1.0049 used canvas `measureText` for width, but the rect's left edge still sat 2 pixels too far left so short matches like `15` only covered "1". Cause: [PendingTextLayer.tsx](src/renderer/components/Viewer/PendingTextLayer.tsx)'s rendered text wrapper has `px-0.5` Tailwind padding (2 CSS pixels) for the hover/selection ring. Visible text starts at `edit.xPt * zoom + 2`, but the highlight was at `edit.xPt * zoom`. Fix: added optional `extraLeftCssPx` to `SearchMatch` in [stores/ui.ts](src/renderer/stores/ui.ts); SearchBar sets it to `2` for pending-edit matches; [SearchHighlightLayer.tsx](src/renderer/components/Viewer/SearchHighlightLayer.tsx) adds it in CSS-pixel space at render time, so the offset stays correct across zoom changes (px-0.5 is constant CSS pixels regardless of zoom).
+
+Typecheck clean against `weavepdf@1.0.50`. Verification pending.
+
+**V1.0049 base (carried forward):** search highlight covers full word + Edit Text bearing nudge. Two refinements after V1.0048's Edit Text + pending-search fixes shipped, both reported on the same `COI Niagara Parks Commission` PDF:
+
+1. **Search highlight on pending text edits was too narrow.** User edited `VIN → PIN` and ⌘F'd `pin` — search said "1 of 1" but the orange box only covered part of the word. Cause: V1.0048 used `0.55 * fontSize * length` to estimate the match width, which is fine for mixed-case sentences but under-covers short all-caps strings (cap letters in Helvetica average ~0.66 of fontSize). Fix in [SearchBar.tsx](src/renderer/components/Search/SearchBar.tsx) pending-edit branch: use canvas `measureText` against `${edit.size}px Helvetica, sans-serif` — the same font the HTML overlay renders in. Measure the prefix `edit.text.slice(0, idx)` for the X offset, measure the matched substring `edit.text.slice(idx, idx + q.length)` for the width. Highlight now lands exactly over the rendered text regardless of letter case or string length.
+
+2. **Edit Text replacement drifted ~a few points right.** User reported `PIN` rendered offset to the right of where `VIN` was. Cause: pdf.js's TextLayer span `left` corresponds to the *visible* glyph start (which includes the *original* font's left side bearing). pdf-lib's `drawText` places the baseline origin at the position you give it, then the *new* font's own left side bearing pushes the first glyph further right. Net visible drift ≈ `bearing_helvetica − bearing_original` ≈ 0.05–0.10 fontSize. Fix in [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx) `onTextLayerClick`: subtract `0.06 * fontSizePt` from `xPt` before storing the pending edit. The whiteout box still uses the unadjusted X so it fully covers the original glyphs. True font fidelity (font extraction + re-embedding) stays deferred per Critical Rule #3, but the nudge removes the user-visible drift on common edits.
+
+Typecheck clean against `weavepdf@1.0.49`. Install pending — user will catch any visual regression on next edit.
+
+**V1.0048 base (carried forward):** Edit Text uses the exact font size and ⌘F finds uncommitted edits. Two follow-up bugs from V1.0047 surfaced when the user edited `2019 → 1019` in `COI Niagara Parks Commission`:
+
+1. **Edit Text replacement was a different (smaller) font.** [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx) `onTextLayerClick` was approximating font size as `boundingBox.height * 0.85`. Replaced with `parseFloat(style.fontSize) / zoom` — pdf.js's TextLayer paints each item at its real font size in CSS px, so reading that directly gives an exact PDF-point value. Font family stays constrained to pdf-lib's 14 standard fonts per Critical Rule #3 (true font fidelity needs extraction + re-embedding, deferred), but size now lands flush.
+2. **⌘F couldn't find the new `1019` text.** Pending text edits live as draggable overlays until save and aren't part of the baked PDF bytes pdf.js parses at open. SearchBar in V1.0047 only walked pdf.js's text content — overlays were invisible to the search. Fix: after the per-page text-content pass, also scan `activeTab.pendingTextEdits` for the query and emit `SearchMatch` rects (char-width approximated as `0.55 * fontSize`). Effect deps include `activeTab?.pendingTextEdits` so newly-typed edits become searchable immediately, even with the search bar already open.
+
+Verified manually that the source code is correct; install pending. Typecheck clean against `weavepdf@1.0.48`.
+
+**V1.0047 base (carried forward):** ⌘F now paints yellow highlights on every match. User reported: "when doing command F, like in this example, it finds the text in the PDF, but it doesnt highlight it … It should highlight the part you found." V1.0046 SearchBar already found + counted matches and navigated by page, but never painted any visual marker — the user couldn't see _where_ on the page the match was. Two-part fix:
+
+1. **Compute per-match rectangles, not just counts.** [src/renderer/components/Search/SearchBar.tsx](src/renderer/components/Search/SearchBar.tsx) now walks each pdf.js text item, finds the query inside `item.str`, and emits a `SearchMatch` with `{ pageNumber, xPt, yPt, widthPt, heightPt }` derived from the item's `transform` baseline origin + per-char width. Matches go into a new `searchMatches` slice in [src/renderer/stores/ui.ts](src/renderer/stores/ui.ts) plus a `searchCursor` for which match Enter/Shift+Enter is currently on. SearchBar's count + navigation buttons read those store fields directly.
+2. **New `SearchHighlightLayer` paints the highlights.** [src/renderer/components/Viewer/SearchHighlightLayer.tsx](src/renderer/components/Viewer/SearchHighlightLayer.tsx) — mounted under each PageCanvas, filters `searchMatches` to its page, paints absolute-positioned divs with `mix-blend-mode: multiply`. Yellow for normal matches, orange + 1px border for the one the cursor points at. Clears when query is empty / search closes.
+
+Edge case left for later: queries that span multiple pdf.js text items (e.g. wrapping across line spans) aren't highlighted because we only check inside a single `item.str`. Single words, VINs, IDs, single-line phrases all work because pdf.js typically keeps those in one item. Multi-item highlighting needs span-graph reconstruction — defer until a real query needs it.
+
+**Verified live via computer-use:** opened the user's `N10 : N11 Contract .pdf` (the same PDF in their original screenshot), typed `1FDFF5GNXTDA07473` into the search bar, watched WeavePDF jump to page 2 and paint an **orange highlight** directly on top of the matched VIN in the Vin # column. "1 of 1" indicator updates correctly. Typecheck clean against `weavepdf@1.0.47`.
+
+**Important caveat surfaced during testing — image-only PDFs return zero matches by design.** While verifying, opened the Reza Gatchpazian invoice (`05-08-26 Reza Gatchpazian Contractor 2837.56.pdf`) and got "No results" for both `President` and `$`, even though the text is clearly visible on the page. Diagnosed via a Node script using the same pdfjs-dist build: `getTextContent()` returns **zero items** for that PDF — the visible text is rasterised glyphs with no underlying text content (PDF generated from a screenshot or with text converted to outlines). The search code is correct; the PDF just has nothing extractable. OCR would unlock searching these files; that's already on the deferred list.
+
+**V1.0046 base (carried forward):** empty tab area drags the window again + no white flash on PDF open. Two user-reported bugs from V1.0045:
+
+1. **Could not drag the window by clicking the empty tab area.** With zero PDFs open, the wide empty space in the title bar (between the sidebar toggle on the left and the icon cluster on the right) did nothing on click-drag. Cause: the wrapping `<div>` for the tab strip in [Titlebar.tsx](src/renderer/components/Titlebar/Titlebar.tsx) had `no-drag` applied unconditionally so horizontal scroll + per-tab clicks could still work when tabs existed. With no tabs there was nothing inside the wrapper to interact with, but `no-drag` still suppressed the title-bar drag region. Fix: only apply `no-drag` when `hasDocs` is true. With no tabs the wrapper inherits the parent header's `drag-region`, so clicking-and-dragging that area moves the window.
+2. **White flash before the PDF appears (dark mode).** Opening a PDF showed a stark white rectangle for ~80–200 ms between the DropZone disappearing and pdf.js painting the canvas. Two compounding causes: (a) the page wrapper in [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx) had `bg-white` + `shadow-[var(--page-shadow)]` applied immediately on mount, before the canvas had any content drawn; (b) the wrapper used a default `612x792` size while waiting for `pdf.getPage(1).then(setDims)` to resolve, which painted as a stark white letter rectangle on the dark app background. Fix: added a `painted` state set to true after `renderTask.promise` resolves; until then `background: transparent` + `boxShadow: none` so the wrapper is invisible against the app background. Also dropped the default 612x792 placeholder — wrapper renders at 0×0 until real `dims` arrive, so the layout doesn't reserve space for a phantom letter page that may not exist.
+
+Verified manually by reproducing the bug live (file picker → opened `05-08-26 Reza Gatchpazian Contractor 2837.56.pdf` → portrait letter PDF → page rendered cleanly, no white flash visible). Typecheck clean against `weavepdf@1.0.46`. Window-drag fix is mechanical (one conditional class).
+
+**V1.0045 base (carried forward):** the whole sidebar thumbnail is draggable to Finder; @dnd-kit reorder replaced by Move up / Move down in the right-click menu. User reported V1.0044 still didn't work for them — the small ↗ handle was too fiddly and they wanted plain drag from the thumbnail itself. Removed @dnd-kit's drag-to-reorder entirely; the thumbnail's wrapping `<div>` now carries `draggable={true}` and `onDragStart` fires the existing `pages:start-drag` IPC. Reorder moved to the context menu as "Move up" / "Move down" items (calls a new `movePage(pageNumber, ±1)` helper that swaps two indices in the page-order array and reuses `reorderPages` + `applyEdit`).
 
 Also dropped @dnd-kit/core, @dnd-kit/sortable, and @dnd-kit/utilities references from Sidebar.tsx (imports only — packages stay in package.json for now in case any other component uses them; will sweep in a future cleanup if confirmed unused).
 
@@ -639,6 +720,118 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-05-08 — V1.0054: print no longer outputs blank pages
+
+User: "When i try to print a document, it comes out blank and doesnt print." Reproduced live with computer-use against the same Circle Check Training PDF the user had open. ⌘P → Print Preview rendered fine. Click Print → modal closed (success). Real-printer side: blank pages.
+
+**Root cause.** Electron 41. Electron 32 deprecated the bundled PDFium plugin (the one enabled by `plugins: true` in `webPreferences`) and Electron 35 removed it entirely. WeavePDF's print path (introduced V1.0021 and refined V1.0028) loaded the temp PDF inside a hidden BrowserWindow with `plugins: true` and ran `webContents.print()`. With PDFium gone, the hidden window stays blank — `loadFile(somePdf)` no longer renders the PDF. `webContents.print()` then prints what it sees (a blank window) and reports `success` because the print job was queued without error from Chromium's perspective. From the user's perspective: blank paper.
+
+This was a latent bug from the moment we upgraded past Electron 32 — it just wasn't noticed until Adam needed to print today.
+
+**Fix in [main.ts](src/main/main.ts) `printPdfBytes` handler.** Drop the entire hidden-BrowserWindow + webContents.print() path. Spawn `/usr/bin/lp` (CUPS) on the temp PDF directly. macOS CUPS understands PDF natively — that's what the macOS Print menu has been doing under the hood since OS X 10.0; we just need to skip Chromium's intermediate render step.
+
+PrintOptions → CUPS flag mapping:
+- `deviceName` → `-d <name>` (CUPS device name from `lpstat -e`, same one ListPrinters returns)
+- `documentName` → `-t <title>` (sanitized; appears as the print-job title in the queue)
+- `copies` → `-n <N>`
+- `duplexMode` → `-o sides=one-sided | two-sided-long-edge | two-sided-short-edge`
+- `landscape` → `-o landscape` (canonical CUPS shorthand for `orientation-requested=4`)
+- `color: false` → `-o ColorModel=Gray` (drivers that don't support it silently ignore)
+- `pageRanges: [{from: 1, to: 3}]` → `-o page-ranges=1-3,5,8-10`
+
+`lp` returns exit code 0 as soon as the job is spooled to CUPS — the temp PDF is fully consumed by then so we delete it in the `finally` block. Stderr captured for the failure-path error message.
+
+Side-benefit: the security hardening on the old hidden BrowserWindow (custom `webRequest.onBeforeRequest` filter that allowed only the temp PDF + chrome:// URLs, `setPermissionRequestHandler` denying everything, per-print session `partition`, locked-down `webPreferences`) is no longer needed and got deleted along with the BrowserWindow. CUPS pipelines (cupsfilter / pdftops / Ghostscript) don't run JavaScript or AcroForm scripts, so a malicious PDF can't phone home through the print path. Less code, more secure, and it actually works.
+
+The legacy "no options provided → show macOS native print dialog" fallback (the V1.0021 path) was already dead code — V1.0028 PrintPreviewModal always passes options including `deviceName`, and the renderer enforces "Pick a printer first" before invoking `printPdfBytes`. Removed without renderer changes.
+
+**Verification.** Manual — no unit test for the OS print pipeline. Verified live: V1.0054 install + ⌘P on `Circle_Check_Training_Signoff_Schedule2.pdf` → Brother HL-2240 → physical output matches the preview.
+
+**Files touched:** [package.json](package.json), [src/main/main.ts](src/main/main.ts).
+
+---
+
+### 2026-05-07 — V1.0053: unsaved-changes dialog now offers Save / Cancel / Don't Save
+
+User shipped a screenshot of the V1.0051 close-with-dirty dialog and pointed out that it should offer a Save option, not just Cancel / Close Anyway. Right — that's the Mac HIG standard, and forcing the user to manually save first is friction every other Mac app avoids.
+
+**Implementation across 5 files.**
+
+1. **[ipc.ts](src/shared/ipc.ts):** added `RequestSaveAll` (main → renderer) and `SaveAllComplete` (renderer → main) channels.
+2. **[api.ts](src/shared/api.ts) + [preload.ts](src/preload/preload.ts):** exposed `onSaveAllRequest(cb)` and `notifySaveAllComplete(ok)` on `window.weavepdf`.
+3. **[main.ts](src/main/main.ts):**
+   - Updated both dialogs (`win.on("close")` and `app.before-quit`) to use `[Save | Cancel | Don't Save]` with `defaultId: 0, cancelId: 1`. Button label becomes "Save All" when more than one tab is dirty. Detail text changed from "If you close now your edits will be lost" to "Save changes before closing?" (HIG-style).
+   - On Save click, main sets `pendingCloseAfterSaveByWinId.add(winId)` (close path) or `pendingQuitAfterSave = true` (quit path) and dispatches `RequestSaveAll` to the focused window's renderer. The dialog is dismissed; main returns from the close handler with `event.preventDefault()` already in effect.
+   - New IPC handler for `SaveAllComplete`: routes `ok` to either a deferred `win.close()` (close path) or `app.quit()` (quit path). On `ok=false` (a save errored or a Save-As was canceled), main does nothing — user stays in the editor with their tabs intact.
+4. **[App.tsx](src/renderer/App.tsx):**
+   - Extracted `saveTabById(tabId, forceSaveAs): Promise<boolean>` from `saveCurrent`. `saveCurrent` is now a thin wrapper that calls `saveTabById(activeTab.id, ...)`. Return-true on successful write; return-false on user-canceled Save-As or write error. Tab-gone case returns true (treat as no-op success so the close path proceeds).
+   - New `useEffect` listening for `onSaveAllRequest`: snapshot dirty tab ids → for each call `saveTabById` → bail on first failure → fire `notifySaveAllComplete(allOk)`.
+
+**HIG button order on macOS.** Electron renders Mac dialogs in a flipped order — the FIRST entry in `buttons` is the rightmost (default) button, last entry is leftmost. So `[Save, Cancel, Don't Save]` displays as **[Don't Save] [Cancel] [Save]** with Save highlighted as the default — exactly Apple's pattern.
+
+**Verified:** `npm run typecheck` clean against `weavepdf@1.0.53`. Visual / live verification pending — needs a repackage + reinstall before Adam can drop a dirty edit and try ⌘W.
+
+**Files touched:** [package.json](package.json), [src/shared/ipc.ts](src/shared/ipc.ts), [src/shared/api.ts](src/shared/api.ts), [src/preload/preload.ts](src/preload/preload.ts), [src/main/main.ts](src/main/main.ts), [src/renderer/App.tsx](src/renderer/App.tsx).
+
+---
+
+### 2026-05-07 — V1.0052: Edit Text falls back to OCR on image-only PDFs
+
+User: "Also, is it possible to make ALL text editable, even ones like this? […] If its possibel to make those types of text editable also, and not just obvious text written documents, lets do it." Then asked whether a prompt was necessary on a non-editable click; I recommended yes (silent OCR fallback would feel like a random pause), and they signed off on case 1 (plain document scans, with case 2 — stylized overlays — explicitly out of scope because pure-white whiteout leaves a visible patch over busy backgrounds).
+
+**Implementation.** Single file change in [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx):
+
+1. Added module-level `ocrCache: Map<string, OcrBox[]>` keyed on `${tabId}-${version}-${pageNumber}` so OCR runs at most once per page per edit-version. Version naturally invalidates the entry after every `applyEdit`. A second `ocrInFlight: Set<string>` blocks re-prompts while a slow OCR call is still resolving.
+
+2. Extended `onTextLayerClick`: if the click target has no `<span>` ancestor AND the text layer DIV is empty (`textLayerRef.current?.querySelector("span") == null`), fall through to a new `runOcrFallback`. The text-layer-empty check ensures normal text PDFs don't surprise-prompt for OCR on between-paragraph misclicks — pre-V1.0052 those clicks were silent no-ops, and this preserves that.
+
+3. `runOcrFallback`: confirm dialog → `ocr.available()` check → `canvas.toBlob` → `ocr.runImage(pngBytes)` → cache. Then map click to normalized image coords (bottom-left origin to match Apple Vision boundingBox), find containing box (fallback: nearest center within 5% squared distance), and seed a regular pending text edit with:
+   - `xPt = box.x * pageSize.w` (with the V1.0049 `0.06 * fontSize` left-bearing nudge)
+   - `yPt = box.y * pageSize.h` (baseline ≈ bottom of visible glyph extent — same convention the pdf.js path uses)
+   - `size = box.h * pageSize.h` (OCR returns visible glyph extent including descenders → close enough to font size)
+   - `text = box.text`
+   - `fontName = "Helvetica"` (OCR doesn't report family; true font fidelity stays deferred per Critical Rule #3)
+   - `whiteout = (box bounds + 0.5pt margin)`
+
+Same `setSelectedPendingText / setEditingPendingText / setTool("none")` as the pdf.js path so the user immediately lands in edit mode with the OCR'd text pre-selected.
+
+**Honest limits surfaced in the user-facing copy.** White whiteout means the feature shines on plain document scans (receipts, contracts, photographed paperwork) and degrades on stylized image overlays (drop-shadow text over photos, the Niagara Falls screenshot the user shared). Generative inpainting + font-style preservation would close that gap but need either a cloud model or a much larger local model — explicitly out of scope.
+
+**Concurrency / cache strategy.** Single in-flight OCR per page-version. Cache lives until app restart (no LRU bound — typical session cache is a few hundred KB even for heavy users; can revisit if memory becomes a real concern). Cache shared across PageCanvas instances via module scope so virtual-list remounts don't re-OCR.
+
+**Verified:** `npm run typecheck` clean against `weavepdf@1.0.52`. Live verification pending — Adam mentioned `Merged-20260507035407.pdf` on Desktop as the test PDF (contains the Instagram screenshot of the Queen Tour bus). Install needs a `npm run package` + reinstall before he can try it.
+
+**Files touched:** [package.json](package.json), [src/renderer/components/Viewer/PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx).
+
+---
+
+### 2026-05-07 — V1.0051: "unsaved changes" dialog actually fires + saved versions show up in Revisions
+
+User: "It doesnt seem to stop me from exiting when i make editing changes to a PDF, with the 'you have changes unsaved' message. The older versions also dont seem to be in revision history."
+
+Two bugs that boil down to missing wires.
+
+**Bug 1: ⌘W / quit on a dirty tab silently discarded edits.** V1.0026 designed a per-window dirty-tab snapshot kept in [main.ts](src/main/main.ts). The renderer was supposed to publish via `window.weavepdf.notifyDirtyTabs(names)` on every store change so the close / before-quit handler had a current list to consult — but that publish call was never wired up. Main always saw `dirty.length === 0` and the close handler short-circuited before showing the confirmation dialog.
+
+**Fix 1: publish dirty names from App.tsx.** [App.tsx](src/renderer/App.tsx) now derives `dirtyTabNames` from `tabs` and pushes them via `notifyDirtyTabs` inside a `useEffect`. The dep is a stable `dirtyTabKey` (joined names) so the effect only refires when the dirty SET actually changes — not on every unrelated re-render. Cmd+W on a dirty tab and Cmd+Q with any dirty tab now show "You have unsaved changes" as designed.
+
+**Bug 2: prior saved versions vanished from Revisions.** Drafts are single-slot-per-file (one `current.pdf` per source path). Every Save overwrote the previous slot, so Revisions only ever showed the current slot's draft (if any) plus the original — no history of past saves to roll back to. The user expected what every other "version history" feature gives them: a chronological list of past saves they can restore.
+
+**Fix 2: parallel snapshot system, distinct from drafts.**
+- New IPC channels `snapshots:save / snapshots:list / snapshots:read` in [ipc.ts](src/shared/ipc.ts), surfaced on `window.weavepdf.snapshots` via [preload.ts](src/preload/preload.ts) and [api.ts](src/shared/api.ts).
+- Main-side handlers ([main.ts](src/main/main.ts)): `userData/snapshots/<sha256(filePath)>/<isoTimestamp>.pdf`. Cap of 20 most-recent per file; oldest pruned on every write. Filenames substitute `:` → `-` to satisfy filesystem constraints; the list endpoint reverses that for the response. Local-only per Critical Rule #1.
+- [App.tsx](src/renderer/App.tsx) `saveActiveAs` fires `snapshots.save` with a slice of the saved bytes after `writeFile` succeeds. Fire-and-forget — a snapshot-write failure doesn't surface to the user (worst case: that one save isn't in the rollback list).
+- [RevisionsPanel.tsx](src/renderer/components/Sidebar/RevisionsPanel.tsx) merges drafts (autosaved unsaved work) and snapshots (saved versions) into a single chronological list keyed by ISO timestamp. Tagged-union row type so the same UI renders both kinds with different icons (`Save` vs `FileClock`) and a kind-aware Restore handler. Snapshots auto-prune at 20 so there's no per-row delete; drafts retain the existing trash button.
+- Snapshot Restore opens the bytes in a NEW tab with `path: null`, which routes the next ⌘S through Save-As — keeps Critical Rule #6's spirit (rollback is intentional but the user still confirms where the bytes land). Tab name decorates the original with the saved-at timestamp.
+
+**Verified:**
+- `npm run typecheck` clean against `weavepdf@1.0.51`.
+- Visual / live verification still pending — installing locally next to confirm the dialog fires on ⌘W with a dirty tab and that saved-version snapshots appear in the Revisions sidebar.
+
+**Files touched:** [package.json](package.json), [src/shared/ipc.ts](src/shared/ipc.ts), [src/shared/api.ts](src/shared/api.ts), [src/preload/preload.ts](src/preload/preload.ts), [src/main/main.ts](src/main/main.ts), [src/renderer/App.tsx](src/renderer/App.tsx), [src/renderer/components/Sidebar/Sidebar.tsx](src/renderer/components/Sidebar/Sidebar.tsx), [src/renderer/components/Sidebar/RevisionsPanel.tsx](src/renderer/components/Sidebar/RevisionsPanel.tsx).
+
+---
 
 ### 2026-04-29 — V1.0032: actually-verified single menu + no warm-app focus steal
 

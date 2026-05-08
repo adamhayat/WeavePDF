@@ -56,7 +56,15 @@ export function Titlebar({ onOpen, onSave, onExport }: Props) {
         </button>
       </ShortcutTooltip>
 
-      <div className="no-drag flex min-w-0 flex-1 items-center gap-1 overflow-x-auto acr-scroll px-1">
+      <div
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-1 overflow-x-auto acr-scroll px-1",
+          // When tabs exist we suppress drag so horizontal scroll + tab clicks
+          // work. With no tabs the area is a plain title-bar gap and should
+          // drag the window — inherit drag from the parent header.
+          hasDocs && "no-drag",
+        )}
+      >
         {tabs.map((t, idx) => (
           <button
             key={t.id}

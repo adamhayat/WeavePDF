@@ -39,6 +39,14 @@ const api: WeavePDFApi = {
     }>,
   printWindow: () => ipcRenderer.invoke(IpcChannel.PrintWindow) as Promise<void>,
   notifyDirtyTabs: (names) => ipcRenderer.send(IpcChannel.NotifyDirtyTabs, names),
+  onSaveAllRequest: (cb) => {
+    const listener = () => cb();
+    ipcRenderer.on(IpcChannel.RequestSaveAll, listener);
+    return () => {
+      ipcRenderer.removeListener(IpcChannel.RequestSaveAll, listener);
+    };
+  },
+  notifySaveAllComplete: (ok) => ipcRenderer.send(IpcChannel.SaveAllComplete, ok),
   printPdfBytes: (bytes, documentName, options) =>
     ipcRenderer.invoke(
       IpcChannel.PrintPdfBytes,
@@ -150,6 +158,16 @@ const api: WeavePDFApi = {
       ipcRenderer.invoke(IpcChannel.DraftsClear, draftKey) as Promise<void>,
     list: () =>
       ipcRenderer.invoke(IpcChannel.DraftsList) as Promise<import("../shared/ipc").DraftManifest[]>,
+  },
+  snapshots: {
+    save: (filePath: string, bytes: ArrayBuffer) =>
+      ipcRenderer.invoke(IpcChannel.SnapshotsSave, filePath, bytes) as Promise<void>,
+    list: (filePath: string) =>
+      ipcRenderer.invoke(IpcChannel.SnapshotsList, filePath) as Promise<
+        import("../shared/ipc").SnapshotEntry[]
+      >,
+    read: (filePath: string, savedAt: string) =>
+      ipcRenderer.invoke(IpcChannel.SnapshotsRead, filePath, savedAt) as Promise<ArrayBuffer | null>,
   },
   pages: {
     startDrag: (payload: { bytes: ArrayBuffer; pageNumber: number; fileName: string }) =>

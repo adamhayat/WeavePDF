@@ -17,6 +17,7 @@ import {
   type OpenFileDialogOptions,
   type OpenedFile,
   type SaveFileDialogOptions,
+  type SnapshotEntry,
   type WriteFileResult,
 } from "../shared/ipc";
 import { u8ToAb } from "../shared/buffers";
@@ -568,6 +569,11 @@ const skipUnsavedConfirmForWindowId = new Set<number>();
 // Set during app.before-quit so each window's close handler skips its
 // own confirmation (we showed one combined dialog for the quit).
 let appQuittingApproved = false;
+// V1.0053: when the user clicks "Save" in an unsaved-changes dialog, we
+// dispatch a save-all request to the renderer and defer the actual close.
+// These flags route the SaveAllComplete reply to the right action.
+const pendingCloseAfterSaveByWinId = new Set<number>();
+let pendingQuitAfterSave = false;
 
 function createMainWindow(): BrowserWindow {
   // V1.0031: any window-creation path means the user is going to interact
@@ -615,6 +621,10 @@ function createMainWindow(): BrowserWindow {
     const dirty = dirtyTabsByWindowId.get(winId) ?? [];
     if (dirty.length === 0) return;
     event.preventDefault();
+    const saveLabel = dirty.length === 1 ? "Save" : "Save All";
+    // macOS HIG button order: [Don't Save, Cancel, Save] visually (Electron
+    // flips the array on macOS so the FIRST entry renders as the rightmost
+    // / default action).
     const choice = dialog.showMessageBoxSync(win, {
       type: "warning",
       message:
@@ -623,21 +633,24 @@ function createMainWindow(): BrowserWindow {
           : `${dirty.length} tabs have unsaved changes.`,
       detail:
         dirty.length === 1
-          ? "If you close this window now, your edits will be lost."
-          : "If you close this window now, edits in these tabs will be lost:\n\n• " +
-            dirty.join("\n• "),
-      buttons: ["Cancel", "Close Anyway"],
-      cancelId: 0,
+          ? "Save your changes before closing?"
+          : "Save changes before closing?\n\n• " + dirty.join("\n• "),
+      buttons: [saveLabel, "Cancel", "Don't Save"],
+      cancelId: 1,
       defaultId: 0,
     });
-    if (choice === 1) {
+    if (choice === 0) {
+      // Save → dispatch save-all to the renderer, defer the close until ack.
+      pendingCloseAfterSaveByWinId.add(winId);
+      win.webContents.send(IpcChannel.RequestSaveAll);
+    } else if (choice === 2) {
+      // Don't Save → discard edits and close.
       skipUnsavedConfirmForWindowId.add(winId);
-      // Re-issue the close after this tick — the current close was
-      // preventDefault'd. Doing it sync inside this handler would recurse.
       setImmediate(() => {
         if (!win.isDestroyed()) win.close();
       });
     }
+    // choice === 1 (Cancel) → fall through, window stays open.
   });
 
   win.on("closed", () => {
@@ -723,6 +736,35 @@ function registerIpc(): void {
     if (!win) return;
     const safe = names.filter((n): n is string => typeof n === "string").slice(0, 200);
     dirtyTabsByWindowId.set(win.id, safe);
+  });
+
+  // V1.0053: renderer reports the outcome of a Save-All triggered by an
+  // unsaved-changes dialog. ok=true means every dirty tab was saved (or
+  // there was nothing to save) — main proceeds with the deferred close /
+  // quit. ok=false means a save errored or a Save-As was canceled — we
+  // bail out and leave the user in the editor with their tabs intact.
+  ipcMain.on(IpcChannel.SaveAllComplete, (e, ok: unknown) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return;
+    const succeeded = ok === true;
+    if (pendingQuitAfterSave) {
+      pendingQuitAfterSave = false;
+      pendingCloseAfterSaveByWinId.delete(win.id);
+      if (succeeded) {
+        appQuittingApproved = true;
+        app.quit();
+      }
+      return;
+    }
+    if (pendingCloseAfterSaveByWinId.has(win.id)) {
+      pendingCloseAfterSaveByWinId.delete(win.id);
+      if (succeeded) {
+        skipUnsavedConfirmForWindowId.add(win.id);
+        setImmediate(() => {
+          if (!win.isDestroyed()) win.close();
+        });
+      }
+    }
   });
 
   ipcMain.handle(
@@ -939,11 +981,23 @@ group.wait()
         return { ok: false, error: "no bytes" };
       }
       if (bytes.byteLength === 0) return { ok: false, error: "empty bytes" };
+      if (!options?.deviceName) {
+        return { ok: false, error: "no printer specified" };
+      }
       const buf = Buffer.from(bytes);
 
-      // Use the document name (without .pdf) as the temp filename so macOS
-      // shows a sensible job title in the print queue + dialog. Sanitize
-      // aggressively — only ASCII alphanumerics, dash, underscore, dot.
+      // V1.0054: route printing through `/usr/bin/lp` (CUPS) instead of a
+      // hidden BrowserWindow + webContents.print(). Electron 32+ removed
+      // the bundled PDFium plugin that used to render `loadFile(some.pdf)`,
+      // so the hidden window stayed blank and webContents.print() returned
+      // success while sending a blank document to the printer (the user-
+      // reported "comes out blank" bug). macOS CUPS understands PDF
+      // natively, so the temp file is fed to lp and printed directly with
+      // every option mapped to a CUPS `-o` flag.
+
+      // Document name → temp filename. macOS uses this as the print-job
+      // title in the print queue. Sanitize aggressively — only ASCII
+      // alphanumerics, dash, underscore, dot.
       const safeName = (documentName || "document")
         .replace(/\.pdf$/i, "")
         .replace(/[^a-zA-Z0-9._-]/g, "_")
@@ -952,112 +1006,78 @@ group.wait()
       const pdfPath = path.join(tmpDir, `${safeName}.pdf`);
       await writeFile(pdfPath, buf);
 
-      const hidden = new BrowserWindow({
-        show: false,
-        // Letter at 96 DPI ≈ 816×1056. Comfortable initial render area for
-        // PDFium; doesn't affect what gets printed.
-        width: 816,
-        height: 1056,
-        webPreferences: {
-          // plugins:true enables the bundled PDFium plugin so file://*.pdf
-          // renders cleanly inside the hidden window.
-          plugins: true,
-          // Stay locked down — print path doesn't need any of these.
-          contextIsolation: true,
-          nodeIntegration: false,
-          sandbox: true,
-          javascript: false,
-          webSecurity: true,
-          allowRunningInsecureContent: false,
-          partition: `print-${randomUUID()}`,
-        },
-      });
-
-      // Hard-block any outbound load except the temp PDF itself. If a
-      // hostile PDF tries to phone home through an embedded annotation,
-      // the request is cancelled before it leaves the host.
-      hidden.webContents.session.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
-      const allowedPdfUrl = "file://" + pdfPath;
-      hidden.webContents.session.webRequest.onBeforeRequest((details, cb) => {
-        try {
-          const u = new URL(details.url);
-          if (u.protocol === "file:" && u.pathname === pdfPath) return cb({ cancel: false });
-        } catch {
-          // fall through
-        }
-        if (details.url === allowedPdfUrl) return cb({ cancel: false });
-        // Allow Chromium-internal chrome:// URLs the PDFium UI uses.
-        if (details.url.startsWith("chrome://") || details.url.startsWith("chrome-extension://")) {
-          return cb({ cancel: false });
-        }
-        cb({ cancel: true });
-      });
-      hidden.webContents.on("will-navigate", (ev) => ev.preventDefault());
-      hidden.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+      // Build lp args. `-d` selects the printer (CUPS device name from
+      // ListPrinters). `-t` sets the job title. `-n` is copies. Each
+      // `-o key=value` is a per-job option; CUPS silently ignores any the
+      // driver doesn't support.
+      const args: string[] = [
+        "-d",
+        options.deviceName,
+        "-t",
+        safeName,
+        "-n",
+        String(Math.max(1, Math.floor(options.copies || 1))),
+      ];
+      // Duplex. CUPS `sides` keys: `one-sided`, `two-sided-long-edge`,
+      // `two-sided-short-edge`. Drivers without duplex (e.g. Brother
+      // HL-2240) just ignore the option.
+      if (options.duplexMode === "shortEdge") {
+        args.push("-o", "sides=two-sided-short-edge");
+      } else if (options.duplexMode === "longEdge") {
+        args.push("-o", "sides=two-sided-long-edge");
+      } else {
+        args.push("-o", "sides=one-sided");
+      }
+      // Landscape. `-o landscape` is the canonical CUPS shorthand
+      // (equivalent to `orientation-requested=4`).
+      if (options.landscape) args.push("-o", "landscape");
+      // Color → mono. Most CUPS drivers respect `ColorModel=Gray`. When
+      // `color` is true (the default), don't pass anything — driver
+      // default kicks in.
+      if (!options.color) args.push("-o", "ColorModel=Gray");
+      // Page ranges. Format: comma-separated `from-to` (single page = `N`).
+      if (options.pageRanges && options.pageRanges.length > 0) {
+        const rangeStr = options.pageRanges
+          .map((r) => (r.from === r.to ? `${r.from}` : `${r.from}-${r.to}`))
+          .join(",");
+        args.push("-o", `page-ranges=${rangeStr}`);
+      }
+      args.push(pdfPath);
 
       try {
-        await hidden.loadFile(pdfPath);
-        // Title the print job after the doc — macOS uses this in the
-        // print queue + the default page header (when the user has
-        // "Print headers and footers" enabled in the dialog). Cleaner
-        // than the temp file path or generic "untitled".
-        try {
-          hidden.setTitle(safeName);
-        } catch {
-          // Some platforms throw on setTitle for hidden windows; ignore.
-        }
-        // Give PDFium a beat to lay out ALL pages. Without this the
-        // print() call sometimes fires before later pages are composed
-        // and prints a partial doc. 1.2s is comfortable for 100-page
-        // PDFs on Adam's M1 — adjust upward if larger PDFs get clipped.
-        await new Promise((r) => setTimeout(r, 1200));
-
-        // V1.0028: when the unified panel passed `options`, print silently
-        // with all settings pre-chosen. Otherwise (legacy path with no
-        // options), show the native macOS dialog as V1.0021 did. This keeps
-        // any future caller that doesn't yet provide options working.
-        const useSilent = !!options?.deviceName;
-        const printOpts: Electron.WebContentsPrintOptions = useSilent
-          ? {
-              silent: true,
-              printBackground: false,
-              header: "",
-              footer: "",
-              margins: { marginType: "default" },
-              deviceName: options!.deviceName,
-              color: options!.color,
-              copies: Math.max(1, Math.floor(options!.copies || 1)),
-              duplexMode: options!.duplexMode,
-              landscape: options!.landscape,
-              ...(options!.pageRanges && options!.pageRanges.length > 0
-                ? { pageRanges: options!.pageRanges }
-                : {}),
-            }
-          : {
-              silent: false,
-              printBackground: false,
-              header: "",
-              footer: "",
-              margins: { marginType: "default" },
-            };
-        const printed = await new Promise<{ ok: boolean; error?: string }>((resolve) => {
-          hidden.webContents.print(printOpts, (success, failureReason) => {
-            if (success) return resolve({ ok: true });
-            // "cancelled" is the user hitting Cancel in the system
-            // dialog — that's a normal outcome, not an error.
-            if (failureReason === "cancelled") return resolve({ ok: false });
-            resolve({ ok: false, error: failureReason || "print failed" });
-          });
-        });
-        return printed;
+        const result = await new Promise<{ ok: boolean; error?: string }>(
+          (resolve) => {
+            const proc = spawn("/usr/bin/lp", args, {
+              stdio: ["ignore", "pipe", "pipe"],
+            });
+            let stderr = "";
+            proc.stderr?.on("data", (d: Buffer) => {
+              stderr += d.toString();
+            });
+            proc.on("error", (err) => {
+              resolve({ ok: false, error: err.message });
+            });
+            proc.on("close", (code) => {
+              if (code === 0) {
+                resolve({ ok: true });
+              } else {
+                resolve({
+                  ok: false,
+                  error: stderr.trim() || `lp exited with code ${code}`,
+                });
+              }
+            });
+          },
+        );
+        return result;
       } catch (err) {
         return {
           ok: false,
           error: err instanceof Error ? err.message : String(err),
         };
       } finally {
-        if (!hidden.isDestroyed()) hidden.destroy();
-        // Don't await — best-effort cleanup, fire and forget.
+        // lp consumes the file fully before queuing, so the temp PDF can
+        // be deleted right after the spawn exits. Best-effort cleanup.
         void rm(tmpDir, { recursive: true, force: true }).catch(() => {});
       }
     },
@@ -1367,6 +1387,100 @@ group.wait()
     out.sort((a, b) => b.savedAt.localeCompare(a.savedAt));
     return out;
   });
+
+  // ─── Saved-version snapshots (V1.0051) ──────────────────────────────
+  // Distinct from drafts: drafts track *unsaved* work; snapshots track
+  // every successful Save so the user can roll back. One directory per
+  // file, one .pdf per save, named with the save's ISO timestamp. We cap
+  // at the 20 most recent snapshots per file — a 1MB PDF × 20 saves is
+  // ~20MB, which is fine; large PDFs get pruned faster as the user keeps
+  // saving. Snapshots are local-only, never uploaded (Critical Rule #1).
+  const SNAPSHOTS_PER_FILE_LIMIT = 20;
+  const snapshotsRoot = (): string => path.join(app.getPath("userData"), "snapshots");
+  const snapshotSlotForPath = (filePath: string): string => {
+    const normalised = path.resolve(filePath);
+    const hash = createHash("sha256").update(normalised).digest("hex");
+    return path.join(snapshotsRoot(), hash);
+  };
+  // Only filenames matching this shape are treated as snapshots — defensive
+  // against stray files (e.g. .DS_Store) accidentally landing in the slot.
+  const SNAPSHOT_FILE_RE = /^(.+)\.pdf$/;
+
+  ipcMain.handle(
+    IpcChannel.SnapshotsSave,
+    async (_e, filePath: unknown, bytes: unknown): Promise<void> => {
+      if (typeof filePath !== "string" || !filePath) return;
+      if (!(bytes instanceof ArrayBuffer) || bytes.byteLength === 0) return;
+      const slot = snapshotSlotForPath(filePath);
+      await mkdir(slot, { recursive: true });
+      // Filesystems disallow ":" in some contexts; replace with "-" for the
+      // filename. The original ISO string is preserved in the dir-listing
+      // logic by reversing the substitution.
+      const isoTimestamp = new Date().toISOString();
+      const safeFilename = isoTimestamp.replace(/:/g, "-") + ".pdf";
+      await writeFile(path.join(slot, safeFilename), Buffer.from(bytes));
+      // Prune oldest beyond the limit.
+      const entries = await readdir(slot).catch(() => []);
+      const snapshots = entries
+        .filter((e) => SNAPSHOT_FILE_RE.test(e))
+        .sort(); // ISO-timestamp filenames sort chronologically
+      const overflow = snapshots.length - SNAPSHOTS_PER_FILE_LIMIT;
+      if (overflow > 0) {
+        for (let i = 0; i < overflow; i++) {
+          await unlink(path.join(slot, snapshots[i])).catch(() => {});
+        }
+      }
+    },
+  );
+
+  ipcMain.handle(
+    IpcChannel.SnapshotsList,
+    async (_e, filePath: unknown): Promise<SnapshotEntry[]> => {
+      if (typeof filePath !== "string" || !filePath) return [];
+      const slot = snapshotSlotForPath(filePath);
+      if (!existsSync(slot)) return [];
+      const entries = await readdir(slot).catch(() => []);
+      const out: SnapshotEntry[] = [];
+      for (const e of entries) {
+        const m = SNAPSHOT_FILE_RE.exec(e);
+        if (!m) continue;
+        try {
+          const s = await stat(path.join(slot, e));
+          // Reverse the ":" → "-" substitution. Only the time portion
+          // (after "T") had ":" originally; the date portion's "-" stay
+          // as-is. ISO format: "YYYY-MM-DDTHH-MM-SS.mmmZ" → split on "T",
+          // restore ":" only in the second half.
+          const ts = m[1];
+          const tIdx = ts.indexOf("T");
+          const savedAt = tIdx >= 0
+            ? ts.slice(0, tIdx + 1) + ts.slice(tIdx + 1).replace(/-/g, ":")
+            : ts;
+          out.push({ savedAt, sizeBytes: s.size });
+        } catch {
+          /* skip */
+        }
+      }
+      out.sort((a, b) => b.savedAt.localeCompare(a.savedAt));
+      return out;
+    },
+  );
+
+  ipcMain.handle(
+    IpcChannel.SnapshotsRead,
+    async (_e, filePath: unknown, savedAt: unknown): Promise<ArrayBuffer | null> => {
+      if (typeof filePath !== "string" || typeof savedAt !== "string") return null;
+      const slot = snapshotSlotForPath(filePath);
+      const safeFilename = savedAt.replace(/:/g, "-") + ".pdf";
+      const target = path.join(slot, safeFilename);
+      if (!existsSync(target)) return null;
+      try {
+        const buf = await readFile(target);
+        return u8ToAb(buf);
+      } catch {
+        return null;
+      }
+    },
+  );
 
   // V1.0043: Drag a single thumbnail page out to Finder/Desktop and produce
   // a real PDF file. Renderer cancels the browser's default drag (so the
@@ -3171,6 +3285,8 @@ app.on("before-quit", (event) => {
   if (allDirty.length === 0) return;
   event.preventDefault();
   const focused = BrowserWindow.getFocusedWindow() ?? BrowserWindow.getAllWindows()[0];
+  const saveLabel = allDirty.length === 1 ? "Save" : "Save All";
+  const buttons = [saveLabel, "Cancel", "Don't Save"];
   const choice = focused
     ? dialog.showMessageBoxSync(focused, {
         type: "warning",
@@ -3180,22 +3296,31 @@ app.on("before-quit", (event) => {
             : `${allDirty.length} tabs have unsaved changes.`,
         detail:
           allDirty.length === 1
-            ? "If you quit now, your edits will be lost."
-            : "If you quit now, edits in these tabs will be lost:\n\n• " +
-              allDirty.join("\n• "),
-        buttons: ["Cancel", "Quit Anyway"],
-        cancelId: 0,
+            ? "Save your changes before quitting?"
+            : "Save changes before quitting?\n\n• " + allDirty.join("\n• "),
+        buttons,
+        cancelId: 1,
         defaultId: 0,
       })
     : dialog.showMessageBoxSync({
         type: "warning",
         message: `${allDirty.length} tab${allDirty.length === 1 ? "" : "s"} with unsaved changes`,
         detail: allDirty.join("\n• "),
-        buttons: ["Cancel", "Quit Anyway"],
-        cancelId: 0,
+        buttons,
+        cancelId: 1,
         defaultId: 0,
       });
-  if (choice === 1) {
+  if (choice === 0) {
+    // Save → dispatch save-all to the focused window's renderer; defer
+    // app.quit() until SaveAllComplete arrives. Multi-window quit-with-dirty
+    // is an edge case (WeavePDF is single-window in practice); the focused
+    // window's renderer saves its own dirty tabs and the resulting
+    // appQuittingApproved=true makes other windows' close handlers no-op.
+    if (focused) {
+      pendingQuitAfterSave = true;
+      focused.webContents.send(IpcChannel.RequestSaveAll);
+    }
+  } else if (choice === 2) {
     appQuittingApproved = true;
     app.quit();
   }

@@ -25,9 +25,14 @@ type Props = {
    * because draft restore touches the file system and tab/document store.
    */
   onRestoreRevision: (manifest: DraftManifest) => Promise<void>;
+  /**
+   * V1.0051: restore a saved-version snapshot. Implementation lives in
+   * App.tsx for the same reason — touches readFile + tab store.
+   */
+  onRestoreSnapshot: (filePath: string, savedAt: string) => Promise<void>;
 };
 
-export function Sidebar({ onRestoreRevision }: Props) {
+export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const setCurrentPage = useDocumentStore((s) => s.setCurrentPage);
   const selectPage = useDocumentStore((s) => s.selectPage);
@@ -133,7 +138,7 @@ export function Sidebar({ onRestoreRevision }: Props) {
       {sidebarTab === "outline" ? (
         <OutlinePanel />
       ) : sidebarTab === "revisions" ? (
-        <RevisionsPanel onRestore={onRestoreRevision} />
+        <RevisionsPanel onRestore={onRestoreRevision} onRestoreSnapshot={onRestoreSnapshot} />
       ) : selectedCount > 0 ? (
         <div className="flex h-10 shrink-0 items-center justify-between border-b border-[var(--panel-border)] pl-3 pr-1">
           <div className="flex items-center gap-2">

@@ -12,6 +12,7 @@ import type {
   PrinterInfo,
   SaveFileDialogOptions,
   SaveFileDialogResult,
+  SnapshotEntry,
   WriteFileResult,
 } from "./ipc";
 
@@ -29,6 +30,14 @@ export interface WeavePDFApi {
   /** V1.0026: publish the current list of dirty tab names to main so the
    *  close / before-quit handler can show an "unsaved changes" dialog. */
   notifyDirtyTabs: (names: string[]) => void;
+  /** V1.0053: main fires this when the user clicks "Save" in the
+   *  unsaved-changes dialog. The renderer should save every dirty tab
+   *  (Save-As as needed for path-less tabs) and call notifySaveAllComplete
+   *  with true on success or false if any save failed/was canceled. */
+  onSaveAllRequest: (cb: () => void) => () => void;
+  /** Send the SaveAll outcome back to main so it can proceed with the
+   *  pending window-close / app-quit (when ok=true) or stay open (false). */
+  notifySaveAllComplete: (ok: boolean) => void;
   /** V1.0021: print clean PDF bytes via hidden BrowserWindow. Caller bakes
    *  pending overlays + applies n-up layout first. V1.0028 adds PrintOptions —
    *  with options provided, prints silently via the chosen printer (no
@@ -138,6 +147,14 @@ export interface WeavePDFApi {
     clear: (draftKey: string) => Promise<void>;
     /** List every saved draft (newest first). Drives the Recent Drafts modal. */
     list: () => Promise<DraftManifest[]>;
+  };
+  /** V1.0051: per-file *saved* version history. Every successful Save
+   *  calls `save` with the saved bytes; the main process keeps the most
+   *  recent N snapshots per file. RevisionsPanel uses `list` + `read`. */
+  snapshots: {
+    save: (filePath: string, bytes: ArrayBuffer) => Promise<void>;
+    list: (filePath: string) => Promise<SnapshotEntry[]>;
+    read: (filePath: string, savedAt: string) => Promise<ArrayBuffer | null>;
   };
   pages: {
     /** Start a native OS drag carrying a single-page PDF extracted from the
