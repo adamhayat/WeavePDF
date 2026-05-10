@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
 // V1.0045: removed @dnd-kit's drag-to-reorder. The thumbnail's plain
 // drag is now reserved for HTML5 native drag-out (drag a page to Finder
 // to extract it as a one-page PDF). Reorder lives in the right-click
@@ -42,6 +42,12 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
   const sidebarTab = useUIStore((s) => s.sidebarTab);
   const setSidebarTab = useUIStore((s) => s.setSidebarTab);
   const [pageLabelPrompt, setPageLabelPrompt] = useState<{ pageNumber: number } | null>(null);
+  // V1.0055: drop-target index for an external-PDF drop into the thumbnails
+  // panel. `null` = no drag in progress; integer N = "insert at position N"
+  // (0 = before page 1, numPages = after last page). Drives the blue
+  // insertion line rendered between thumbnails.
+  const [dropTargetIndex, setDropTargetIndex] = useState<number | null>(null);
+  const thumbsContainerRef = useRef<HTMLDivElement | null>(null);
 
   if (!open || !activeTab?.pdf) return null;
 
@@ -193,11 +199,88 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
           // Clicking empty space clears the selection.
           if (e.target === e.currentTarget) clearSelection(activeTab.id);
         }}
+        // V1.0055: dropping a PDF file directly into the thumbnails panel
+        // merges its pages into the open document at the drop point. Plain
+        // drops elsewhere on the window (page area, title bar) keep the
+        // existing window-level "open as new tab" behavior — App.tsx's
+        // global drop handler is bypassed here via stopPropagation.
+        onDragOver={(e) => {
+          if (!e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+          e.stopPropagation();
+          e.dataTransfer.dropEffect = "copy";
+          // Compute insertion index from the drop point relative to the
+          // existing thumbnails. Above a thumbnail's vertical midpoint =
+          // "insert before this page"; below = "insert after". With no
+          // thumbnails matched, default to "append at end".
+          const container = thumbsContainerRef.current;
+          if (!container) return;
+          const thumbs = Array.from(
+            container.querySelectorAll<HTMLDivElement>("[data-page-number]"),
+          );
+          let insertAt = thumbs.length;
+          for (let i = 0; i < thumbs.length; i++) {
+            const r = thumbs[i].getBoundingClientRect();
+            if (e.clientY < r.top + r.height / 2) {
+              insertAt = i;
+              break;
+            }
+          }
+          setDropTargetIndex(insertAt);
+        }}
+        onDragLeave={(e) => {
+          // Only clear when the drag actually leaves the panel (relatedTarget
+          // outside the scroller). Otherwise React fires dragLeave whenever
+          // the cursor crosses between child elements and the indicator
+          // would flicker.
+          const next = e.relatedTarget as Node | null;
+          if (!next || !(e.currentTarget as Node).contains(next)) {
+            setDropTargetIndex(null);
+          }
+        }}
+        onDrop={async (e) => {
+          if (!e.dataTransfer.types.includes("Files")) return;
+          e.preventDefault();
+          e.stopPropagation(); // suppress App.tsx window-global "new tab" handler
+          const dropAt = dropTargetIndex;
+          setDropTargetIndex(null);
+          if (dropAt == null || !activeTab?.bytes) return;
+          // Collect dropped PDF paths in drop order. Non-PDFs fall through
+          // to the window handler... wait, we already stopPropagation'd, so
+          // they're just ignored. Image / DOC merge can come later if asked.
+          const pdfPaths: string[] = [];
+          for (const f of Array.from(e.dataTransfer.files)) {
+            const filePath = window.weavepdf.getPathForFile(f);
+            if (!filePath) continue;
+            const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
+            if (ext === "pdf") pdfPaths.push(filePath);
+          }
+          if (pdfPaths.length === 0) return;
+          try {
+            const { insertAfter, countPages } = await loadPdfOps();
+            let bytes: Uint8Array = activeTab.bytes;
+            let cursor = dropAt;
+            // Stack each dropped PDF in drop order at the cursor; advance
+            // the cursor by each PDF's page count so they land contiguously
+            // when the user drops two or more PDFs at once.
+            for (const p of pdfPaths) {
+              const file = await window.weavepdf.readFile(p);
+              const newBytes = new Uint8Array(file.data);
+              const added = await countPages(newBytes);
+              bytes = await insertAfter(bytes, newBytes, cursor);
+              cursor += added;
+            }
+            await applyEdit(activeTab.id, bytes);
+          } catch (err) {
+            alert(`Couldn't merge PDF: ${(err as Error).message ?? err}`);
+          }
+        }}
       >
-        <div className="flex flex-col gap-3">
+        <div className="flex flex-col gap-3" ref={thumbsContainerRef}>
+          {dropTargetIndex === 0 && <DropIndicator />}
           {Array.from({ length: activeTab.numPages }, (_, i) => i + 1).map((pageNumber) => (
+            <Fragment key={`${activeTab.id}-${activeTab.version}-${pageNumber}`}>
             <Thumb
-              key={`${activeTab.id}-${activeTab.version}-${pageNumber}`}
               pdf={activeTab.pdf!}
               pageNumber={pageNumber}
               active={activeTab.currentPage === pageNumber}
@@ -315,6 +398,8 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                 ]);
               }}
             />
+            {dropTargetIndex === pageNumber && <DropIndicator />}
+            </Fragment>
           ))}
         </div>
       </div>}
@@ -407,6 +492,17 @@ type ThumbProps = {
   onActivate: (mode: "set" | "toggle" | "range") => void;
   onContextMenu: (clientX: number, clientY: number) => void;
 };
+
+/** V1.0055: 2px horizontal accent bar shown between thumbnails during an
+ *  external-PDF drag to mark the insertion point. */
+function DropIndicator() {
+  return (
+    <div
+      className="h-0.5 w-full rounded-full bg-[var(--color-accent)]"
+      aria-hidden
+    />
+  );
+}
 
 function Thumb({ pdf, pageNumber, active, selected, tab, onActivate, onContextMenu }: ThumbProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);

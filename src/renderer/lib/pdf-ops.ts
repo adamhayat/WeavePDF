@@ -61,6 +61,13 @@ export async function insertAfter(
   return toUint8(await out.save());
 }
 
+/** Page count of a PDF byte stream. Cheap pdf-lib parse; use when you
+ *  just need the count without rendering or extracting pages. */
+export async function countPages(bytes: Uint8Array): Promise<number> {
+  const doc = await load(bytes);
+  return doc.getPageCount();
+}
+
 /** Remove the given 1-based page numbers. Silently ignores out-of-range. */
 export async function deletePages(
   base: Uint8Array,

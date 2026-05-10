@@ -5,7 +5,17 @@
 
 ## Current State
 
-**Status:** **V1.0054 — print no longer outputs blank pages.** User: "When i try to print a document, it comes out blank and doesnt print." Reproduced live and root-caused: Electron 32 deprecated and Electron 35 removed the bundled PDFium plugin that used to render `loadFile(some.pdf)` inside a `BrowserWindow` with `plugins: true`. We're on Electron 41. The print path (V1.0021 / V1.0028) loaded the temp PDF in a hidden BrowserWindow + called `webContents.print()` — post-Electron-32 the hidden window stays blank, so print() queued blank pages while reporting `success`.
+**Status:** **V1.0055 — drop a PDF into the thumbnails panel to merge it into the open document.** User asked: dropping another PDF directly onto the sidebar's Pages thumbnails should add its pages at the drop point, not open a new tab. Plain drops on the page area / title bar / blank space keep the existing "open as new tab" behavior — only the Pages panel intercepts.
+
+**How it works.** The Pages-tab scroll container in [Sidebar.tsx](src/renderer/components/Sidebar/Sidebar.tsx) gets `onDragOver / onDragLeave / onDrop` handlers. onDragOver checks `dataTransfer.types.includes("Files")` and computes the insertion index by scanning `[data-page-number]` thumbnails — drop above a thumb's vertical midpoint = "insert before this page", below = "insert after". The insertion point is rendered as a 2px accent-colored bar between the two adjacent thumbnails. onDrop reads each dropped PDF, calls `insertAfter(bytes, newBytes, cursor)` (existing pdf-ops helper), advances cursor by the new file's page count via a new `countPages` helper, then `applyEdit(activeTab.id, mergedBytes)` triggers the standard reload pipeline. `e.stopPropagation()` in onDrop suppresses App.tsx's window-global "open as new tab" handler.
+
+**Multi-PDF drop.** Drop two or more PDFs simultaneously — they merge in drop order, contiguous at the drop point. The cursor advances by each new file's page count.
+
+**Honest limits.** PDF-only. Drop a PNG / JPG / DOCX on the panel → silently ignored (image / DOC merge needs a separate convert + insert path; deferred until asked).
+
+Typecheck clean against `weavepdf@1.0.55`. User confirmed working on the two PDFs from his screenshot.
+
+**V1.0054 base (carried forward):** print no longer outputs blank pages. User: "When i try to print a document, it comes out blank and doesnt print." Reproduced live and root-caused: Electron 32 deprecated and Electron 35 removed the bundled PDFium plugin that used to render `loadFile(some.pdf)` inside a `BrowserWindow` with `plugins: true`. We're on Electron 41. The print path (V1.0021 / V1.0028) loaded the temp PDF in a hidden BrowserWindow + called `webContents.print()` — post-Electron-32 the hidden window stays blank, so print() queued blank pages while reporting `success`.
 
 **Fix.** [main.ts](src/main/main.ts) — replaced the hidden-BrowserWindow path with `spawn("/usr/bin/lp", […])`. macOS CUPS understands PDF natively (no PDFium needed), so feeding the temp PDF directly to lp prints the actual content. PrintOptions map cleanly to CUPS flags: `-d` (deviceName), `-t` (job title), `-n` (copies), `-o sides=...` (duplex), `-o landscape` (orientation), `-o ColorModel=Gray` (mono), `-o page-ranges=...` (ranges). Drivers without a given capability (e.g. Brother HL-2240 has no duplex) silently ignore it. lp returns 0 as soon as the job is spooled; we delete the temp PDF after.
 
@@ -720,6 +730,34 @@ forge.config.ts                  VitePlugin + Fuses (inspect ON for Playwright) 
 ---
 
 ## Session Log
+
+### 2026-05-08 — V1.0055: drop a PDF into the thumbnails panel to merge into the open document
+
+User: "If a PDF file is open, and we have the thumbnail on the left side, and we drag another PDF file directly into the thumbnail area, right now, it opens a new tab in weavepdf. However, the correct thing, is if it's dragged directly to the thumbnail area, it should be able to become a part of the original PDF file, in the order we dragged it to."
+
+Right — the convention every PDF-editor-with-thumbnails (Acrobat, Preview's sidebar) implements. Open WeavePDF + drop a PDF on the thumbnails = merge at drop point. Drop anywhere else = the existing "open as new tab" behavior keeps working.
+
+**Implementation in [Sidebar.tsx](src/renderer/components/Sidebar/Sidebar.tsx) Pages panel.**
+
+1. New state `dropTargetIndex: number | null` (0 = before first page, N = after page N, numPages = after last). Drives the insertion-line indicator and feeds the merge call.
+2. New `thumbsContainerRef` for the flex column so onDragOver can scan thumb geometry.
+3. `onDragOver` on the scroll container: gate on `dataTransfer.types.includes("Files")` so internal pointer / context-menu interactions don't trigger. Scan `[data-page-number]` thumbnails, find the first whose vertical midpoint is below the drop point — insert there. If none match, insert at the end.
+4. `onDragLeave`: only clear `dropTargetIndex` when `relatedTarget` is genuinely outside the scroll container (prevents flicker as the cursor crosses between child elements during the drag).
+5. `onDrop`: `e.stopPropagation()` to suppress App.tsx's window-global "open as new tab" handler that would otherwise fire after the bubble. Read each dropped PDF via `getPathForFile` + `readFile`, call `insertAfter(bytes, newBytes, cursor)` (existing pdf-ops helper), advance cursor by `countPages(newBytes)` (new helper) so multi-PDF drops land contiguously, then `applyEdit(activeTab.id, mergedBytes)` triggers the standard pdf.js reload + history bump.
+6. New `<DropIndicator />` component — a 2px accent-colored bar — rendered conditionally between thumbnails based on `dropTargetIndex`. Uses a `<Fragment>` wrapper around each Thumb so the indicator can sit between siblings without fighting the flex column gap.
+7. New `countPages(bytes)` helper added to [pdf-ops.ts](src/renderer/lib/pdf-ops.ts). Cheap pdf-lib parse, returns `doc.getPageCount()`. Used to advance the cursor between successive PDF drops.
+
+**Decisions made.**
+- **PDF-only.** Drop a PNG / JPG / DOCX on the panel → silently ignored (the merge path requires PDF input). Image-to-PDF + merge can come later if asked. The window-level handler still converts those files to PDF as separate tabs, just not via the thumbnail panel.
+- **No drop-on-existing-thumbnail = "replace this page".** Out of scope. Any drop on the panel inserts; doesn't replace.
+- **Stop event propagation, don't add a "skip merge" flag to the window handler.** Cleaner: Sidebar owns its drop semantics; App.tsx doesn't need to know about Sidebar's intercept.
+- **Drag-from-own-thumbnail-back-to-own-panel corner case.** V1.0045 thumbnail drag-out uses `webContents.startDrag` for a real OS drag with the temp single-page PDF. If user drags from thumb-A back to the same panel, the OS drop event would surface to the renderer with that temp PDF as a file. Result: the single-page PDF gets merged in (essentially: duplicate that page at the drop point). Recoverable via undo. Adding a flag to suppress this is overkill until someone hits it.
+
+**Verified:** `npm run typecheck` clean against `weavepdf@1.0.55`. User confirmed live ("perfect works ship it") after dragging a second PDF onto the thumbnails panel of an open document.
+
+**Files touched:** [package.json](package.json), [src/renderer/components/Sidebar/Sidebar.tsx](src/renderer/components/Sidebar/Sidebar.tsx), [src/renderer/lib/pdf-ops.ts](src/renderer/lib/pdf-ops.ts).
+
+---
 
 ### 2026-05-08 — V1.0054: print no longer outputs blank pages
 
