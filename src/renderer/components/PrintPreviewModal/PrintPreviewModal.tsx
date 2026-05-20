@@ -21,12 +21,18 @@ type Props = {
   onClose: () => void;
 };
 
+// V1.0085: Layout absorbs the "Fit all on one sheet" mode (was the V1.0084
+// "Shrink to one sheet" Scale option — confusingly mode-mixed). Pages-per-
+// sheet now ranges 1/2/4/6/9 + the dynamic "fit" grid that computes
+// ceil(sqrt(n)) × ceil(n/cols) on the fly so a 30-page doc actually fits on
+// one sheet (no 9-cap).
 const PER_SHEET_OPTIONS: { value: PerSheet; label: string }[] = [
   { value: 1, label: "1 page per sheet" },
   { value: 2, label: "2 pages per sheet" },
   { value: 4, label: "4 pages per sheet" },
   { value: 6, label: "6 pages per sheet" },
   { value: 9, label: "9 pages per sheet" },
+  { value: "fit", label: "Fit all on one sheet" },
 ];
 const PAPER_OPTIONS: { value: PaperKey; label: string }[] = [
   { value: "letter", label: "US Letter" },
@@ -152,6 +158,8 @@ export function PrintPreviewModal({ open, onClose }: Props) {
       settings.paper,
       settings.layout,
       settings.orientation,
+      settings.scalePct,
+      settings.fullPage ? "1" : "0",
       // Cache by parsed ranges, not raw input (prevents bouncing on
       // intermediate "1-" while user is typing).
       JSON.stringify(rangeParse.error ? [] : rangeParse.ranges),
@@ -162,6 +170,8 @@ export function PrintPreviewModal({ open, onClose }: Props) {
     settings.paper,
     settings.layout,
     settings.orientation,
+    settings.scalePct,
+    settings.fullPage,
     rangeParse,
   ]);
 
@@ -190,26 +200,68 @@ export function PrintPreviewModal({ open, onClose }: Props) {
             bytes = await ops.extractPages(bytes, list);
           }
 
-          // 2. N-up (if layout > 1) — bakes orientation + paper into the
-          //    laid-out PDF.
-          if (settings.layout > 1) {
+          // 2. Layout dispatch.
+          //   - "fit" → V1.0086 content-aware single-sheet composition.
+          //   - n-up (>1) → V1.0083 nUpPages with explicit grid; scale
+          //     composes via the legacy scalePageContent multiplier
+          //     inside each tile.
+          //   - 1-up + fullPage ON → V1.0088 scaleToFitForPrint: auto-
+          //     rotates content when source aspect mismatches sheet
+          //     aspect and scales it to fill the printable area
+          //     (scale=100% fills exactly).
+          //   - 1-up + fullPage OFF (V1.0089 default) → render the
+          //     source at its intrinsic size. Apply the slider as a
+          //     literal scale (legacy scalePageContent). Apply
+          //     fitToPaper ONLY when paper/orientation explicitly
+          //     differ from the source defaults (Letter portrait); for
+          //     Letter portrait the source is rendered untouched, so
+          //     Adam's cert at 100% looks identical to opening it in
+          //     Preview.
+          if (settings.layout === "fit") {
+            bytes = await ops.fitAllOntoSingleSheet(
+              bytes,
+              settings.paper,
+              settings.orientation,
+            );
+          } else if (settings.layout > 1) {
+            if (settings.scalePct !== 100) {
+              try {
+                bytes = await ops.scalePageContent(bytes, settings.scalePct / 100);
+              } catch {
+                // permissive — fall back to unscaled bytes
+              }
+            }
             bytes = await ops.nUpPages(bytes, settings.layout as 2 | 4 | 6 | 9, {
               paper: settings.paper,
               orientation: settings.orientation,
             });
-          } else if (
-            // 1-up fit-to-paper. Skip when source paper already matches the
-            // selected paper to avoid a re-render that doesn't change anything.
-            settings.paper !== "letter" ||
-            settings.orientation === "landscape"
-          ) {
+          } else if (settings.fullPage) {
             try {
-              bytes = await ops.fitToPaper(bytes, settings.paper, {
-                orientation: settings.orientation,
-              });
+              bytes = await ops.scaleToFitForPrint(
+                bytes,
+                settings.paper,
+                settings.orientation,
+                settings.scalePct,
+              );
             } catch {
-              // fitToPaper is permissive — fall back to source bytes if
-              // anything trips up (uncommon edge: empty doc).
+              // permissive — fall back to source bytes
+            }
+          } else {
+            if (settings.scalePct !== 100) {
+              try {
+                bytes = await ops.scalePageContent(bytes, settings.scalePct / 100);
+              } catch {
+                // permissive
+              }
+            }
+            if (settings.paper !== "letter" || settings.orientation === "landscape") {
+              try {
+                bytes = await ops.fitToPaper(bytes, settings.paper, {
+                  orientation: settings.orientation,
+                });
+              } catch {
+                // fitToPaper is permissive
+              }
             }
           }
 
@@ -605,18 +657,59 @@ function ControlsRail({
       <Row label="Layout">
         <select
           value={settings.layout}
-          onChange={(e) =>
-            dispatch({ type: "set-layout", value: Number(e.target.value) as PerSheet })
-          }
+          onChange={(e) => {
+            const raw = e.target.value;
+            const v: PerSheet = raw === "fit" ? "fit" : (Number(raw) as PerSheet);
+            dispatch({ type: "set-layout", value: v });
+          }}
           disabled={disabled}
+          data-testid="print-layout-select"
           className="w-full rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg-raised)] px-2 py-1 text-[12px] text-[var(--app-fg)] focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] disabled:opacity-50"
         >
           {PER_SHEET_OPTIONS.map((o) => (
-            <option key={o.value} value={o.value}>
+            <option key={String(o.value)} value={String(o.value)}>
               {o.label}
             </option>
           ))}
         </select>
+      </Row>
+
+      {/* V1.0085: Scale is now an always-visible slider with a click-to-
+          edit numeric readout. Replaces the old mode dropdown — Adam's
+          feedback was the hidden text input felt awkward and the modes
+          confused layout vs. scale. Disabled when Layout = "fit" because
+          the fit-all path scales each tile to fill its cell; the slider
+          value would have no visible effect. */}
+      <Row label="Scale">
+        <div className="flex w-full items-center gap-2">
+          <input
+            type="range"
+            min={10}
+            max={400}
+            step={1}
+            value={settings.scalePct}
+            onChange={(e) =>
+              dispatch({ type: "set-scale-pct", value: Number(e.target.value) })
+            }
+            disabled={disabled || settings.layout === "fit"}
+            title={settings.layout === "fit" ? "Scale is auto-fit when Layout is 'Fit all on one sheet'." : undefined}
+            data-testid="print-scale-slider"
+            className="flex-1 accent-[var(--color-accent)] disabled:opacity-50"
+          />
+          <input
+            type="number"
+            min={10}
+            max={400}
+            value={settings.scalePct}
+            onChange={(e) =>
+              dispatch({ type: "set-scale-pct", value: Number(e.target.value) })
+            }
+            disabled={disabled || settings.layout === "fit"}
+            data-testid="print-scale-input"
+            className="w-14 rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg-raised)] px-2 py-1 text-right text-[12px] text-[var(--app-fg)] tabular-nums focus:outline-none focus:ring-2 focus:ring-[var(--color-accent)] disabled:opacity-50"
+          />
+          <span className="text-[11px] text-[var(--muted)]">%</span>
+        </div>
       </Row>
 
       <Row label="Orientation">
@@ -632,6 +725,30 @@ function ControlsRail({
             onClick={() => dispatch({ type: "set-orientation", value: "landscape" })}
             disabled={disabled}
             label="Landscape"
+          />
+        </div>
+      </Row>
+
+      {/* V1.0089: explicit "Full page" opt-in. Default OFF so portrait
+          renders the source as-is (Adam's "actual size" expectation).
+          ON enables the V1.0088 auto-fit + auto-rotate behavior: each
+          source page's content bbox is detected, rotated 90° if its
+          aspect mismatches the sheet, and scaled to fill the printable
+          area. Disabled when Layout = "fit" (the fit-all path already
+          fills the sheet by design — Full page would be redundant). */}
+      <Row label="Full page">
+        <div className="flex gap-1.5">
+          <OrientationButton
+            active={settings.fullPage}
+            onClick={() => dispatch({ type: "set-full-page", value: true })}
+            disabled={disabled || settings.layout === "fit"}
+            label="On"
+          />
+          <OrientationButton
+            active={!settings.fullPage}
+            onClick={() => dispatch({ type: "set-full-page", value: false })}
+            disabled={disabled || settings.layout === "fit"}
+            label="Off"
           />
         </div>
       </Row>

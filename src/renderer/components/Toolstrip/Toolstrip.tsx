@@ -27,6 +27,7 @@ import {
   Link as LinkIcon,
   Ruler,
   ShieldAlert,
+  Frame,
 } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
@@ -51,6 +52,10 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
   const redo = useDocumentStore((s) => s.redo);
   const tool = useUIStore((s) => s.tool);
   const setTool = useUIStore((s) => s.setTool);
+  // V1.0062: text-box margin mode. When on, new text overlays fit inside a
+  // 36pt page margin; when off, they extend to the page edge.
+  const marginsEnabled = useUIStore((s) => s.marginsEnabled);
+  const toggleMargins = useUIStore((s) => s.toggleMargins);
   const openSignature = useUIStore((s) => s.openSignature);
   const openCompress = useUIStore((s) => s.openCompress);
   const openMetadata = useUIStore((s) => s.openMetadata);
@@ -58,7 +63,12 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
   const openExtract = useUIStore((s) => s.openExtract);
   const openImagePicker = useUIStore((s) => s.openImagePicker);
   const openHeaderFooter = useUIStore((s) => s.openHeaderFooter);
-  const openCrop = useUIStore((s) => s.openCrop);
+  // V1.0087: Crop is now a draggable tool mode, not a modal. The
+  // openCrop ui-store action is retained for backwards compat with the
+  // command palette / menu entry, but the toolstrip button toggles tool
+  // mode directly via the `setTool` already in scope above.
+  const cropTool = tool === "crop";
+  const setCropDraft = useUIStore((s) => s.setCropDraft);
 
   if (!activeTab) return null;
 
@@ -116,6 +126,21 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
           active={tool === "text"}
           onClick={tt("text")}
           data-testid="tool-text"
+        />
+        {/* V1.0062: toggle whether new text boxes constrain to printable
+            margins (½" from each page edge) or extend to the page edge.
+            Label reflects state so it's clear what clicking will do. */}
+        <ToolButton
+          label={marginsEnabled ? "Margins" : "Full page"}
+          icon={<Frame className="h-[14px] w-[14px]" strokeWidth={1.8} />}
+          active={marginsEnabled}
+          onClick={toggleMargins}
+          data-testid="tool-margins"
+          title={
+            marginsEnabled
+              ? "Text boxes fit inside ½″ page margins — click to extend to page edge"
+              : "Text boxes extend to page edge — click to constrain to ½″ margins"
+          }
         />
         <ToolButton
           label="Edit"
@@ -288,10 +313,20 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
         <ToolButton
           label="Crop"
           hint="C"
+          active={cropTool}
           icon={<Crop className="h-[14px] w-[14px]" strokeWidth={1.8} />}
-          onClick={openCrop}
+          onClick={() => {
+            if (cropTool) {
+              // Toggle off — same Cancel semantics as the action bar.
+              setCropDraft(null);
+              setTool("none");
+            } else {
+              setCropDraft(null); // forces a fresh auto-detect seed
+              setTool("crop");
+            }
+          }}
           data-testid="tool-crop"
-          title="Crop page margins"
+          title="Crop page margins (drag the rectangle, ⏎ to apply)"
         />
       </ToolGroup>
 

@@ -5,6 +5,7 @@ import {
   type DigitalCertInfo,
   type MenuCommand,
   type OcrBox,
+  type PageDragPayload,
   type OpenFileDialogOptions,
   type OpenFileDialogResult,
   type OpenedFile,
@@ -98,6 +99,7 @@ const api: WeavePDFApi = {
       ipcRenderer.removeListener(IpcChannel.OpenFilePath, listener);
     };
   },
+  notifyOpenFileListenerReady: () => ipcRenderer.send(IpcChannel.OpenFileListenerReady),
   window: {
     minimize: () => ipcRenderer.send(IpcChannel.WindowMinimize),
     maximize: () => ipcRenderer.send(IpcChannel.WindowMaximize),
@@ -170,7 +172,7 @@ const api: WeavePDFApi = {
       ipcRenderer.invoke(IpcChannel.SnapshotsRead, filePath, savedAt) as Promise<ArrayBuffer | null>,
   },
   pages: {
-    startDrag: (payload: { bytes: ArrayBuffer; pageNumber: number; fileName: string }) =>
+    startDrag: (payload: PageDragPayload) =>
       ipcRenderer.send(IpcChannel.PagesStartDrag, payload),
   },
   platform: process.platform,

@@ -5,6 +5,7 @@ import type {
   DraftRecord,
   MenuCommand,
   OcrBox,
+  PageDragPayload,
   OpenFileDialogOptions,
   OpenFileDialogResult,
   OpenedFile,
@@ -63,6 +64,7 @@ export interface WeavePDFApi {
   };
   onMenuCommand: (cb: (cmd: MenuCommand) => void) => () => void;
   onOpenFilePath: (cb: (path: string) => void) => () => void;
+  notifyOpenFileListenerReady: () => void;
   window: {
     minimize: () => void;
     maximize: () => void;
@@ -157,15 +159,11 @@ export interface WeavePDFApi {
     read: (filePath: string, savedAt: string) => Promise<ArrayBuffer | null>;
   };
   pages: {
-    /** Start a native OS drag carrying a single-page PDF extracted from the
-     *  given source bytes. Call from a `dragstart` handler after
+    /** Start a native OS drag carrying a PDF extracted from the given
+     *  source bytes. Call from a `dragstart` handler after
      *  `e.preventDefault()` — Electron's `webContents.startDrag()` initiates
      *  its own OS drag with file payload, replacing the browser's default. */
-    startDrag: (payload: {
-      bytes: ArrayBuffer;
-      pageNumber: number;
-      fileName: string;
-    }) => void;
+    startDrag: (payload: PageDragPayload) => void;
   };
   platform: NodeJS.Platform;
 }

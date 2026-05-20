@@ -6,7 +6,7 @@ import { FusesPlugin } from "@electron-forge/plugin-fuses";
 import { AutoUnpackNativesPlugin } from "@electron-forge/plugin-auto-unpack-natives";
 import { FuseV1Options, FuseVersion } from "@electron/fuses";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, cpSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, cpSync, rmSync, readdirSync } from "node:fs";
 import { join, resolve } from "node:path";
 
 // Detect a stable code-signing identity ("WeavePDF Local" — see
@@ -166,6 +166,7 @@ const config: ForgeConfig = {
       const helperScript = join(repoRoot, "scripts/build-url-listener.mjs");
       const helperBin = join(repoRoot, "resources/helpers/url-listener-bin");
       const buildScript = join(repoRoot, "scripts/build-finder-sync.mjs");
+      const entitlements = join(repoRoot, "resources/extensions/finder-sync.entitlements");
       const appex = join(repoRoot, "out/build-finder-sync/WeavePDFFinderSync.appex");
 
       console.log("[postPackage] Building Finder Sync notification bridge...");
@@ -188,10 +189,28 @@ const config: ForgeConfig = {
         rmSync(dest, { recursive: true, force: true });
         cpSync(appex, dest, { recursive: true });
         console.log(`[postPackage] embedded extension: ${dest}`);
+        execFileSync(
+          "codesign",
+          ["--force", "--sign", SIGNING_IDENTITY, "--entitlements", entitlements, dest],
+          { stdio: "inherit" },
+        );
+        console.log(`[postPackage] re-signed embedded extension: ${dest}`);
 
         const helperDest = join(appBundle, "Contents/Resources/resources/helpers/url-listener-bin");
         cpSync(helperBin, helperDest);
         console.log(`[postPackage] embedded notification bridge: ${helperDest}`);
+
+        const frameworksDir = join(appBundle, "Contents/Frameworks");
+        if (existsSync(frameworksDir)) {
+          for (const entry of readdirSync(frameworksDir)) {
+            if (!/^WeavePDF Helper.*\.app$/.test(entry)) continue;
+            const helperApp = join(frameworksDir, entry);
+            execFileSync("codesign", ["--force", "--sign", SIGNING_IDENTITY, helperApp], {
+              stdio: "inherit",
+            });
+            console.log(`[postPackage] re-signed Electron helper: ${helperApp}`);
+          }
+        }
 
         // Re-sign the parent .app WITHOUT --deep. This regenerates the
         // parent's CodeResources to seal the new PlugIns/ contents, but

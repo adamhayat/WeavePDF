@@ -1,10 +1,10 @@
-import { Fragment, useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 // V1.0045: removed @dnd-kit's drag-to-reorder. The thumbnail's plain
 // drag is now reserved for HTML5 native drag-out (drag a page to Finder
-// to extract it as a one-page PDF). Reorder lives in the right-click
+// to extract it as a PDF). Reorder lives in the right-click
 // menu via "Move up" / "Move down" — same end result, no gesture
 // disambiguation needed.
-import { RotateCw, RotateCcw, Trash2 } from "lucide-react";
+import { Plus, RotateCw, RotateCcw, Trash2 } from "lucide-react";
 import { useDocumentStore, type DocumentTab } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
@@ -113,6 +113,13 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
     const { setPageLabels } = await loadPdfOps();
     const b = await setPageLabels(activeTab.bytes, ranges);
     await applyEdit(activeTab.id, b);
+  };
+
+  const insertBlankAfterPage = async (afterPage: number) => {
+    if (!activeTab.bytes) return;
+    const { insertBlankPageAfter } = await loadPdfOps();
+    const newBytes = await insertBlankPageAfter(activeTab.bytes, afterPage);
+    await applyEdit(activeTab.id, newBytes, { newCurrentPage: afterPage + 1 });
   };
 
   return (
@@ -278,8 +285,9 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
       >
         <div className="flex flex-col gap-3" ref={thumbsContainerRef}>
           {dropTargetIndex === 0 && <DropIndicator />}
+          {/* V1.0095: Fragment key dropped `activeTab.version`. Pre-V1.0095 every commit unmounted + remounted all Thumbs, kicking off a fresh pdf.js render task per page per applied edit. Thumb's own useEffect already lists `tab.version` in its deps and re-renders the thumbnail when needed; we don't need to throw the whole component instance away. Same pattern as PageCanvas (see its key=line 187 comment). */}
           {Array.from({ length: activeTab.numPages }, (_, i) => i + 1).map((pageNumber) => (
-            <Fragment key={`${activeTab.id}-${activeTab.version}-${pageNumber}`}>
+            <Fragment key={`${activeTab.id}-${pageNumber}`}>
             <Thumb
               pdf={activeTab.pdf!}
               pageNumber={pageNumber}
@@ -397,10 +405,33 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                   },
                 ]);
               }}
+              onAddPageAfter={() => void insertBlankAfterPage(pageNumber)}
+              showAddPageAfter={pageNumber < activeTab.numPages}
             />
             {dropTargetIndex === pageNumber && <DropIndicator />}
             </Fragment>
           ))}
+          {/* V1.0090: explicit "New page" affordance. Pre-V1.0090 Adam
+              could only add a page via a drag-to-duplicate trick he
+              stumbled onto — undiscoverable. This sticky bottom button
+              inserts a blank page at the end of the doc by default; if
+              a single page is selected, inserts AFTER it (matches PDF
+              Expert's mental model). Size matches the doc's first page
+              so mixed-paper docs don't regress to an unexpected paper. */}
+          <button
+            type="button"
+            data-testid="sidebar-new-page"
+            onClick={async () => {
+              const selection = Array.from(activeTab.selectedPages);
+              const afterPage = selection.length === 1 ? selection[0] : activeTab.numPages;
+              await insertBlankAfterPage(afterPage);
+            }}
+            className="mt-1 flex h-10 items-center justify-center gap-1.5 rounded-md border border-dashed border-[var(--panel-border)] text-[12px] text-[var(--muted)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]"
+            title="Insert a blank page after the current selection (or at the end)"
+          >
+            <span className="text-[14px] leading-none">+</span>
+            <span>New page</span>
+          </button>
         </div>
       </div>}
     </aside>
@@ -491,6 +522,8 @@ type ThumbProps = {
   tab: DocumentTab;
   onActivate: (mode: "set" | "toggle" | "range") => void;
   onContextMenu: (clientX: number, clientY: number) => void;
+  onAddPageAfter: () => void;
+  showAddPageAfter: boolean;
 };
 
 /** V1.0055: 2px horizontal accent bar shown between thumbnails during an
@@ -504,9 +537,140 @@ function DropIndicator() {
   );
 }
 
-function Thumb({ pdf, pageNumber, active, selected, tab, onActivate, onContextMenu }: ThumbProps) {
+function AddPageSegment({
+  afterPage,
+  onClick,
+}: {
+  afterPage: number;
+  onClick: () => void;
+}) {
+  return (
+    <div
+      className="group -my-1 flex h-7 items-center justify-center"
+      data-testid={`sidebar-add-page-slot-${afterPage}`}
+    >
+      <button
+        type="button"
+        draggable={false}
+        onDragStart={(e) => e.preventDefault()}
+        onClick={(e) => {
+          e.preventDefault();
+          e.stopPropagation();
+          onClick();
+        }}
+        className={cn(
+          "group/add flex h-6 w-[150px] items-center gap-2 rounded-md px-1 text-[11px] font-medium text-[var(--muted)] opacity-0 transition",
+          "group-hover:opacity-100 hover:bg-[var(--hover-bg)] hover:text-[var(--color-accent)] hover:opacity-100",
+          "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]/50",
+        )}
+        data-testid={`sidebar-add-page-after-${afterPage}`}
+        aria-label={`Add page after page ${afterPage}`}
+      >
+        <span className="h-px flex-1 rounded-full bg-[var(--panel-border-strong)] transition-colors group-hover/add:bg-[var(--color-accent)]" />
+        <span className="flex items-center gap-1 whitespace-nowrap">
+          <Plus className="h-3 w-3" strokeWidth={1.8} />
+          Add page
+        </span>
+        <span className="h-px flex-1 rounded-full bg-[var(--panel-border-strong)] transition-colors group-hover/add:bg-[var(--color-accent)]" />
+      </button>
+    </div>
+  );
+}
+
+function collapsePageRanges(pageNumbers: number[]): string {
+  if (pageNumbers.length === 0) return "";
+  const pages = [...pageNumbers].sort((a, b) => a - b);
+  const ranges: string[] = [];
+  let start = pages[0];
+  let prev = pages[0];
+  for (let i = 1; i < pages.length; i++) {
+    const page = pages[i];
+    if (page === prev + 1) {
+      prev = page;
+      continue;
+    }
+    ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+    start = page;
+    prev = page;
+  }
+  ranges.push(start === prev ? `${start}` : `${start}-${prev}`);
+  return ranges.join(", ");
+}
+
+function pageDragFileName(tabName: string, pageNumbers: number[]): string {
+  const baseName = tabName.replace(/\.pdf$/i, "");
+  if (pageNumbers.length === 1) {
+    return `${baseName} - page ${pageNumbers[0]}.pdf`;
+  }
+  return `${baseName} - pages ${collapsePageRanges(pageNumbers)}.pdf`;
+}
+
+function Thumb({
+  pdf,
+  pageNumber,
+  active,
+  selected,
+  tab,
+  onActivate,
+  onContextMenu,
+  onAddPageAfter,
+  showAddPageAfter,
+}: ThumbProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const [dims, setDims] = useState<{ w: number; h: number } | null>(null);
+  // V1.0090: thumbnail must reflect pending overlays the user has placed
+  // but not yet committed. Pre-V1.0090 the canvas only rendered baked
+  // bytes via pdf.js, so on a new/blank doc with several pending text
+  // overlays the thumbnail looked completely empty. Adam: "the preview
+  // on the left sidebar doesnt update as we update the content, see its
+  // blank". The agent recommendation was "show baked-only" but his real
+  // complaint was that BAKED + PENDING aren't both reflected. Compromise:
+  // after the baked render, overlay simple indicator rectangles for each
+  // pending text/image/shape on this page — enough to communicate "stuff
+  // is here" without trying to be a perfect mini-renderer.
+  // V1.0094 / V1.0095 freeze fix.
+  //
+  // V1.0094 step 1: pre-V1.0094 these were inline `.filter(...)` calls
+  // computed during render. Each render created brand-new array references,
+  // which were in the useEffect dep array below — so every parent re-render
+  // re-fired the effect, kicking off a fresh pdf.js `page.render(...)` per
+  // thumbnail. Memoising the slices stops that loop.
+  //
+  // V1.0095 step 2: even with stable refs across "no-op" renders, the effect
+  // STILL re-fires for every actual edit — every drag-move pointer event,
+  // every keystroke while editing text — because the zustand arrays get a
+  // new ref per mutation. With N pending edits and a fast typist, the
+  // pdf.js worker (single-threaded) backs up faster than it can drain;
+  // the main thread eventually waits and the app freezes. Adam: "every time
+  // I open it and try to edit text, sometimes even without editing."
+  //
+  // The thumbnail is 150px wide — moving an indicator rect by 1pt is
+  // invisible at that scale. So we depend only on the COUNT signature
+  // (changes only when an overlay is added or removed) and read the latest
+  // arrays via refs inside the effect. The thumbnail's pending-rect
+  // positions are stale during a drag but snap to the right place on
+  // overlay add/remove or any commit (`tab.version` bump).
+  const pendingText = useMemo(
+    () => tab.pendingTextEdits.filter((e) => e.page === pageNumber),
+    [tab.pendingTextEdits, pageNumber],
+  );
+  const pendingImage = useMemo(
+    () => tab.pendingImageEdits.filter((e) => e.page === pageNumber),
+    [tab.pendingImageEdits, pageNumber],
+  );
+  const pendingShape = useMemo(
+    () => tab.pendingShapeEdits.filter((e) => e.page === pageNumber),
+    [tab.pendingShapeEdits, pageNumber],
+  );
+  const pendingCount = pendingText.length + pendingImage.length + pendingShape.length;
+  // Latest-values refs for the effect to read without re-firing on every
+  // pointer move.
+  const pendingTextRef = useRef(pendingText);
+  const pendingImageRef = useRef(pendingImage);
+  const pendingShapeRef = useRef(pendingShape);
+  pendingTextRef.current = pendingText;
+  pendingImageRef.current = pendingImage;
+  pendingShapeRef.current = pendingShape;
 
   useEffect(() => {
     let cancelled = false;
@@ -533,15 +697,62 @@ function Thumb({ pdf, pageNumber, active, selected, tab, onActivate, onContextMe
       } catch {
         /* cancelled */
       }
+      if (cancelled) return;
+      // V1.0090: overlay pending edits as indicator rects. PDF-point
+      // coords scale by `scale` directly (since target=150 means CSS px
+      // = PDF-point × scale). Y flips because PDF origin is bottom-left.
+      const pageHPt = baseViewport.height;
+      // Subtle accent fill at low alpha so the thumbnail still reads as
+      // "the page". 30% alpha is enough to see at thumbnail scale.
+      ctx.fillStyle = "rgba(109, 94, 245, 0.30)"; // var(--color-accent) at 30%
+      ctx.strokeStyle = "rgba(109, 94, 245, 0.55)";
+      ctx.lineWidth = 0.5;
+      // V1.0095: read the latest arrays via refs (NOT via deps) so that
+      // every keystroke / drag pointer-move doesn't re-queue a pdf.js
+      // render task. Positions in the thumbnail are stale during a drag
+      // but snap when overlay count changes or version bumps.
+      for (const e of pendingTextRef.current) {
+        const w = (e.widthPt ?? Math.max(40, e.size * 6)) * scale;
+        const h = e.size * 1.2 * scale;
+        const x = e.xPt * scale;
+        const y = (pageHPt - e.yPt - e.size) * scale;
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeRect(x, y, w, h);
+      }
+      for (const e of pendingImageRef.current) {
+        const w = e.widthPt * scale;
+        const h = e.heightPt * scale;
+        const x = e.xPt * scale;
+        const y = (pageHPt - e.yPt - e.heightPt) * scale;
+        ctx.fillRect(x, y, w, h);
+        ctx.strokeRect(x, y, w, h);
+      }
+      for (const e of pendingShapeRef.current) {
+        // Compute a bounding box per shape kind. Skip kinds we can't
+        // cheaply bound; the indicator is best-effort.
+        let bbox: { x: number; y: number; w: number; h: number } | null = null;
+        if ("widthPt" in e && "heightPt" in e && "xPt" in e && "yPt" in e) {
+          bbox = {
+            x: e.xPt * scale,
+            y: (pageHPt - e.yPt - e.heightPt) * scale,
+            w: e.widthPt * scale,
+            h: e.heightPt * scale,
+          };
+        }
+        if (bbox) {
+          ctx.fillRect(bbox.x, bbox.y, bbox.w, bbox.h);
+          ctx.strokeRect(bbox.x, bbox.y, bbox.w, bbox.h);
+        }
+      }
     })();
     return () => {
       cancelled = true;
       task?.cancel();
     };
-  }, [pdf, pageNumber, tab.version]);
+  }, [pdf, pageNumber, tab.version, pendingCount]);
 
   // V1.0045: the entire thumbnail is HTML5-draggable. Plain drag from anywhere
-  // on the page card → drag-out. No modifier, no dedicated handle, no per-app
+  // on the page card -> drag-out. No modifier, no dedicated handle, no per-app
   // training. Reorder lives in the right-click menu's "Move up / Move down".
   // Implementation: the wrapping <div> (NOT a <button>) carries
   // `draggable={true}` because Chromium will not initiate a native drag on a
@@ -555,11 +766,13 @@ function Thumb({ pdf, pageNumber, active, selected, tab, onActivate, onContextMe
     // a new OS-level drag with the file payload + WeavePDF app icon.
     e.preventDefault();
     const slice = tab.bytes.slice().buffer;
-    const baseName = tab.name.replace(/\.pdf$/i, "");
+    const selectedPages = Array.from(tab.selectedPages).sort((a, b) => a - b);
+    const pageNumbers =
+      selected && selectedPages.length > 1 ? selectedPages : [pageNumber];
     window.weavepdf.pages.startDrag({
       bytes: slice,
-      pageNumber,
-      fileName: `${baseName} - page ${pageNumber}.pdf`,
+      pageNumbers,
+      fileName: pageDragFileName(tab.name, pageNumbers),
     });
   };
 
@@ -571,11 +784,6 @@ function Thumb({ pdf, pageNumber, active, selected, tab, onActivate, onContextMe
         e.preventDefault();
         onContextMenu(e.clientX, e.clientY);
       }}
-      title={
-        tab.bytes
-          ? `Page ${pageNumber} — click to view, drag to Finder to extract this page`
-          : `Page ${pageNumber}`
-      }
       className="group relative flex flex-col items-center gap-1.5"
       data-testid="thumb-row"
       data-page-number={pageNumber}
@@ -632,6 +840,7 @@ function Thumb({ pdf, pageNumber, active, selected, tab, onActivate, onContextMe
       >
         {pageNumber}
       </span>
+      {showAddPageAfter && <AddPageSegment afterPage={pageNumber} onClick={onAddPageAfter} />}
     </div>
   );
 }

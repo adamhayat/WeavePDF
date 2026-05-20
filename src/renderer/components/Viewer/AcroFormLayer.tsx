@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
 import { useDocumentStore } from "../../stores/document";
+import { useUIStore } from "../../stores/ui";
 import type { FormFieldValue } from "../../lib/pdf-ops";
 
 const loadPdfOps = () => import("../../lib/pdf-ops");
@@ -10,6 +11,12 @@ type Props = {
   pageNumber: number;
   zoom: number;
   pageHeightPt: number;
+  /** V1.0073: when the Edit Text tool is active, the form widgets stop
+   *  intercepting clicks for form-fill and instead route them through to
+   *  spawn a pending text overlay (whiteout + editable). Lets the user
+   *  apply WeavePDF's text format bar (font size, bold, alignment) to
+   *  AcroForm field values. */
+  editTextMode?: boolean;
 };
 
 type PdfAnnotation = {
@@ -39,9 +46,13 @@ type Widget = {
   exportValue?: string;
 };
 
-export function AcroFormLayer({ pdf, pageNumber, zoom, pageHeightPt }: Props) {
+export function AcroFormLayer({ pdf, pageNumber, zoom, pageHeightPt, editTextMode }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const applyEdit = useDocumentStore((s) => s.applyEdit);
+  const addPendingTextEdit = useDocumentStore((s) => s.addPendingTextEdit);
+  const setTool = useUIStore((s) => s.setTool);
+  const setSelectedPendingText = useUIStore((s) => s.setSelectedPendingText);
+  const setEditingPendingText = useUIStore((s) => s.setEditingPendingText);
   const [widgets, setWidgets] = useState<Widget[]>([]);
 
   useEffect(() => {
@@ -80,8 +91,66 @@ export function AcroFormLayer({ pdf, pageNumber, zoom, pageHeightPt }: Props) {
     await applyEdit(tab.id, newBytes);
   };
 
+  // V1.0073: Edit Text on a form-field VALUE. Converts the AcroForm
+  // widget into a pending text overlay anchored over the same rect —
+  // whiteout covers the baked appearance-stream value, the editable
+  // overlay floats on top, the WeavePDF format bar (size / bold /
+  // italic / alignment) is available. The widget's stored value
+  // remains in the AcroForm structure but is no longer the source of
+  // visual truth — the overlay drives the visible text.
+  const startEditTextOnWidget = (widget: Widget) => {
+    const tab = useDocumentStore.getState().activeTab();
+    if (!tab) return;
+    const [x1, y1, x2, y2] = widget.rect;
+    const wPt = x2 - x1;
+    const hPt = y2 - y1;
+    // Approximate font size from rect height (AcroForm widgets typically
+    // pad ~2pt above/below the glyphs; sizing from h × 0.6 lands near
+    // the rendered value).
+    const sizePt = Math.max(6, Math.min(48, hPt * 0.6));
+    // Baseline ≈ widget bottom + small ascender offset. Matches where
+    // pdf.js renders the value in the widget's appearance stream.
+    const baselineY = y1 + hPt * 0.25;
+    // Padding inside the widget rect — most appearance streams add
+    // ~2pt of left padding. Mirror that so the overlay text doesn't
+    // shift horizontally.
+    const padX = Math.min(4, wPt * 0.05);
+    const newId = addPendingTextEdit(tab.id, {
+      page: pageNumber,
+      xPt: x1 + padX,
+      yPt: baselineY,
+      size: sizePt,
+      text: widget.value,
+      widthPt: Math.max(36, wPt - padX * 2),
+      // V1.0076: pad the whiteout by 2pt on all sides. pdf.js renders
+      // the widget's appearance stream slightly larger than the widget
+      // rect (anti-aliasing, descenders, italic shear), so a rect-tight
+      // whiteout left a faint outline of the baked value visible
+      // underneath. The padding catches the overflow without being big
+      // enough to eat adjacent content.
+      whiteout: {
+        x: x1 - 2,
+        y: y1 - 2,
+        width: wPt + 4,
+        height: hPt + 4,
+      },
+    });
+    setSelectedPendingText(newId);
+    setEditingPendingText(newId);
+    setTool("none");
+  };
+
+  // V1.0076: layer raised above the page's interaction layer (z-10) so
+  // form widgets accept clicks regardless of which drawing tool is
+  // active. Pre-V1.0076 the user had to deselect the active tool (e.g.
+  // Whiteout) before form fields became clickable — Adam: "its fillable
+  // in preview app" but not in WeavePDF because the Whiteout tool was
+  // eating the clicks. Pending overlays / outer drag-drop / context
+  // menu use z-20+, so widgets sit between the page content and the
+  // editing UI — same relative order as before, just above the drawing
+  // layer.
   return (
-    <div className="absolute inset-0 z-[6]" data-testid="acroform-layer">
+    <div className="absolute inset-0 z-[15]" data-testid="acroform-layer">
       {widgets.map((widget, index) => (
         // V1.0039: key MUST be stable across `applyEdit` re-renders. Earlier
         // we keyed on `${name}-${index}-${activeTab.version}` — version
@@ -100,6 +169,8 @@ export function AcroFormLayer({ pdf, pageNumber, zoom, pageHeightPt }: Props) {
           pageHeightPt={pageHeightPt}
           radioChecked={radioSelections.get(widget.name) === widget.exportValue}
           onCommit={commit}
+          editTextMode={!!editTextMode}
+          onStartEditText={() => startEditTextOnWidget(widget)}
         />
       ))}
     </div>
@@ -112,12 +183,16 @@ function FieldWidget({
   pageHeightPt,
   radioChecked,
   onCommit,
+  editTextMode,
+  onStartEditText,
 }: {
   widget: Widget;
   zoom: number;
   pageHeightPt: number;
   radioChecked: boolean;
   onCommit: (value: FormFieldValue) => Promise<void>;
+  editTextMode: boolean;
+  onStartEditText: () => void;
 }) {
   const [value, setValue] = useState(widget.value);
   const [checked, setChecked] = useState(widget.checked || radioChecked);
@@ -149,6 +224,29 @@ function FieldWidget({
   };
 
   if (widget.kind === "text") {
+    // V1.0073: in Edit Text mode, render a transparent click-target
+    // over the widget rect. A click spawns a pending text overlay
+    // (with whiteout covering the appearance-stream value) and selects
+    // it in editing mode — full WeavePDF format bar applies.
+    if (editTextMode) {
+      return (
+        <div
+          aria-label={`Edit "${widget.name}"`}
+          data-testid="acroform-edit-text-target"
+          data-field-name={widget.name}
+          className="absolute cursor-text rounded-[2px] border border-transparent transition-colors hover:border-[var(--color-accent)] hover:bg-[rgba(109,94,245,0.08)]"
+          style={style}
+          onPointerDown={(e) => {
+            e.stopPropagation();
+          }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onStartEditText();
+          }}
+          title="Click to replace this field's text with editable WeavePDF text (format bar available)"
+        />
+      );
+    }
     // V1.0036: text fields render the value via pdf.js's baked-in widget
     // appearance after `applyEdit` runs `setFormFields`. If we ALSO show the
     // value in this HTML overlay, both layers render it slightly offset and
@@ -159,41 +257,70 @@ function FieldWidget({
     // canvas hasn't been updated yet for in-flight typing, so there's no
     // doubling. On blur, the bake fires, pdf.js re-renders, the input
     // returns to transparent, and the user sees one clean rendering.
+    //
+    // V1.0074: render the input inside a wrapping `group` so a small
+    // "Aa ▸" pill can sit above-right of the field on hover or focus.
+    // Clicking the pill switches the field's edit flow to a WeavePDF
+    // pending text overlay (with full format bar) — discoverability fix
+    // for the case where the user filled the field in Margins / other
+    // tool mode and didn't realize Edit Text gives more options.
     return (
-      <input
-        aria-label={widget.name}
-        data-testid="acroform-text"
-        className="acroform-text-input absolute rounded-[2px] border border-transparent bg-transparent text-[12px] leading-normal outline-none transition-colors hover:border-[rgba(59,76,202,0.35)] focus:border-[var(--color-accent)] focus:bg-white focus:ring-1 focus:ring-[var(--color-accent)] disabled:opacity-60"
-        style={{
-          ...style,
-          paddingLeft: Math.max(6, 4 * zoom),
-          paddingRight: Math.max(6, 4 * zoom),
-          paddingTop: 0,
-          paddingBottom: 0,
-          // Transparent text by default → only pdf.js shows the value.
-          // Caret stays visible so the user can see the focus position.
-          color: "transparent",
-          caretColor: "black",
-        }}
-        value={value}
-        disabled={widget.readOnly || busy}
-        onPointerDown={(e) => e.stopPropagation()}
-        onClick={(e) => e.stopPropagation()}
-        onContextMenu={(e) => e.stopPropagation()}
-        onFocus={(e) => {
-          // Switch to opaque text while editing so user sees their typing.
-          e.currentTarget.style.color = "black";
-        }}
-        onChange={(e) => setValue(e.target.value)}
-        onBlur={(e) => {
-          // Hand the visual rendering back to pdf.js. setFormFields →
-          // applyEdit → pdf.js re-render handles the display from here.
-          e.currentTarget.style.color = "transparent";
-          if (value !== widget.value) {
-            void runCommit({ name: widget.name, kind: "text", value });
-          }
-        }}
-      />
+      <div
+        className="group absolute"
+        style={style}
+        data-acroform-text-field={widget.name}
+      >
+        <input
+          aria-label={widget.name}
+          data-testid="acroform-text"
+          className="acroform-text-input absolute inset-0 rounded-[2px] border border-transparent bg-transparent text-[12px] leading-normal outline-none transition-colors hover:border-[rgba(59,76,202,0.35)] focus:border-[var(--color-accent)] focus:bg-white focus:ring-1 focus:ring-[var(--color-accent)] disabled:opacity-60"
+          style={{
+            paddingLeft: Math.max(6, 4 * zoom),
+            paddingRight: Math.max(6, 4 * zoom),
+            paddingTop: 0,
+            paddingBottom: 0,
+            color: "transparent",
+            caretColor: "black",
+          }}
+          value={value}
+          disabled={widget.readOnly || busy}
+          onPointerDown={(e) => e.stopPropagation()}
+          onClick={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.stopPropagation()}
+          onFocus={(e) => {
+            e.currentTarget.style.color = "black";
+          }}
+          onChange={(e) => setValue(e.target.value)}
+          onBlur={(e) => {
+            e.currentTarget.style.color = "transparent";
+            if (value !== widget.value) {
+              void runCommit({ name: widget.name, kind: "text", value });
+            }
+          }}
+        />
+        {!widget.readOnly && (
+          <button
+            type="button"
+            // Mousedown rather than click — we need to grab the pill
+            // BEFORE the input's blur fires (which would commit a
+            // form-fill change and re-render via applyEdit, unmounting
+            // us mid-click).
+            onMouseDown={(e) => {
+              e.preventDefault();
+              e.stopPropagation();
+              onStartEditText();
+            }}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="absolute -top-5 right-0 flex h-4 items-center gap-1 rounded bg-[var(--color-accent)] px-1.5 text-[10px] font-medium text-white opacity-0 shadow-sm transition-opacity hover:bg-[var(--color-accent-hover)] group-hover:opacity-100 group-focus-within:opacity-100"
+            aria-label={`Edit "${widget.name}" with the format bar`}
+            title="Convert to editable WeavePDF text (font size, bold, alignment)"
+            data-testid="acroform-format-pill"
+            data-field-name={widget.name}
+          >
+            Aa ▸
+          </button>
+        )}
+      </div>
     );
   }
 

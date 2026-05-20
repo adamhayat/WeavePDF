@@ -9,7 +9,7 @@
 // Submenu items (6):
 //   - Compress              — PDF only
 //   - Combine into PDF      — 2+ files of any supported type
-//   - Convert to PDF        — image only
+//   - Convert to PDF        — images or Word/RTF/TXT/ODT documents
 //   - Extract first page    — PDF only
 //   - Rotate clockwise      — PDF only (90° clockwise)
 //   - Rotate counterclockwise — PDF only (90° counter-clockwise)
@@ -35,11 +35,20 @@ class FinderSync: FIFinderSync {
     static let supported: Set<String> = [
         "pdf", "png", "jpg", "jpeg", "heic", "heif",
         "tif", "tiff", "gif", "bmp", "webp",
+        // V1.0092: doc-class formats accepted by "Convert to PDF".
+        "doc", "docx", "rtf", "txt", "odt",
     ]
     static let imageOnly: Set<String> = [
         "png", "jpg", "jpeg", "heic", "heif",
         "tif", "tiff", "gif", "bmp", "webp",
     ]
+    // V1.0092: extensions that flow through the textutil + printToPDF
+    // pipeline in the parent app's runCli `doc-to-pdf` op.
+    static let docOnly: Set<String> = [
+        "doc", "docx", "rtf", "txt", "odt",
+    ]
+    // Anything we can convert to PDF — images OR docs.
+    static let convertable: Set<String> = imageOnly.union(docOnly)
 
     // V1.0032: macOS pkd can spawn multiple instances of this extension
     // (different locale stacks, Finder window contexts, etc.) — observed
@@ -99,7 +108,7 @@ class FinderSync: FIFinderSync {
         guard !ok.isEmpty else { return m }
 
         let pdfCount = ok.filter { $0.pathExtension.lowercased() == "pdf" }.count
-        let imgCount = ok.filter { FinderSync.imageOnly.contains($0.pathExtension.lowercased()) }.count
+        let convertCount = ok.filter { FinderSync.convertable.contains($0.pathExtension.lowercased()) }.count
 
         // V1.0029: restore explicit "WeavePDF" parent NSMenuItem with a
         // submenu. V1.0028 tried removing this on the assumption macOS would
@@ -119,7 +128,7 @@ class FinderSync: FIFinderSync {
         // preset, not the full CompressModal flow inside the app.
         addItem(sub, "Quick Compress", #selector(compressAction(_:)), enabled: pdfCount > 0)
         addItem(sub, "Combine into PDF", #selector(combineAction(_:)), enabled: ok.count >= 2)
-        addItem(sub, "Convert to PDF", #selector(convertAction(_:)), enabled: imgCount > 0)
+        addItem(sub, "Convert to PDF", #selector(convertAction(_:)), enabled: convertCount > 0)
         addItem(sub, "Extract first page", #selector(extractAction(_:)), enabled: pdfCount > 0)
         addItem(sub, "Rotate clockwise", #selector(rotateClockwiseAction(_:)), enabled: pdfCount > 0)
         addItem(sub, "Rotate counterclockwise", #selector(rotateCounterclockwiseAction(_:)), enabled: pdfCount > 0)
@@ -157,7 +166,7 @@ class FinderSync: FIFinderSync {
     }
 
     @objc func convertAction(_ sender: AnyObject?) {
-        dispatch(verb: "convert", urls: selectedExt(Array(FinderSync.imageOnly)))
+        dispatch(verb: "convert", urls: selectedExt(Array(FinderSync.convertable)))
     }
 
     @objc func extractAction(_ sender: AnyObject?) {

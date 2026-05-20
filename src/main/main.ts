@@ -16,6 +16,7 @@ import {
   type OcrBox,
   type OpenFileDialogOptions,
   type OpenedFile,
+  type PageDragPayload,
   type SaveFileDialogOptions,
   type SnapshotEntry,
   type WriteFileResult,
@@ -47,6 +48,7 @@ function getActiveWindow(): BrowserWindow | null {
 // Files the OS wants us to open before the window is ready — drained
 // once the renderer signals it's listening.
 const pendingOpenFiles: string[] = [];
+const openFileListenerReadyWindowIds = new Set<number>();
 
 // Hoisted high so the early helpers (queueOrSendOpen, bringWindowForward)
 // can call it. The Finder Sync extension dispatches via this same log path
@@ -217,6 +219,8 @@ function assertBlessed(p: string): void {
 //      extension's filter, which we don't trust.
 const WEAVEPDF_URL_ALLOWED_EXTS = new Set([
   "pdf", "png", "jpg", "jpeg", "heic", "heif",
+  // V1.0092: doc-class formats for the right-click "Convert to PDF" action.
+  "doc", "docx", "rtf", "txt", "odt",
 ]);
 const WEAVEPDF_URL_BLOCKED_BASENAMES = new Set([
   ".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker",
@@ -324,13 +328,35 @@ function ownerPasswordOrRandom(ownerPassword: string | undefined): string {
     : randomBytes(24).toString("base64url");
 }
 
+function canReceiveOpenFilePaths(win: BrowserWindow): boolean {
+  return (
+    !win.isDestroyed() &&
+    !win.webContents.isLoading() &&
+    openFileListenerReadyWindowIds.has(win.id)
+  );
+}
+
+function drainPendingOpenFiles(win: BrowserWindow): void {
+  if (!canReceiveOpenFilePaths(win)) return;
+  let drained = false;
+  while (pendingOpenFiles.length > 0) {
+    const p = pendingOpenFiles.shift();
+    if (p) {
+      logFinderSync(`  → draining queued open-file to window ${win.id}: ${p}`);
+      win.webContents.send(IpcChannel.OpenFilePath, p);
+      drained = true;
+    }
+  }
+  if (drained) bringWindowForward(win);
+}
+
 function queueOrSendOpen(filePath: string): void {
   blessPath(filePath);
   // Multi-window: route the file-open to the currently-active window so PDFs
   // that arrive while window A is focused land as a tab in A, not in some
   // arbitrary other window. Defaults to a tab in whichever window is on top.
   const target = getActiveWindow();
-  const ready = !!target && !target.webContents.isLoading();
+  const ready = !!target && canReceiveOpenFilePaths(target);
   // V1.0023: detailed logging so we can debug "opens but didn't focus"
   // reports without screen-recording. Drops to /tmp/weavepdf-quickaction.log.
   logFinderSync(
@@ -344,7 +370,7 @@ function queueOrSendOpen(filePath: string): void {
   // V1.0025: if there are NO windows (user closed the last one with the
   // red X — macOS keeps the app running but with zero windows), queueing
   // the path was a dead-end — nothing would drain it. Create a fresh
-  // window; its did-finish-load handler drains pendingOpenFiles for us.
+  // window; the renderer-ready handler drains pendingOpenFiles for us.
   // This matches the existing app.on("activate") behaviour for dock-icon
   // clicks; we just hadn't wired the same fallback into the file-open path.
   pendingOpenFiles.push(filePath);
@@ -559,6 +585,186 @@ async function withTempDir<T>(prefix: string, run: (dir: string) => Promise<T>):
   }
 }
 
+// Document extensions that our doc-to-pdf pipeline can convert.
+// V1.0092: surfaces the same right-click "Convert to PDF" Quick Action that
+// already worked for images. textutil ships with macOS and reads .doc / .docx /
+// .rtf / .txt / .odt natively. V1.0093: Pages.app (Apple's own .docx layout
+// engine) added as the primary path for higher-fidelity output.
+const DOC_LIKE_EXTENSIONS = new Set(["doc", "docx", "rtf", "txt", "odt"]);
+
+function pagesAppPath(): string | null {
+  // On macOS 14+ Pages lives at /System/Applications (managed by Apple). On
+  // older macOS or if installed from the App Store separately it lives at
+  // /Applications. Return whichever is present.
+  const candidates = ["/System/Applications/Pages.app", "/Applications/Pages.app"];
+  for (const p of candidates) if (existsSync(p)) return p;
+  return null;
+}
+
+// V1.0093: Pages-driven .docx → PDF. Apple's layout engine renders Word
+// documents with high fidelity — embedded fonts, exact margins, line spacing,
+// images, tables — matching what Word's "Export as PDF" produces. textutil's
+// HTML→printToPDF path loses fonts, ignores most styling, and reflows to
+// HTML defaults.
+//
+// First invocation triggers a one-time macOS Automation TCC prompt
+// ("WeavePDF wants permission to control Pages"). User clicks OK once and
+// it's remembered. If they deny, this throws and we fall back to textutil.
+//
+// `application "Pages" is running` is queried BEFORE the first `tell` block
+// so we can `quit` Pages at the end if we were the ones who launched it —
+// without disturbing a Pages session the user already had open.
+async function convertDocViaPages(inPath: string, outPath: string): Promise<void> {
+  const script = `
+on run argv
+  set inFile to POSIX file (item 1 of argv)
+  set outFile to POSIX file (item 2 of argv)
+  set wasRunning to (application "Pages" is running)
+  tell application "Pages"
+    launch
+    set theDoc to open inFile
+    export theDoc to outFile as PDF
+    close theDoc saving no
+    if not wasRunning then quit
+  end tell
+end run
+`;
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn("osascript", ["-e", script, inPath, outPath]);
+    let stderr = "";
+    child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+    child.on("error", reject);
+    child.on("exit", (code) => {
+      if (code === 0) resolve();
+      else reject(new Error(stderr.trim() || `osascript (Pages) exited ${code}`));
+    });
+  });
+  if (!existsSync(outPath)) {
+    throw new Error("Pages reported success but no PDF was written");
+  }
+}
+
+// V1.0092 fallback path: textutil → hidden BrowserWindow → printToPDF.
+// Lower fidelity than Pages (textutil's HTML output is generic, no font
+// embedding) but works without Pages.app or Automation permissions. The
+// BrowserWindow is sandboxed with javascript disabled and a webRequest
+// filter that blocks anything outside the single allowed HTML file URL.
+async function convertDocViaTextutil(inPath: string, outPath: string): Promise<void> {
+  await withTempDir("weavepdf-doc2pdf-textutil-", async (tmpDir) => {
+    const htmlPath = path.join(tmpDir, "out.html");
+    await new Promise<void>((resolve, reject) => {
+      const child = spawn("textutil", ["-convert", "html", "-output", htmlPath, inPath]);
+      let stderr = "";
+      child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(stderr.trim() || `textutil exited ${code}`));
+      });
+    });
+    const hidden = new BrowserWindow({
+      show: false,
+      webPreferences: {
+        contextIsolation: true,
+        nodeIntegration: false,
+        sandbox: true,
+        javascript: false,
+        webSecurity: true,
+        allowRunningInsecureContent: false,
+        partition: `doc2pdf-${randomUUID()}`,
+      },
+    });
+    const hidSession = hidden.webContents.session;
+    hidSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
+    const allowedFileUrl = "file://" + htmlPath;
+    hidSession.webRequest.onBeforeRequest((details, cb) => {
+      if (details.url.startsWith("data:")) return cb({ cancel: false });
+      try {
+        const parsed = new URL(details.url);
+        if (parsed.protocol === "file:" && parsed.pathname === htmlPath && !parsed.search && !parsed.hash) {
+          return cb({ cancel: false });
+        }
+      } catch {
+        // Malformed URL → block.
+      }
+      if (details.url === allowedFileUrl) return cb({ cancel: false });
+      cb({ cancel: true });
+    });
+    hidden.webContents.on("will-navigate", (ev) => ev.preventDefault());
+    hidden.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
+    try {
+      await hidden.loadFile(htmlPath);
+      await new Promise((r) => setTimeout(r, 200));
+      const pdf = await hidden.webContents.printToPDF({
+        pageSize: "Letter",
+        printBackground: true,
+        margins: { top: 0.5, bottom: 0.5, left: 0.5, right: 0.5 },
+      });
+      await writeFile(outPath, pdf);
+    } finally {
+      hidden.destroy();
+    }
+  });
+}
+
+// Convert a Word/RTF/TXT/ODT file at `inPath` to a PDF at `outPath`. V1.0093
+// prefers Pages.app for Word-fidelity output and falls back to textutil if
+// Pages isn't installed or the AppleScript call fails (Automation permission
+// denied, Pages crash, etc.).
+async function convertDocFileToPdf(inPath: string, outPath: string): Promise<void> {
+  const ext = path.extname(inPath).replace(/^\./, "").toLowerCase();
+  if (!DOC_LIKE_EXTENSIONS.has(ext)) {
+    throw new Error(`Unsupported document extension: .${ext}`);
+  }
+  if (pagesAppPath()) {
+    try {
+      await convertDocViaPages(inPath, outPath);
+      return;
+    } catch (err) {
+      console.warn(
+        "[doc-to-pdf] Pages export failed, falling back to textutil:",
+        err instanceof Error ? err.message : err,
+      );
+      // Fall through to textutil below.
+    }
+  }
+  await convertDocViaTextutil(inPath, outPath);
+}
+
+// V1.0096: shared OCR-on-image-bytes helper. The Swift `ocr-bin` binary
+// wraps Apple Vision's VNRecognizeTextRequest and returns OcrBox[] (text +
+// normalized bbox in image space, bottom-left origin). Used by:
+//   - The existing IpcChannel.OcrRunImage handler (renderer-side per-page
+//     OCR-on-demand path).
+//   - V1.0096: the `addImagePage` flow during right-click "Convert to PDF"
+//     / "Combine into PDF" / `--cli image-to-pdf` so the produced PDF
+//     carries a hidden text layer from the moment of creation.
+async function runOcrOnImageBytes(imageBytes: Uint8Array): Promise<OcrBox[]> {
+  const bin = helperBinaryPath("ocr-bin");
+  if (!existsSync(bin)) {
+    throw new Error("OCR helper not built. Run `node scripts/build-ocr.mjs` to compile the Swift binary.");
+  }
+  return withTempDir("weavepdf-ocr-bin-", async (tmpDir) => {
+    // ocr-bin's Swift uses NSImage(contentsOf:) which auto-detects format
+    // from the file's content header, so the extension doesn't matter.
+    const imgPath = path.join(tmpDir, "img");
+    await writeFile(imgPath, Buffer.from(imageBytes));
+    const json = await new Promise<string>((resolve, reject) => {
+      const child = spawn(bin, [imgPath]);
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
+      child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+      child.on("error", reject);
+      child.on("exit", (code) => {
+        if (code !== 0) reject(new Error(stderr.trim() || `ocr-bin exited ${code}`));
+        else resolve(stdout);
+      });
+    });
+    return JSON.parse(json) as OcrBox[];
+  });
+}
+
 // V1.0026: per-window snapshot of dirty tab names. Renderer publishes via
 // the NotifyDirtyTabs IPC on every store change. Used by the close /
 // before-quit handlers to show an "unsaved changes" confirmation dialog.
@@ -618,6 +824,12 @@ function createMainWindow(): BrowserWindow {
       skipUnsavedConfirmForWindowId.delete(winId);
       return;
     }
+    // V1.0066: Playwright's `app.close()` triggers `win.on("close")`. If a
+    // test left a dirty tab, `showMessageBoxSync` below blocks the teardown
+    // until Playwright kills the process after the 60s test timeout. Skip
+    // the dialog in E2E builds (`npm run package:test` sets VITE_E2E=1);
+    // release builds keep the production behavior.
+    if (import.meta.env.VITE_E2E === "1") return;
     const dirty = dirtyTabsByWindowId.get(winId) ?? [];
     if (dirty.length === 0) return;
     event.preventDefault();
@@ -656,6 +868,7 @@ function createMainWindow(): BrowserWindow {
   win.on("closed", () => {
     dirtyTabsByWindowId.delete(win.id);
     skipUnsavedConfirmForWindowId.delete(win.id);
+    openFileListenerReadyWindowIds.delete(win.id);
   });
 
   // Hardening: any link, window.open, or embedded <webview> in content we
@@ -680,21 +893,10 @@ function createMainWindow(): BrowserWindow {
   });
 
   win.webContents.once("did-finish-load", () => {
-    // Flush any open-file paths that arrived before the window was ready.
-    // Drain ALL queued paths and bring the window forward once if any drained
-    // — covers the cold-start path where the user double-clicked a PDF that
-    // launched WeavePDF; macOS auto-focuses cold launches, but the deferred
-    // bringWindowForward also handles the edge case where another app stole
-    // focus during the renderer load.
-    let drained = false;
-    while (pendingOpenFiles.length > 0) {
-      const p = pendingOpenFiles.shift();
-      if (p) {
-        win.webContents.send(IpcChannel.OpenFilePath, p);
-        drained = true;
-      }
-    }
-    if (drained) bringWindowForward(win);
+    // `did-finish-load` can fire before React has registered the
+    // onOpenFilePath listener. Drain only if the renderer has also
+    // acknowledged that its listener is attached.
+    drainPendingOpenFiles(win);
   });
 
   if (MAIN_WINDOW_VITE_DEV_SERVER_URL) {
@@ -765,6 +967,16 @@ function registerIpc(): void {
         });
       }
     }
+  });
+
+  ipcMain.on(IpcChannel.OpenFileListenerReady, (e) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    if (!win) return;
+    openFileListenerReadyWindowIds.add(win.id);
+    logFinderSync(
+      `open-file listener ready in window ${win.id} (pending=${pendingOpenFiles.length})`,
+    );
+    drainPendingOpenFiles(win);
   });
 
   ipcMain.handle(
@@ -1482,26 +1694,30 @@ group.wait()
     },
   );
 
-  // V1.0043: Drag a single thumbnail page out to Finder/Desktop and produce
-  // a real PDF file. Renderer cancels the browser's default drag (so the
-  // browser doesn't try to drag the canvas as an image), forwards the source
-  // bytes + page number here, we extract the page with pdf-lib into the OS
-  // tempdir, and call `webContents.startDrag()` to start the OS-level drag
+  // V1.0043: Drag thumbnail pages out to Finder/Desktop and produce a real
+  // PDF file. Renderer cancels the browser's default drag (so the browser
+  // doesn't try to drag the canvas as an image), forwards the source bytes +
+  // selected page numbers here, we extract those pages with pdf-lib into the
+  // OS tempdir, and call `webContents.startDrag()` to start the OS-level drag
   // with file payload. Drop on Finder/Desktop creates the file; drop inside
   // the app or back on the sidebar is a no-op (no drop target).
   ipcMain.on(
     IpcChannel.PagesStartDrag,
-    async (
-      event,
-      payload: { bytes: ArrayBuffer; pageNumber: number; fileName: string },
-    ) => {
+    async (event, payload: PageDragPayload) => {
       try {
         const src = await PDFLibDocument.load(new Uint8Array(payload.bytes));
         const out = await PDFLibDocument.create();
-        const idx = Math.max(0, payload.pageNumber - 1);
-        if (idx >= src.getPageCount()) return;
-        const [copied] = await out.copyPages(src, [idx]);
-        out.addPage(copied);
+        const pageCount = src.getPageCount();
+        const indexes = Array.from(
+          new Set(
+            payload.pageNumbers
+              .map((pageNumber) => Math.floor(pageNumber) - 1)
+              .filter((idx) => idx >= 0 && idx < pageCount),
+          ),
+        );
+        if (indexes.length === 0) return;
+        const copiedPages = await out.copyPages(src, indexes);
+        for (const copied of copiedPages) out.addPage(copied);
         const pageBytes = await out.save();
         // Sanitise the filename so a tab name with slashes/colons doesn't
         // escape the tempdir or break the write.
@@ -1588,18 +1804,11 @@ group.wait()
   );
 
   // ─── OCR (Apple Vision) ──────────────────────────────────────────────
-  // Compiled Swift helper. Forge's extraResource:["resources"] copies the
-  // whole folder into Contents/Resources/resources/, so the packaged path
-  // has an extra "resources/" segment vs dev.
-  const ocrBinaryPath = (): string => {
-    const resourcesRoot = app.isPackaged
-      ? path.join(process.resourcesPath, "resources")
-      : path.join(__dirname, "..", "..", "resources");
-    return path.join(resourcesRoot, "helpers", "ocr-bin");
-  };
-
+  // V1.0096: bin-path + run-on-bytes logic moved to the module-top-level
+  // `helperBinaryPath("ocr-bin")` + `runOcrOnImageBytes` so it's also
+  // reachable from runCli's addImagePage auto-OCR flow.
   ipcMain.handle(IpcChannel.OcrAvailable, async (): Promise<boolean> => {
-    return existsSync(ocrBinaryPath());
+    return existsSync(helperBinaryPath("ocr-bin"));
   });
 
   // ─── qpdf (password unlock) ─────────────────────────────────────────
@@ -1662,85 +1871,20 @@ group.wait()
   );
 
   // ─── DOCX / DOC / RTF → PDF (via textutil + printToPDF) ────────────────
-  // macOS's built-in `textutil` converts .docx/.doc/.rtf → HTML. We then load
-  // the HTML into a hidden, unsandboxed BrowserWindow with no preload and
-  // call printToPDF() to get back PDF bytes. All on-device.
+  // Thin wrapper around the module-top-level `convertDocFileToPdf` helper so
+  // the same pipeline backs in-app DOCX import AND the V1.0092 Finder
+  // right-click "Convert to PDF" action on doc-class files.
   ipcMain.handle(
     IpcChannel.ConvertDocToPdf,
     async (_e, bytes: ArrayBuffer, filename: string): Promise<ArrayBuffer> => {
       const ext = (filename.split(".").pop() ?? "docx").toLowerCase();
-      return withTempDir("weavepdf-doc2pdf-", async (tmpDir) => {
+      return withTempDir("weavepdf-doc2pdf-ipc-", async (tmpDir) => {
         const inPath = path.join(tmpDir, `input.${ext}`);
-        const htmlPath = path.join(tmpDir, "out.html");
+        const outPath = path.join(tmpDir, "output.pdf");
         await writeFile(inPath, Buffer.from(bytes));
-        // Run textutil. It picks the right format from the extension.
-        await new Promise<void>((resolve, reject) => {
-          const child = spawn("textutil", ["-convert", "html", "-output", htmlPath, inPath]);
-          let stderr = "";
-          child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
-          child.on("error", reject);
-          child.on("exit", (code) => {
-            if (code === 0) resolve();
-            else reject(new Error(stderr.trim() || `textutil exited ${code}`));
-          });
-        });
-        // Spawn a hidden renderer to print-to-PDF. No preload, no IPC
-        // surface — just HTML → PDF. Every network / navigation path is
-        // denied so a hostile .docx's HTML output can't phone home, read
-        // file://, or hijack via meta-refresh.
-        const hidden = new BrowserWindow({
-          show: false,
-          webPreferences: {
-            contextIsolation: true,
-            nodeIntegration: false,
-            sandbox: true,
-            javascript: false,
-            webSecurity: true,
-            allowRunningInsecureContent: false,
-            partition: `doc2pdf-${randomUUID()}`,
-          },
-        });
-        const hidSession = hidden.webContents.session;
-        hidSession.setPermissionRequestHandler((_wc, _perm, cb) => cb(false));
-        // Block every outbound request. The HTML can still reference local
-        // images/fonts via file://, which are technically intercepted too —
-        // textutil embeds images inline as data: URLs, so this is fine.
-        // V1.0020: tightened from prefix-startsWith to exact-equality check
-        // on the URL pathname so a malicious HTML can't smuggle
-        // `file:///tmp/weavepdf-doc2pdf-XXXX/out.html?../../../etc/passwd`
-        // past the filter (the substring check would have accepted it).
-        const allowedFileUrl = "file://" + htmlPath;
-        hidSession.webRequest.onBeforeRequest((details, cb) => {
-          if (details.url.startsWith("data:")) return cb({ cancel: false });
-          try {
-            const parsed = new URL(details.url);
-            // Compare normalised pathname; rejects query/fragment-smuggled paths.
-            if (parsed.protocol === "file:" && parsed.pathname === htmlPath && !parsed.search && !parsed.hash) {
-              return cb({ cancel: false });
-            }
-          } catch {
-            // Malformed URL → block.
-          }
-          // Defensive: accept the literal expected URL even if URL parsing
-          // changes shape across Electron versions.
-          if (details.url === allowedFileUrl) return cb({ cancel: false });
-          cb({ cancel: true });
-        });
-        hidden.webContents.on("will-navigate", (ev) => ev.preventDefault());
-        hidden.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
-        try {
-          await hidden.loadFile(htmlPath);
-          // Give images + fonts a beat to resolve before printing.
-          await new Promise((r) => setTimeout(r, 200));
-          const pdf = await hidden.webContents.printToPDF({
-            pageSize: "Letter",
-            printBackground: true,
-            margins: { top: 0.5, bottom: 0.5, left: 0.5, right: 0.5 },
-          });
-          return u8ToAb(pdf);
-        } finally {
-          hidden.destroy();
-        }
+        await convertDocFileToPdf(inPath, outPath);
+        const buf = await readFile(outPath);
+        return u8ToAb(buf);
       });
     },
   );
@@ -2107,30 +2251,10 @@ group.wait()
   );
 
   ipcMain.handle(IpcChannel.OcrRunImage, async (_e, pngBytes: ArrayBuffer): Promise<OcrBox[]> => {
-    const bin = ocrBinaryPath();
-    if (!existsSync(bin)) {
-      throw new Error("OCR helper not built. Run `node scripts/build-ocr.mjs` to compile the Swift binary.");
-    }
-    // Vision needs a file path — write PNG to a tempfile, spawn the helper,
-    // parse JSON, clean up. Keep the tempfile per-call to stay re-entrant safe.
-    return withTempDir("weavepdf-ocr-", async (tmpDir) => {
-      const tmp = path.join(tmpDir, "page.png");
-      await writeFile(tmp, Buffer.from(pngBytes));
-      const json = await new Promise<string>((resolve, reject) => {
-        const child = spawn(bin, [tmp]);
-        let stdout = "";
-        let stderr = "";
-        child.stdout.on("data", (d) => (stdout += d.toString("utf8")));
-        child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
-        child.on("error", reject);
-        child.on("exit", (code) => {
-          if (code !== 0) reject(new Error(stderr.trim() || `ocr-bin exited ${code}`));
-          else resolve(stdout);
-        });
-      });
-      const parsed = JSON.parse(json) as OcrBox[];
-      return parsed;
-    });
+    // V1.0096: thin wrapper around the module-top-level `runOcrOnImageBytes`
+    // helper that also backs the auto-OCR on Combine into PDF / image-to-pdf
+    // paths in runCli.
+    return runOcrOnImageBytes(new Uint8Array(pngBytes));
   });
 }
 
@@ -2353,15 +2477,16 @@ function buildAppMenu(): void {
     {
       label: "File",
       submenu: [
-        // Chrome convention: ⌘T = new tab, ⌘N = new window.
-        // ⌘T opens the file picker and adds the chosen PDF as a new tab in
-        // the active window — there's no "blank tab" concept since a tab
-        // without content has no meaning in a PDF editor. ⌘O is a long-
-        // standing alias for the same flow.
+        // V1.0056: doc-editor convention — ⌘N = New Blank PDF (a fresh
+        // untitled document with one Letter page, ready to fill in via
+        // Text / Image / etc. and Save-As). ⌘T = New Tab (empty placeholder
+        // showing the DropZone). Shift+⌘N = New Window (browser-style,
+        // independent renderer + tab list). Pre-V1.0056 ⌘N was wired to
+        // New Window; moved to make room for the more common doc-editor
+        // action that Word / Pages / Acrobat all bind to ⌘N.
+        { label: "New Blank PDF", accelerator: "CmdOrCtrl+N", click: m("newBlankPdf") },
         { label: "New Tab…", accelerator: "CmdOrCtrl+T", click: m("newTab") },
-        // ⌘N creates a fresh BrowserWindow with its own renderer + independent
-        // tab list. Matches Chrome / Safari / most browsers.
-        { label: "New Window", accelerator: "CmdOrCtrl+N", click: () => createMainWindow() },
+        { label: "New Window", accelerator: "Shift+CmdOrCtrl+N", click: () => createMainWindow() },
         { type: "separator" },
         { label: "Open…", accelerator: "CmdOrCtrl+O", click: m("open") },
         { type: "separator" },
@@ -2442,7 +2567,12 @@ function buildAppMenu(): void {
         { label: "Next Page", accelerator: "Right", click: m("nextPage") },
         { label: "Previous Page", accelerator: "Left", click: m("prevPage") },
         { type: "separator" },
-        { label: "Toggle Sidebar", accelerator: "CmdOrCtrl+B", click: m("toggleSidebar") },
+        // V1.0061: sidebar → ⇧⌘B. Adam's choice (close to text Bold's ⌘B for
+        // memorability). V1.0059's ⌥⌘S (macOS canonical) was unmemorable for
+        // him; V1.0058's ⌘\ collided with 1Password global quick-access;
+        // pre-V1.0057's ⌘B collided with text Bold. Three remaps to land on
+        // a binding the user actually remembers and doesn't conflict.
+        { label: "Toggle Sidebar", accelerator: "Shift+CmdOrCtrl+B", click: m("toggleSidebar") },
         { type: "separator" },
         { role: "togglefullscreen" },
       ],
@@ -2495,7 +2625,7 @@ async function runCli(args: string[]): Promise<number> {
   if (!op) {
     console.error("weavepdf --cli <op> <args...>");
     console.error(
-      "ops: compress, merge, rotate, extract-first, extract-range, watermark, encrypt, decrypt, image-to-pdf",
+      "ops: compress, merge, rotate, extract-first, extract-range, watermark, encrypt, decrypt, image-to-pdf, doc-to-pdf",
     );
     return 2;
   }
@@ -2574,12 +2704,54 @@ async function runCli(args: string[]): Promise<number> {
     // what users expect when converting a narrow screenshot — the image
     // sits at the top of a US Letter page rather than floating in the
     // middle of a mostly-blank page.
-    page.drawImage(img, {
-      x: (pageW - w) / 2,
-      y: pageH - margin - h,
-      width: w,
-      height: h,
-    });
+    const imageX = (pageW - w) / 2;
+    const imageY = pageH - margin - h;
+    page.drawImage(img, { x: imageX, y: imageY, width: w, height: h });
+
+    // V1.0096: auto-OCR. Adam: "I created it inside Weave [via Combine into
+    // PDF on a stack of Gmail screenshots], why can't I edit the text?"
+    // Pre-V1.0096 these pages were pure image — opening one in WeavePDF
+    // showed "No editable text on this page" until the user clicked OK on
+    // the OCR prompt per page. Now we OCR each image at combine-time and
+    // embed the recognised text as a hidden layer (opacity 0) at the
+    // matching positions on the page. The visible appearance is unchanged
+    // but pdf.js can extract spans → click-to-edit works directly.
+    //
+    // Apple Vision's bbox is normalised [0..1] with origin at the IMAGE's
+    // bottom-left; PDF page origin is also bottom-left, so the coords map
+    // cleanly onto where the image was drawn. If OCR fails, swallow and
+    // continue — the image page is still useful even without a text layer.
+    try {
+      const ocrBoxes = await runOcrOnImageBytes(bytes);
+      if (ocrBoxes.length > 0) {
+        const { StandardFonts } = await import("pdf-lib");
+        const helv = await doc.embedFont(StandardFonts.Helvetica);
+        for (const box of ocrBoxes) {
+          const text = box.text;
+          if (!text || !text.trim()) continue;
+          // Confidence < 0.3 is usually noise / artifacts.
+          if (box.confidence < 0.3) continue;
+          const textX = imageX + box.x * w;
+          const textY = imageY + box.y * h;
+          const textBoxH = box.h * h;
+          if (textBoxH < 1) continue;
+          // Font size ~85% of the bbox height — leaves room for descenders.
+          const fontSize = Math.max(2, textBoxH * 0.85);
+          page.drawText(text, {
+            x: textX,
+            y: textY,
+            size: fontSize,
+            font: helv,
+            opacity: 0, // hidden — pdf.js still extracts the spans.
+          });
+        }
+      }
+    } catch (err) {
+      console.warn(
+        "[addImagePage] auto-OCR failed; page added without text layer:",
+        err instanceof Error ? err.message : err,
+      );
+    }
   };
   const appendMergeInput = async (outDoc: import("pdf-lib").PDFDocument, input: string) => {
     const ext = extensionOf(input);
@@ -2847,6 +3019,17 @@ async function runCli(args: string[]): Promise<number> {
     return 0;
   }
 
+  if (op === "doc-to-pdf") {
+    const [input, output] = rest;
+    if (!input || !output) return fail("doc-to-pdf <in-doc> <out.pdf>");
+    const ext = extensionOf(input);
+    if (!DOC_LIKE_EXTENSIONS.has(ext)) {
+      return fail(`doc-to-pdf: unsupported extension .${ext}`);
+    }
+    await convertDocFileToPdf(input, output);
+    return 0;
+  }
+
   if (op === "decrypt") {
     const [input, output, passwordArg] = rest;
     if (!input || !output || !passwordArg) return fail("decrypt <in> <out> <password|->");
@@ -3059,7 +3242,7 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
       void dialog.showMessageBox(target, {
         type: "warning",
         message: "WeavePDF rejected an unsafe file path",
-        detail: `One or more paths were outside your normal document folders or pointed at sensitive system locations. WeavePDF only acts on PDFs and images in places like Desktop, Documents, Downloads, iCloud Drive, and external volumes.\n\nRejected:\n${rejected.slice(0, 5).join("\n")}${rejected.length > 5 ? `\n…and ${rejected.length - 5} more` : ""}`,
+        detail: `One or more paths were outside your normal document folders or pointed at sensitive system locations. WeavePDF only acts on PDFs, images, and Word/RTF/TXT documents in places like Desktop, Documents, Downloads, iCloud Drive, and external volumes.\n\nRejected:\n${rejected.slice(0, 5).join("\n")}${rejected.length > 5 ? `\n…and ${rejected.length - 5} more` : ""}`,
         buttons: ["OK"],
       });
     }
@@ -3074,7 +3257,7 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
   }
 
   const runUnary = async (
-    cliVerb: string,
+    cliVerb: string | ((inputExt: string) => string),
     suffix: string,
     opts?: { extra?: string[]; forceOutputExt?: string; inPlace?: boolean; reveal?: boolean },
   ) => {
@@ -3086,23 +3269,24 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
       // (compress, extract-first, convert) produce <stem><suffix>.<ext> and
       // reveal it in Finder so the user can see something happened.
       const outPath = opts?.inPlace ? input : uniqueOutputPath(`${stem}${suffix}.${outExt}`);
-      logFinderSync(`  ${cliVerb}: ${input} → ${outPath}${opts?.inPlace ? " (in-place)" : ""}`);
+      const verbForFile = typeof cliVerb === "function" ? cliVerb(inputExt) : cliVerb;
+      logFinderSync(`  ${verbForFile}: ${input} → ${outPath}${opts?.inPlace ? " (in-place)" : ""}`);
       try {
-        const code = await runCli([cliVerb, input, outPath, ...(opts?.extra ?? [])]);
+        const code = await runCli([verbForFile, input, outPath, ...(opts?.extra ?? [])]);
         if (code !== 0) {
-          console.error(`[weavepdf://] ${cliVerb} failed on ${input} (exit ${code})`);
-          logFinderSync(`  ${cliVerb}: exit code ${code} (FAILED)`);
+          console.error(`[weavepdf://] ${verbForFile} failed on ${input} (exit ${code})`);
+          logFinderSync(`  ${verbForFile}: exit code ${code} (FAILED)`);
         } else if (existsSync(outPath)) {
-          logFinderSync(`  ${cliVerb}: wrote ${outPath} (ok)`);
+          logFinderSync(`  ${verbForFile}: wrote ${outPath} (ok)`);
           if (opts?.reveal) {
             shell.showItemInFolder(outPath);
           }
         } else {
-          logFinderSync(`  ${cliVerb}: exit 0 but ${outPath} doesn't exist (?!)`);
+          logFinderSync(`  ${verbForFile}: exit 0 but ${outPath} doesn't exist (?!)`);
         }
       } catch (err) {
-        console.error(`[weavepdf://] ${cliVerb} threw on ${input}:`, err);
-        logFinderSync(`  ${cliVerb}: threw — ${err instanceof Error ? err.message : String(err)}`);
+        console.error(`[weavepdf://] ${verbForFile} threw on ${input}:`, err);
+        logFinderSync(`  ${verbForFile}: threw — ${err instanceof Error ? err.message : String(err)}`);
       }
     }
   };
@@ -3137,8 +3321,15 @@ async function handleWeavePdfUrl(urlString: string): Promise<void> {
         break;
       case "convert":
         // V1.0030: same as extract-first — don't reveal. New PDF lands
-        // next to the source image with the user already in context.
-        await runUnary("image-to-pdf", "", { forceOutputExt: "pdf", reveal: false });
+        // next to the source file with the user already in context.
+        // V1.0092: doc-class extensions (doc/docx/rtf/txt/odt) go through
+        // the textutil + printToPDF pipeline; images stay on the original
+        // pdf-lib path.
+        await runUnary(
+          (ext) => (DOC_LIKE_EXTENSIONS.has(ext) ? "doc-to-pdf" : "image-to-pdf"),
+          "",
+          { forceOutputExt: "pdf", reveal: false },
+        );
         break;
       case "combine": {
         if (paths.length < 2) {
@@ -3245,6 +3436,13 @@ if (isCliMode) {
   setTimeout(() => {
     const hasFiles = pendingOpenFiles.length > 0;
     const hasWindows = BrowserWindow.getAllWindows().length > 0;
+    if (hasFiles && !hasWindows) {
+      // Cold macOS file-open events arrive before app readiness. The file is
+      // safely queued at that point; once ready, create the window that will
+      // drain the queue after the renderer registers its open-file listener.
+      createMainWindow();
+      return;
+    }
     if (!hadQueuedUrls && !hasFiles && !hasWindows) {
       // Bare launch — foreground + show the main window.
       createMainWindow();
@@ -3277,6 +3475,9 @@ app.on("window-all-closed", () => {
 // so the per-window close handlers skip their own confirmation) or cancel.
 app.on("before-quit", (event) => {
   if (appQuittingApproved) return;
+  // V1.0066: same rationale as the per-window close handler — let
+  // Playwright's `app.close()` tear down without blocking on a modal.
+  if (import.meta.env.VITE_E2E === "1") return;
   const allDirty: string[] = [];
   for (const win of BrowserWindow.getAllWindows()) {
     const list = dirtyTabsByWindowId.get(win.id) ?? [];

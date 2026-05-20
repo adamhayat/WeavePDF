@@ -1,10 +1,14 @@
 import { useEffect, useState } from "react";
-import { FileClock, FilePlus2, Upload } from "lucide-react";
+import { FileClock, FilePlus2, Plus, Upload } from "lucide-react";
 import { useUIStore } from "../../stores/ui";
 
-type Props = { onOpen: () => void };
+type Props = {
+  onOpen: () => void;
+  /** V1.0056: optional secondary action — create a blank PDF in a new tab. */
+  onCreateBlank?: () => void;
+};
 
-export function DropZone({ onOpen }: Props) {
+export function DropZone({ onOpen, onCreateBlank }: Props) {
   const openRecentDrafts = useUIStore((s) => s.openRecentDrafts);
   const [draftCount, setDraftCount] = useState(0);
 
@@ -49,6 +53,20 @@ export function DropZone({ onOpen }: Props) {
           </span>
         </div>
       </button>
+      {onCreateBlank && (
+        <button
+          type="button"
+          onClick={onCreateBlank}
+          className="inline-flex items-center gap-2 rounded-lg border border-[var(--panel-border)] bg-[var(--panel-bg-raised)] px-3 py-1.5 text-[12px] text-[var(--app-fg)] hover:border-[var(--color-accent)] hover:text-[var(--color-accent)]"
+          data-testid="create-blank-cta"
+        >
+          <Plus className="h-3.5 w-3.5" strokeWidth={1.8} />
+          Create blank PDF
+          <span className="ml-1 rounded bg-[var(--panel-bg)] px-1.5 py-0.5 text-[10px] tracking-wide text-[var(--muted)]">
+            ⌘N
+          </span>
+        </button>
+      )}
       {draftCount > 0 && (
         <button
           type="button"

@@ -2,17 +2,25 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
 import { useDocumentStore, type PendingShapeEdit } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
+import { resolveCrossPageTopLeft } from "../../lib/cross-page-drag";
 
 type Props = {
   pageNumber: number;
   zoom: number;
   pageHeightPx: number;
+  /** V1.0068: page dims in PDF points. With the global Margins toggle,
+   *  drag-move clamps so the shape's bounding box stays inside the
+   *  printable rectangle. */
+  pageWidthPt: number;
+  pageHeightPt: number;
 };
 
 const MIN_SIZE_PT = 8;
+const PAGE_MARGIN_PT = 36;
 
-export function PendingShapeLayer({ pageNumber, zoom, pageHeightPx }: Props) {
+export function PendingShapeLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt, pageHeightPt }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
+  const marginsEnabled = useUIStore((s) => s.marginsEnabled);
   if (!activeTab) return null;
   const shapes = activeTab.pendingShapeEdits.filter((e) => e.page === pageNumber);
   if (shapes.length === 0) return null;
@@ -25,6 +33,9 @@ export function PendingShapeLayer({ pageNumber, zoom, pageHeightPx }: Props) {
           zoom={zoom}
           pageHeightPx={pageHeightPx}
           tabId={activeTab.id}
+          pageWidthPt={pageWidthPt}
+          pageHeightPt={pageHeightPt}
+          marginsEnabled={marginsEnabled}
         />
       ))}
     </>
@@ -36,6 +47,9 @@ type ShapeProps = {
   zoom: number;
   pageHeightPx: number;
   tabId: string;
+  pageWidthPt: number;
+  pageHeightPt: number;
+  marginsEnabled: boolean;
 };
 
 function PendingShape(props: ShapeProps) {
@@ -61,9 +75,10 @@ function PendingShape(props: ShapeProps) {
 
 type BoxKind = Extract<PendingShapeEdit, { kind: "rect" | "ellipse" | "highlight" | "whiteout" | "redact" }>;
 
-function BoxShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: BoxKind }) {
+function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: BoxKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
+  const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
   const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
 
@@ -72,6 +87,7 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: Bo
   const widthPx = shape.widthPt * zoom;
   const heightPx = shape.heightPt * zoom;
 
+  const addPendingShapeEdit = useDocumentStore((s) => s.addPendingShapeEdit);
   const dragState = useRef<{
     mode: "move" | "nw" | "ne" | "sw" | "se";
     startClientX: number;
@@ -80,36 +96,61 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: Bo
     startYPt: number;
     startWPt: number;
     startHPt: number;
+    currentPage: number;
+    pointerOffsetXPx: number;
+    pointerOffsetYPx: number;
+    /** V1.0070: option-drag clone target. */
+    dragShapeId: string;
+    cleanup?: () => void;
   } | null>(null);
 
-  const startDrag = useCallback(
-    (e: React.PointerEvent<HTMLElement>, mode: "move" | "nw" | "ne" | "sw" | "se") => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      dragState.current = {
-        mode,
-        startClientX: e.clientX,
-        startClientY: e.clientY,
-        startXPt: shape.xPt,
-        startYPt: shape.yPt,
-        startWPt: shape.widthPt,
-        startHPt: shape.heightPt,
-      };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      setSelectedId(shape.id);
-    },
-    [shape.xPt, shape.yPt, shape.widthPt, shape.heightPt, shape.id, setSelectedId],
-  );
+  const finishDrag = useCallback((pointerId?: number, captureTarget?: HTMLElement | null) => {
+    const s = dragState.current;
+    if (!s) return;
+    s.cleanup?.();
+    dragState.current = null;
+    if (pointerId != null && captureTarget) {
+      try {
+        captureTarget.releasePointerCapture(pointerId);
+      } catch {
+        /* already released */
+      }
+    }
+  }, []);
 
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
+  const applyPointerMove = useCallback(
+    (clientX: number, clientY: number, shiftKey: boolean) => {
       const s = dragState.current;
       if (!s) return;
-      const dxPt = (e.clientX - s.startClientX) / zoom;
-      const dyPt = (e.clientY - s.startClientY) / zoom;
+      const dxPt = (clientX - s.startClientX) / zoom;
+      const dyPt = (clientY - s.startClientY) / zoom;
       if (s.mode === "move") {
-        updateShape(tabId, shape.id, { xPt: s.startXPt + dxPt, yPt: s.startYPt - dyPt });
+        const target = resolveCrossPageTopLeft({
+          currentPage: s.currentPage,
+          clientX,
+          clientY,
+          zoom,
+          pointerOffsetXPx: s.pointerOffsetXPx,
+          pointerOffsetYPx: s.pointerOffsetYPx,
+          widthPt: s.startWPt,
+          heightPt: s.startHPt,
+          marginsEnabled,
+        });
+        let newX = s.startXPt + dxPt;
+        let newY = s.startYPt - dyPt;
+        let nextPage = s.currentPage;
+        if (target) {
+          newX = target.xPt;
+          newY = target.yPt;
+          nextPage = target.page;
+        } else {
+          const m = marginsEnabled ? PAGE_MARGIN_PT : 0;
+          newX = Math.max(m, Math.min(pageWidthPt - m - s.startWPt, newX));
+          newY = Math.max(m, Math.min(pageHeightPt - m - s.startHPt, newY));
+        }
+        s.currentPage = nextPage;
+        // V1.0070: option-drag targets the clone via dragShapeId.
+        updateShape(tabId, s.dragShapeId, { page: nextPage, xPt: newX, yPt: newY });
         return;
       }
       let newX = s.startXPt;
@@ -127,27 +168,144 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: Bo
         newW = s.startWPt + dxPt;
         newY = s.startYPt - dyPt; newH = s.startHPt + dyPt;
       }
+      // V1.0057: Shift locks aspect ratio. Mirrors PendingImageLayer's
+      // V1.0023 behavior — pick whichever delta is larger (width or height),
+      // then derive the other from the start ratio so corners scale
+      // proportionally. The anchor (opposite corner) stays put, so we
+      // recompute `newX` / `newY` from the resolved size.
+      if (shiftKey) {
+        const aspect = s.startWPt / s.startHPt;
+        const wScale = newW / s.startWPt;
+        const hScale = newH / s.startHPt;
+        if (Math.abs(wScale - 1) > Math.abs(hScale - 1)) {
+          newH = newW / aspect;
+        } else {
+          newW = newH * aspect;
+        }
+        // Re-pin so the dragged corner moves; the opposite corner stays.
+        if (s.mode === "nw") {
+          newX = s.startXPt + (s.startWPt - newW);
+          newY = s.startYPt;
+        } else if (s.mode === "ne") {
+          newX = s.startXPt;
+          newY = s.startYPt;
+        } else if (s.mode === "sw") {
+          newX = s.startXPt + (s.startWPt - newW);
+          newY = s.startYPt - (newH - s.startHPt);
+        } else if (s.mode === "se") {
+          newX = s.startXPt;
+          newY = s.startYPt - (newH - s.startHPt);
+        }
+      }
       if (newW < MIN_SIZE_PT || newH < MIN_SIZE_PT) return;
       updateShape(tabId, shape.id, { xPt: newX, yPt: newY, widthPt: newW, heightPt: newH });
     },
-    [zoom, updateShape, tabId, shape.id],
+    [zoom, updateShape, tabId, shape.id, marginsEnabled, pageWidthPt, pageHeightPt],
+  );
+
+  const startDrag = useCallback(
+    (e: React.PointerEvent<HTMLElement>, mode: "move" | "nw" | "ne" | "sw" | "se") => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      pushUndoStep(tabId);
+      let dragShapeId = shape.id;
+      if (mode === "move" && e.altKey) {
+        const { id: _unused, ...rest } = shape;
+        void _unused;
+        dragShapeId = addPendingShapeEdit(tabId, rest);
+        setSelectedId(dragShapeId);
+      } else {
+        setSelectedId(shape.id);
+      }
+      const target = e.currentTarget as HTMLElement;
+      const rect = target.getBoundingClientRect();
+      const handleWindowMove = (ev: PointerEvent) => {
+        if (!dragState.current) return;
+        ev.preventDefault();
+        applyPointerMove(ev.clientX, ev.clientY, ev.shiftKey);
+      };
+      const handleWindowUp = (ev: PointerEvent) => finishDrag(ev.pointerId, target);
+      if (mode === "move") {
+        window.addEventListener("pointermove", handleWindowMove, { capture: true });
+        window.addEventListener("pointerup", handleWindowUp, { capture: true, once: true });
+        window.addEventListener("pointercancel", handleWindowUp, { capture: true, once: true });
+      }
+      dragState.current = {
+        mode,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startXPt: shape.xPt,
+        startYPt: shape.yPt,
+        startWPt: shape.widthPt,
+        startHPt: shape.heightPt,
+        currentPage: shape.page,
+        pointerOffsetXPx: e.clientX - rect.left,
+        pointerOffsetYPx: e.clientY - rect.top,
+        dragShapeId,
+        cleanup: () => {
+          window.removeEventListener("pointermove", handleWindowMove, true);
+          window.removeEventListener("pointerup", handleWindowUp, true);
+          window.removeEventListener("pointercancel", handleWindowUp, true);
+        },
+      };
+      target.setPointerCapture(e.pointerId);
+    },
+    [shape, setSelectedId, pushUndoStep, tabId, addPendingShapeEdit, applyPointerMove, finishDrag],
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      applyPointerMove(e.clientX, e.clientY, e.shiftKey);
+    },
+    [applyPointerMove],
   );
 
   const onPointerUp = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (!dragState.current) return;
-    dragState.current = null;
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {
-      /* already released */
-    }
-  }, []);
+    finishDrag(e.pointerId, e.currentTarget as HTMLElement);
+  }, [finishDrag]);
 
   useShapeKeyboard(selected, shape.id, tabId, {
     onNudge: (dx, dy) => updateShape(tabId, shape.id, { xPt: shape.xPt + dx, yPt: shape.yPt + dy }),
     onDelete: () => { removeShape(tabId, shape.id); setSelectedId(null); },
     onEscape: () => setSelectedId(null),
   });
+
+  const openLinkForShape = useCallback((clientX: number, clientY: number) => {
+    useUIStore.getState().setPendingLink({
+      page: shape.page,
+      rect: { x: shape.xPt, y: shape.yPt, width: shape.widthPt, height: shape.heightPt },
+      screenX: clientX,
+      screenY: clientY,
+    });
+  }, [shape.page, shape.xPt, shape.yPt, shape.widthPt, shape.heightPt]);
+
+  const onContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setSelectedId(shape.id);
+    useUIStore.getState().openContextMenu(e.clientX, e.clientY, [
+      ...(shape.kind === "highlight"
+        ? [
+            {
+              kind: "item" as const,
+              label: "Add link…",
+              onClick: () => openLinkForShape(e.clientX, e.clientY),
+            },
+            { kind: "separator" as const },
+          ]
+        : []),
+      {
+        kind: "item",
+        label: "Delete",
+        danger: true,
+        onClick: () => {
+          removeShape(tabId, shape.id);
+          setSelectedId(null);
+        },
+      },
+    ]);
+  }, [openLinkForShape, removeShape, setSelectedId, shape.id, shape.kind, tabId]);
 
   // Visual style by kind.
   const fill =
@@ -170,9 +328,11 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: Bo
       data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
+      data-page-number={shape.page}
       onPointerDown={(e) => { e.stopPropagation(); setSelectedId(shape.id); startDrag(e, "move"); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onContextMenu={onContextMenu}
     >
       <div
         className={
@@ -204,9 +364,10 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: Bo
 
 type LineKind = Extract<PendingShapeEdit, { kind: "line" | "arrow" }>;
 
-function LineShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: LineKind }) {
+function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: LineKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
+  const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
   const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
 
@@ -235,36 +396,65 @@ function LineShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: L
     startFromY: number;
     startToX: number;
     startToY: number;
+    currentPage: number;
+    pointerOffsetXPx: number;
+    pointerOffsetYPx: number;
+    startBoxLeftPt: number;
+    startBoxTopYPt: number;
+    startBoxWidthPt: number;
+    startBoxHeightPt: number;
+    cleanup?: () => void;
   } | null>(null);
 
-  const startDrag = useCallback(
-    (e: React.PointerEvent<HTMLElement>, mode: "move" | "from" | "to") => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      dragState.current = {
-        mode,
-        startClientX: e.clientX,
-        startClientY: e.clientY,
-        startFromX: shape.fromX, startFromY: shape.fromY,
-        startToX: shape.toX, startToY: shape.toY,
-      };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      setSelectedId(shape.id);
-    },
-    [shape.fromX, shape.fromY, shape.toX, shape.toY, shape.id, setSelectedId],
-  );
+  const finishDrag = useCallback((pointerId?: number, captureTarget?: HTMLElement | null) => {
+    const s = dragState.current;
+    if (!s) return;
+    s.cleanup?.();
+    dragState.current = null;
+    if (pointerId != null && captureTarget) {
+      try { captureTarget.releasePointerCapture(pointerId); } catch { /* already released */ }
+    }
+  }, []);
 
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
+  const applyPointerMove = useCallback(
+    (clientX: number, clientY: number) => {
       const s = dragState.current;
       if (!s) return;
-      const dxPt = (e.clientX - s.startClientX) / zoom;
-      const dyPt = (e.clientY - s.startClientY) / zoom;
+      const dxPt = (clientX - s.startClientX) / zoom;
+      const dyPt = (clientY - s.startClientY) / zoom;
       if (s.mode === "move") {
+        let txX = dxPt, txY = -dyPt;
+        let nextPage = s.currentPage;
+        const target = resolveCrossPageTopLeft({
+          currentPage: s.currentPage,
+          clientX,
+          clientY,
+          zoom,
+          pointerOffsetXPx: s.pointerOffsetXPx,
+          pointerOffsetYPx: s.pointerOffsetYPx,
+          widthPt: s.startBoxWidthPt,
+          heightPt: s.startBoxHeightPt,
+          marginsEnabled,
+        });
+        if (target) {
+          txX = target.xPt - s.startBoxLeftPt;
+          txY = (target.pageHeightPt - target.topPt) - s.startBoxTopYPt;
+          nextPage = target.page;
+        } else {
+          // V1.0069: always clamp to the page-edge or margin rectangle.
+          const m = marginsEnabled ? PAGE_MARGIN_PT : 0;
+          const minX = Math.min(s.startFromX, s.startToX);
+          const maxX = Math.max(s.startFromX, s.startToX);
+          const minY = Math.min(s.startFromY, s.startToY);
+          const maxY = Math.max(s.startFromY, s.startToY);
+          txX = Math.max(m - minX, Math.min(pageWidthPt - m - maxX, txX));
+          txY = Math.max(m - minY, Math.min(pageHeightPt - m - maxY, txY));
+        }
+        s.currentPage = nextPage;
         updateShape(tabId, shape.id, {
-          fromX: s.startFromX + dxPt, fromY: s.startFromY - dyPt,
-          toX: s.startToX + dxPt, toY: s.startToY - dyPt,
+          page: nextPage,
+          fromX: s.startFromX + txX, fromY: s.startFromY + txY,
+          toX: s.startToX + txX, toY: s.startToY + txY,
         });
       } else if (s.mode === "from") {
         updateShape(tabId, shape.id, {
@@ -276,14 +466,84 @@ function LineShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: L
         });
       }
     },
-    [zoom, updateShape, tabId, shape.id],
+    [zoom, updateShape, tabId, shape.id, marginsEnabled, pageWidthPt, pageHeightPt],
+  );
+
+  const startDrag = useCallback(
+    (e: React.PointerEvent<HTMLElement>, mode: "move" | "from" | "to") => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      pushUndoStep(tabId);
+      const target = e.currentTarget as HTMLElement;
+      const rect = target.getBoundingClientRect();
+      const boxLeftPt = minX - padPt;
+      const boxTopYPt = maxY + padPt;
+      const boxWidthPt = maxX - minX + padPt * 2;
+      const boxHeightPt = maxY - minY + padPt * 2;
+      const handleWindowMove = (ev: PointerEvent) => {
+        if (!dragState.current) return;
+        ev.preventDefault();
+        applyPointerMove(ev.clientX, ev.clientY);
+      };
+      const handleWindowUp = (ev: PointerEvent) => finishDrag(ev.pointerId, target);
+      if (mode === "move") {
+        window.addEventListener("pointermove", handleWindowMove, { capture: true });
+        window.addEventListener("pointerup", handleWindowUp, { capture: true, once: true });
+        window.addEventListener("pointercancel", handleWindowUp, { capture: true, once: true });
+      }
+      dragState.current = {
+        mode,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startFromX: shape.fromX, startFromY: shape.fromY,
+        startToX: shape.toX, startToY: shape.toY,
+        currentPage: shape.page,
+        pointerOffsetXPx: e.clientX - rect.left,
+        pointerOffsetYPx: e.clientY - rect.top,
+        startBoxLeftPt: boxLeftPt,
+        startBoxTopYPt: boxTopYPt,
+        startBoxWidthPt: boxWidthPt,
+        startBoxHeightPt: boxHeightPt,
+        cleanup: () => {
+          window.removeEventListener("pointermove", handleWindowMove, true);
+          window.removeEventListener("pointerup", handleWindowUp, true);
+          window.removeEventListener("pointercancel", handleWindowUp, true);
+        },
+      };
+      target.setPointerCapture(e.pointerId);
+      setSelectedId(shape.id);
+    },
+    [
+      shape.fromX,
+      shape.fromY,
+      shape.toX,
+      shape.toY,
+      shape.page,
+      shape.id,
+      minX,
+      maxX,
+      minY,
+      maxY,
+      padPt,
+      setSelectedId,
+      pushUndoStep,
+      tabId,
+      applyPointerMove,
+      finishDrag,
+    ],
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      applyPointerMove(e.clientX, e.clientY);
+    },
+    [applyPointerMove],
   );
 
   const onPointerUp = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (!dragState.current) return;
-    dragState.current = null;
-    try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* */ }
-  }, []);
+    finishDrag(e.pointerId, e.currentTarget as HTMLElement);
+  }, [finishDrag]);
 
   useShapeKeyboard(selected, shape.id, tabId, {
     onNudge: (dx, dy) => updateShape(tabId, shape.id, {
@@ -305,6 +565,7 @@ function LineShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: L
       data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
+      data-page-number={shape.page}
       onPointerDown={(e) => { e.stopPropagation(); setSelectedId(shape.id); startDrag(e, "move"); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -375,9 +636,10 @@ function LineShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: L
 
 type FreehandKind = Extract<PendingShapeEdit, { kind: "freehand" }>;
 
-function FreehandShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: FreehandKind }) {
+function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: FreehandKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
+  const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
   const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
 
@@ -408,42 +670,139 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shap
     startClientX: number;
     startClientY: number;
     startPoints: Array<{ x: number; y: number }>;
+    currentPage: number;
+    pointerOffsetXPx: number;
+    pointerOffsetYPx: number;
+    startBoxLeftPt: number;
+    startBoxTopYPt: number;
+    startBoxWidthPt: number;
+    startBoxHeightPt: number;
+    cleanup?: () => void;
   } | null>(null);
+
+  const finishDrag = useCallback((pointerId?: number, captureTarget?: HTMLElement | null) => {
+    const s = dragState.current;
+    if (!s) return;
+    s.cleanup?.();
+    dragState.current = null;
+    if (pointerId != null && captureTarget) {
+      try { captureTarget.releasePointerCapture(pointerId); } catch { /* already released */ }
+    }
+  }, []);
+
+  const applyPointerMove = useCallback(
+    (clientX: number, clientY: number) => {
+      const s = dragState.current;
+      if (!s) return;
+      const dxPt = (clientX - s.startClientX) / zoom;
+      const dyPt = (clientY - s.startClientY) / zoom;
+      let txX = dxPt, txY = -dyPt;
+      let nextPage = s.currentPage;
+      const target = resolveCrossPageTopLeft({
+        currentPage: s.currentPage,
+        clientX,
+        clientY,
+        zoom,
+        pointerOffsetXPx: s.pointerOffsetXPx,
+        pointerOffsetYPx: s.pointerOffsetYPx,
+        widthPt: s.startBoxWidthPt,
+        heightPt: s.startBoxHeightPt,
+        marginsEnabled,
+      });
+      if (target) {
+        txX = target.xPt - s.startBoxLeftPt;
+        txY = (target.pageHeightPt - target.topPt) - s.startBoxTopYPt;
+        nextPage = target.page;
+      } else if (s.startPoints.length > 0) {
+        // V1.0069: always clamp to the page-edge or margin rectangle.
+        const m = marginsEnabled ? PAGE_MARGIN_PT : 0;
+        let mnX = Infinity, mxX = -Infinity, mnY = Infinity, mxY = -Infinity;
+        for (const p of s.startPoints) {
+          if (p.x < mnX) mnX = p.x;
+          if (p.x > mxX) mxX = p.x;
+          if (p.y < mnY) mnY = p.y;
+          if (p.y > mxY) mxY = p.y;
+        }
+        txX = Math.max(m - mnX, Math.min(pageWidthPt - m - mxX, txX));
+        txY = Math.max(m - mnY, Math.min(pageHeightPt - m - mxY, txY));
+      }
+      s.currentPage = nextPage;
+      updateShape(tabId, shape.id, {
+        page: nextPage,
+        points: s.startPoints.map((p) => ({ x: p.x + txX, y: p.y + txY })),
+      });
+    },
+    [zoom, updateShape, tabId, shape.id, marginsEnabled, pageWidthPt, pageHeightPt],
+  );
 
   const startDrag = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       if (e.button !== 0) return;
       e.preventDefault();
       e.stopPropagation();
+      pushUndoStep(tabId);
+      const target = e.currentTarget as HTMLElement;
+      const rect = target.getBoundingClientRect();
+      const boxLeftPt = minX - padPt;
+      const boxTopYPt = maxY + padPt;
+      const boxWidthPt = maxX - minX + padPt * 2;
+      const boxHeightPt = maxY - minY + padPt * 2;
+      const handleWindowMove = (ev: PointerEvent) => {
+        if (!dragState.current) return;
+        ev.preventDefault();
+        applyPointerMove(ev.clientX, ev.clientY);
+      };
+      const handleWindowUp = (ev: PointerEvent) => finishDrag(ev.pointerId, target);
+      window.addEventListener("pointermove", handleWindowMove, { capture: true });
+      window.addEventListener("pointerup", handleWindowUp, { capture: true, once: true });
+      window.addEventListener("pointercancel", handleWindowUp, { capture: true, once: true });
       dragState.current = {
         startClientX: e.clientX,
         startClientY: e.clientY,
         startPoints: shape.points.map((p) => ({ ...p })),
+        currentPage: shape.page,
+        pointerOffsetXPx: e.clientX - rect.left,
+        pointerOffsetYPx: e.clientY - rect.top,
+        startBoxLeftPt: boxLeftPt,
+        startBoxTopYPt: boxTopYPt,
+        startBoxWidthPt: boxWidthPt,
+        startBoxHeightPt: boxHeightPt,
+        cleanup: () => {
+          window.removeEventListener("pointermove", handleWindowMove, true);
+          window.removeEventListener("pointerup", handleWindowUp, true);
+          window.removeEventListener("pointercancel", handleWindowUp, true);
+        },
       };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      target.setPointerCapture(e.pointerId);
       setSelectedId(shape.id);
     },
-    [shape.points, shape.id, setSelectedId],
+    [
+      shape.points,
+      shape.page,
+      shape.id,
+      minX,
+      maxX,
+      minY,
+      maxY,
+      padPt,
+      setSelectedId,
+      pushUndoStep,
+      tabId,
+      applyPointerMove,
+      finishDrag,
+    ],
   );
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
-      const s = dragState.current;
-      if (!s) return;
-      const dxPt = (e.clientX - s.startClientX) / zoom;
-      const dyPt = (e.clientY - s.startClientY) / zoom;
-      updateShape(tabId, shape.id, {
-        points: s.startPoints.map((p) => ({ x: p.x + dxPt, y: p.y - dyPt })),
-      });
+      applyPointerMove(e.clientX, e.clientY);
     },
-    [zoom, updateShape, tabId, shape.id],
+    [applyPointerMove],
   );
 
   const onPointerUp = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (!dragState.current) return;
-    dragState.current = null;
-    try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* */ }
-  }, []);
+    finishDrag(e.pointerId, e.currentTarget as HTMLElement);
+  }, [finishDrag]);
 
   useShapeKeyboard(selected, shape.id, tabId, {
     onNudge: (dx, dy) => updateShape(tabId, shape.id, {
@@ -464,6 +823,7 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shap
       data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
+      data-page-number={shape.page}
       onPointerDown={startDrag}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -488,9 +848,10 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shap
 
 type StickyKind = Extract<PendingShapeEdit, { kind: "sticky" }>;
 
-function StickyShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape: StickyKind }) {
+function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: StickyKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
+  const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
   const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
   const [editing, setEditing] = useState(false);
@@ -512,42 +873,103 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape:
     startClientY: number;
     startXPt: number;
     startYPt: number;
+    currentPage: number;
+    pointerOffsetXPx: number;
+    pointerOffsetYPx: number;
+    cleanup?: () => void;
   } | null>(null);
+
+  const finishDrag = useCallback((pointerId?: number, captureTarget?: HTMLElement | null) => {
+    const s = dragState.current;
+    if (!s) return;
+    s.cleanup?.();
+    dragState.current = null;
+    if (pointerId != null && captureTarget) {
+      try { captureTarget.releasePointerCapture(pointerId); } catch { /* already released */ }
+    }
+  }, []);
+
+  const applyPointerMove = useCallback(
+    (clientX: number, clientY: number) => {
+      const s = dragState.current;
+      if (!s) return;
+      const target = resolveCrossPageTopLeft({
+        currentPage: s.currentPage,
+        clientX,
+        clientY,
+        zoom,
+        pointerOffsetXPx: s.pointerOffsetXPx,
+        pointerOffsetYPx: s.pointerOffsetYPx,
+        widthPt: MARKER_W,
+        heightPt: MARKER_H,
+        marginsEnabled,
+      });
+      let newX = s.startXPt + (clientX - s.startClientX) / zoom;
+      let newY = s.startYPt - (clientY - s.startClientY) / zoom;
+      let nextPage = s.currentPage;
+      if (target) {
+        newX = target.xPt;
+        newY = target.yPt;
+        nextPage = target.page;
+      } else {
+        // V1.0069: always clamp to the page-edge or margin rectangle.
+        const m = marginsEnabled ? PAGE_MARGIN_PT : 0;
+        newX = Math.max(m, Math.min(pageWidthPt - m - MARKER_W, newX));
+        newY = Math.max(m, Math.min(pageHeightPt - m - MARKER_H, newY));
+      }
+      s.currentPage = nextPage;
+      updateShape(tabId, shape.id, { page: nextPage, xPt: newX, yPt: newY });
+    },
+    [zoom, updateShape, tabId, shape.id, marginsEnabled, pageWidthPt, pageHeightPt],
+  );
 
   const startDrag = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
       if (e.button !== 0 || editing) return;
       e.preventDefault();
       e.stopPropagation();
+      pushUndoStep(tabId);
+      const target = e.currentTarget as HTMLElement;
+      const rect = target.getBoundingClientRect();
+      const handleWindowMove = (ev: PointerEvent) => {
+        if (!dragState.current) return;
+        ev.preventDefault();
+        applyPointerMove(ev.clientX, ev.clientY);
+      };
+      const handleWindowUp = (ev: PointerEvent) => finishDrag(ev.pointerId, target);
+      window.addEventListener("pointermove", handleWindowMove, { capture: true });
+      window.addEventListener("pointerup", handleWindowUp, { capture: true, once: true });
+      window.addEventListener("pointercancel", handleWindowUp, { capture: true, once: true });
       dragState.current = {
         startClientX: e.clientX,
         startClientY: e.clientY,
         startXPt: shape.xPt,
         startYPt: shape.yPt,
+        currentPage: shape.page,
+        pointerOffsetXPx: e.clientX - rect.left,
+        pointerOffsetYPx: e.clientY - rect.top,
+        cleanup: () => {
+          window.removeEventListener("pointermove", handleWindowMove, true);
+          window.removeEventListener("pointerup", handleWindowUp, true);
+          window.removeEventListener("pointercancel", handleWindowUp, true);
+        },
       };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
+      target.setPointerCapture(e.pointerId);
       setSelectedId(shape.id);
     },
-    [shape.xPt, shape.yPt, shape.id, setSelectedId, editing],
+    [shape.xPt, shape.yPt, shape.page, shape.id, setSelectedId, editing, pushUndoStep, tabId, applyPointerMove, finishDrag],
   );
 
   const onPointerMove = useCallback(
     (e: React.PointerEvent<HTMLElement>) => {
-      const s = dragState.current;
-      if (!s) return;
-      updateShape(tabId, shape.id, {
-        xPt: s.startXPt + (e.clientX - s.startClientX) / zoom,
-        yPt: s.startYPt - (e.clientY - s.startClientY) / zoom,
-      });
+      applyPointerMove(e.clientX, e.clientY);
     },
-    [zoom, updateShape, tabId, shape.id],
+    [applyPointerMove],
   );
 
   const onPointerUp = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (!dragState.current) return;
-    dragState.current = null;
-    try { (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId); } catch { /* */ }
-  }, []);
+    finishDrag(e.pointerId, e.currentTarget as HTMLElement);
+  }, [finishDrag]);
 
   useShapeKeyboard(selected && !editing, shape.id, tabId, {
     onNudge: (dx, dy) => updateShape(tabId, shape.id, { xPt: shape.xPt + dx, yPt: shape.yPt + dy }),
@@ -563,6 +985,7 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId }: ShapeProps & { shape:
       data-pending-element="shape"
       data-shape-kind="sticky"
       data-shape-id={shape.id}
+      data-page-number={shape.page}
       onPointerDown={startDrag}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
@@ -688,13 +1111,14 @@ function DeleteChip({
 function useShapeKeyboard(
   active: boolean,
   _shapeId: string,
-  _tabId: string,
+  tabId: string,
   handlers: {
     onNudge: (dx: number, dy: number) => void;
     onDelete: () => void;
     onEscape: () => void;
   },
 ) {
+  const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
@@ -703,14 +1127,14 @@ function useShapeKeyboard(
         return;
       }
       const step = e.shiftKey ? 10 : 1;
-      if (e.key === "ArrowUp") { e.preventDefault(); handlers.onNudge(0, step); }
-      else if (e.key === "ArrowDown") { e.preventDefault(); handlers.onNudge(0, -step); }
-      else if (e.key === "ArrowLeft") { e.preventDefault(); handlers.onNudge(-step, 0); }
-      else if (e.key === "ArrowRight") { e.preventDefault(); handlers.onNudge(step, 0); }
+      if (e.key === "ArrowUp") { e.preventDefault(); pushUndoStep(tabId); handlers.onNudge(0, step); }
+      else if (e.key === "ArrowDown") { e.preventDefault(); pushUndoStep(tabId); handlers.onNudge(0, -step); }
+      else if (e.key === "ArrowLeft") { e.preventDefault(); pushUndoStep(tabId); handlers.onNudge(-step, 0); }
+      else if (e.key === "ArrowRight") { e.preventDefault(); pushUndoStep(tabId); handlers.onNudge(step, 0); }
       else if (e.key === "Backspace" || e.key === "Delete") { e.preventDefault(); handlers.onDelete(); }
       else if (e.key === "Escape") handlers.onEscape();
     };
     window.addEventListener("keydown", onKey, { capture: true });
     return () => window.removeEventListener("keydown", onKey, { capture: true });
-  }, [active, handlers]);
+  }, [active, handlers, pushUndoStep, tabId]);
 }

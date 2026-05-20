@@ -56,15 +56,16 @@ export function Titlebar({ onOpen, onSave, onExport }: Props) {
         </button>
       </ShortcutTooltip>
 
-      <div
-        className={cn(
-          "flex min-w-0 flex-1 items-center gap-1 overflow-x-auto acr-scroll px-1",
-          // When tabs exist we suppress drag so horizontal scroll + tab clicks
-          // work. With no tabs the area is a plain title-bar gap and should
-          // drag the window — inherit drag from the parent header.
-          hasDocs && "no-drag",
-        )}
-      >
+      {/* V1.0103: pre-V1.0103 the whole tab-strip container had `no-drag`
+          when any tab was open — meant the empty space NEXT to / BETWEEN
+          tabs (which looks like draggable titlebar) didn't drag the
+          window. Particularly noticeable with one short tab and a wide
+          window. Now: container stays draggable (inherits `drag` from the
+          parent header); each tab button + close X is the only `no-drag`
+          surface so clicks still work. Horizontal trackpad scroll inside
+          a drag region works fine; scrollbar-drag is a rare path for
+          tabs and stays as the trade-off. */}
+      <div className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto acr-scroll px-1">
         {tabs.map((t, idx) => (
           <button
             key={t.id}
@@ -81,7 +82,7 @@ export function Titlebar({ onOpen, onSave, onExport }: Props) {
               ]);
             }}
             className={cn(
-              "group flex h-7 min-w-[140px] max-w-[240px] shrink-0 items-center gap-2 rounded-md border px-2.5 text-[13px] transition-colors",
+              "no-drag group flex h-7 min-w-[140px] max-w-[240px] shrink-0 items-center gap-2 rounded-md border px-2.5 text-[13px] transition-colors",
               t.id === activeTabId
                 ? "border-[var(--panel-border-strong)] bg-[var(--panel-bg-raised)] text-[var(--app-fg)]"
                 : "border-transparent text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]",
@@ -108,7 +109,7 @@ export function Titlebar({ onOpen, onSave, onExport }: Props) {
                 closeTab(t.id);
               }}
               className={cn(
-                "ml-auto inline-flex h-4 w-4 shrink-0 items-center justify-center rounded opacity-0 transition-opacity",
+                "no-drag ml-auto inline-flex h-4 w-4 shrink-0 items-center justify-center rounded opacity-0 transition-opacity",
                 "hover:bg-[var(--active-bg)]",
                 "group-hover:opacity-100",
                 t.id === activeTabId && "opacity-70",

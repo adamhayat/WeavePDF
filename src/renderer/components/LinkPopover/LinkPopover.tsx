@@ -27,7 +27,7 @@ export function LinkPopover() {
   useEffect(() => {
     if (pendingLink) {
       setTab("url");
-      setUrl("");
+      setUrl(pendingLink.suggestedUrl ?? "");
       setError(null);
       setPageNumber(Math.min(activeTab?.numPages ?? 1, pendingLink.page + 1));
     }

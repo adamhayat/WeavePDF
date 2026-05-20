@@ -8,10 +8,13 @@ import { StickyPromptOverlay } from "./StickyPromptOverlay";
 import { PendingTextLayer } from "./PendingTextLayer";
 import { PendingImageLayer } from "./PendingImageLayer";
 import { PendingShapeLayer } from "./PendingShapeLayer";
+import { CropOverlay } from "./CropOverlay";
 import { AcroFormLayer } from "./AcroFormLayer";
 import { SearchHighlightLayer } from "./SearchHighlightLayer";
 import { bytesToBlob } from "../../../shared/buffers";
 import type { OcrBox } from "../../../shared/ipc";
+
+const MIN_WRAP_TEXT_WIDTH_PT = 120;
 
 // V1.0052: OCR results cached per (tab × edit-version × page). Survives
 // PageCanvas remounts within a session — multiple page components share one
@@ -46,6 +49,10 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
   const tool = useUIStore((s) => s.tool);
   const setTool = useUIStore((s) => s.setTool);
   const setTextPrompt = useUIStore((s) => s.setTextPrompt);
+  // V1.0063: when on, draw a dashed gray rectangle at 36pt from each edge
+  // so the user can see exactly where the printable area is. Also drives
+  // the click-snap-to-margin logic in the Text-tool click handler below.
+  const marginsEnabled = useUIStore((s) => s.marginsEnabled);
   const addPendingTextEdit = useDocumentStore((s) => s.addPendingTextEdit);
   const [dragBox, setDragBox] = useState<{ x: number; y: number; w: number; h: number } | null>(null);
   const dragStart = useRef<{ x: number; y: number } | null>(null);
@@ -176,7 +183,34 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
     const pdfYFromBottom = pageSize.h - clickY / zoom;
 
     if (tool === "text") {
-      setTextPrompt({ page: pageNumber, x: pdfX, y: pdfYFromBottom });
+      // V1.0062: width = available space from click X to the active right
+      // boundary (page right margin when marginsEnabled, page edge otherwise).
+      // Min width keeps the box usable even if user clicks very near the right.
+      // V1.0063: also snap the click point INTO the printable area when
+      // margins are on, so the text-box top-left lands inside the guide
+      // rectangle rather than hovering in the margin gutter.
+      const PAGE_MARGIN = 36;
+      const marginsEnabled = useUIStore.getState().marginsEnabled;
+      const rightBound = marginsEnabled ? pageSize.w - PAGE_MARGIN : pageSize.w;
+      // Snap. PDF Y is bottom-left origin and yPt is the baseline; the
+      // text's visible top sits at `yPt + size`. We don't know `size` yet
+      // (chosen in the TextPromptOverlay), so guard with the default 14pt.
+      const ESTIMATED_SIZE = 14;
+      let snappedX = pdfX;
+      let snappedY = pdfYFromBottom;
+      if (marginsEnabled) {
+        const MIN_W = MIN_WRAP_TEXT_WIDTH_PT;
+        snappedX = Math.min(
+          Math.max(PAGE_MARGIN, pdfX),
+          pageSize.w - PAGE_MARGIN - MIN_W,
+        );
+        snappedY = Math.min(
+          Math.max(PAGE_MARGIN, pdfYFromBottom),
+          pageSize.h - PAGE_MARGIN - ESTIMATED_SIZE,
+        );
+      }
+      const widthPt = Math.max(MIN_WRAP_TEXT_WIDTH_PT, rightBound - snappedX);
+      setTextPrompt({ page: pageNumber, x: snappedX, y: snappedY, widthPt });
       setTool("none");
       return;
     }
@@ -500,6 +534,11 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
   // click, and seed a pending text edit using OCR's text + position + size.
   // Same whiteout-and-retype flow as the text-layer path — just a different
   // source for the original-text rectangle.
+  //
+  // V1.0097: no blocking "Run OCR?" prompt. The user already asked to edit
+  // text by clicking the page; OCR is local-only and is the only useful next
+  // step for image-only PDFs, especially older Weave-created screenshot PDFs
+  // that predate the V1.0096 hidden text layer.
   const runOcrFallback = async (e: React.MouseEvent<HTMLDivElement>) => {
     if (!pageSize || !containerRef.current || !canvasRef.current) return;
     const activeTab = useDocumentStore.getState().activeTab();
@@ -509,30 +548,28 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
     if (ocrInFlight.has(cacheKey)) return;
     let boxes = ocrCache.get(cacheKey);
     if (!boxes) {
-      const ok = window.confirm(
-        "No editable text on this page.\n\nRun OCR to make scanned text editable? (~2s)",
-      );
-      if (!ok) return;
       const ocrAvailable = await window.weavepdf.ocr.available();
       if (!ocrAvailable) {
-        alert(
+        useUIStore.getState().showToast(
           "OCR helper isn't built. Reinstall WeavePDF to enable scanned-text editing.",
+          "warn",
         );
         return;
       }
+      useUIStore.getState().showToast("Reading scanned text…");
       ocrInFlight.add(cacheKey);
       try {
         const blob = await new Promise<Blob | null>((res) =>
           canvasRef.current!.toBlob((b) => res(b), "image/png"),
         );
         if (!blob) {
-          alert("Couldn't read this page's image.");
+          useUIStore.getState().showToast("Couldn't read this page's image.", "warn");
           return;
         }
         const pngBytes = await blob.arrayBuffer();
         boxes = await window.weavepdf.ocr.runImage(pngBytes);
         if (boxes.length === 0) {
-          alert("No text detected on this page.");
+          useUIStore.getState().showToast("No text detected on this page.", "warn");
           return;
         }
         ocrCache.set(cacheKey, boxes);
@@ -575,7 +612,7 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         }
       }
       if (!chosen || bestDist > 0.0025) {
-        alert("No text near that point. Click closer to visible text.");
+        useUIStore.getState().showToast("No text near that point. Click closer to visible text.", "warn");
         return;
       }
     }
@@ -623,14 +660,47 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
   // size, and stage a PendingTextEdit that will whiteout the original
   // region and draw the user's new text in its place.
   const onTextLayerClick = async (e: React.MouseEvent<HTMLDivElement>) => {
-    if (tool !== "editText" || !pageSize) return;
+    // V1.0090: drop the `tool === "editText"` gate. Adam: "I want PDFs
+    // to save extra data to make them fully editable in Weave once
+    // saved" — his real ask is that any text in the doc is click-to-
+    // edit without tool switching. The Edit Text tool button still
+    // works (it preselects the cursor + leaves the tool active for
+    // multi-click sessions); but clicking on a glyph with no tool
+    // active now also promotes it to a pending text edit. Only block
+    // when another DRAWING tool (rect/whiteout/etc.) is active so we
+    // don't fight the drawing gesture, OR when a text-creation prompt
+    // is already mounted (the Text tool's click sets the prompt then
+    // resets tool to "none"; the subsequent click handler must not
+    // also promote a baked span).
+    if (!pageSize) return;
     if (!containerRef.current) return;
+    if (useUIStore.getState().textPrompt) return;
+    const blockingTools = new Set<typeof tool>([
+      "highlight",
+      "whiteout",
+      "rect",
+      "circle",
+      "line",
+      "arrow",
+      "draw",
+      "image",
+      "sticky",
+      "crop",
+      "redact",
+      "link",
+      "measure",
+      "text",
+      "signature",
+    ]);
+    if (blockingTools.has(tool)) return;
     const span = (e.target as HTMLElement).closest("span") as HTMLElement | null;
     if (!span) {
       // V1.0052: image-only page → run OCR and pick the box nearest the click.
       // Only fires when pdf.js has zero text spans on this page, so a misclick
       // between paragraphs on a normal text-PDF stays a no-op (matches
-      // pre-V1.0052 behavior).
+      // pre-V1.0052 behavior). Pre-V1.0090 this OCR fallback was gated
+      // to the Edit Text tool; same gate-removal applies — clicking on
+      // an image-only page with no active drawing tool also promotes.
       const layerHasText = textLayerRef.current?.querySelector("span") != null;
       if (layerHasText) return;
       e.preventDefault();
@@ -760,14 +830,35 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         // Fallback: text.
         const text = await navigator.clipboard.readText();
         if (text?.trim()) {
+          // V1.0062 + V1.0063: pasted text matches Text-tool placement
+          // (margin-aware width, click-snap when margins are on).
+          const PAGE_MARGIN = 36;
+          const marginsEnabled = useUIStore.getState().marginsEnabled;
+          const rightBound = marginsEnabled ? pageSize.w - PAGE_MARGIN : pageSize.w;
+          const PASTE_SIZE = 12;
+          let snappedX = pdfX;
+          let snappedY = pdfYFromBottom;
+          if (marginsEnabled) {
+            const MIN_W = MIN_WRAP_TEXT_WIDTH_PT;
+            snappedX = Math.min(
+              Math.max(PAGE_MARGIN, pdfX),
+              pageSize.w - PAGE_MARGIN - MIN_W,
+            );
+            snappedY = Math.min(
+              Math.max(PAGE_MARGIN, pdfYFromBottom),
+              pageSize.h - PAGE_MARGIN - PASTE_SIZE,
+            );
+          }
+          const widthPt = Math.max(MIN_WRAP_TEXT_WIDTH_PT, rightBound - snappedX);
           useDocumentStore.getState().addPendingTextEdit(
             useDocumentStore.getState().activeTab()!.id,
             {
               page: pageNumber,
-              xPt: pdfX,
-              yPt: pdfYFromBottom,
-              size: 12,
+              xPt: snappedX,
+              yPt: snappedY,
+              size: PASTE_SIZE,
               text: text.trim(),
+              widthPt,
             },
           );
         }
@@ -846,7 +937,25 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         kind: "item",
         label: "Add text here",
         onClick: () => {
-          setTextPrompt({ page: pageNumber, x: pdfX, y: pdfYFromBottom });
+          const PAGE_MARGIN = 36;
+          const marginsEnabled = useUIStore.getState().marginsEnabled;
+          const rightBound = marginsEnabled ? pageSize.w - PAGE_MARGIN : pageSize.w;
+          const ESTIMATED_SIZE = 14;
+          let snappedX = pdfX;
+          let snappedY = pdfYFromBottom;
+          if (marginsEnabled) {
+            const MIN_W = MIN_WRAP_TEXT_WIDTH_PT;
+            snappedX = Math.min(
+              Math.max(PAGE_MARGIN, pdfX),
+              pageSize.w - PAGE_MARGIN - MIN_W,
+            );
+            snappedY = Math.min(
+              Math.max(PAGE_MARGIN, pdfYFromBottom),
+              pageSize.h - PAGE_MARGIN - ESTIMATED_SIZE,
+            );
+          }
+          const widthPt = Math.max(MIN_WRAP_TEXT_WIDTH_PT, rightBound - snappedX);
+          setTextPrompt({ page: pageNumber, x: snappedX, y: snappedY, widthPt });
           setTool("text");
         },
       },
@@ -899,7 +1008,9 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         background: painted ? "#fff" : "transparent",
         boxShadow: painted ? "var(--page-shadow)" : "none",
       }}
-      onClick={tool === "editText" ? onTextLayerClick : undefined}
+      // V1.0090: text-layer click is always-on (gated by `onTextLayerClick`
+      // itself, which short-circuits when a drawing tool is active).
+      onClick={onTextLayerClick}
       onContextMenu={onContextMenu}
     >
       <canvas
@@ -908,12 +1019,31 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         className="rounded-[var(--radius-page)]"
       />
       <div ref={textLayerRef} className="textLayer" aria-hidden={false} />
+      {/* V1.0063: margin guides — dashed gray rectangle 36pt inside each
+          page edge. Only when margins mode is on AND the page has actually
+          painted (avoids drawing a tiny guide on an empty 0×0 wrapper while
+          pdf.js is still resolving dims). pointer-events: none so it
+          doesn't block clicks or selection. */}
+      {marginsEnabled && painted && dims && (
+        <div
+          aria-hidden
+          data-testid="margin-guide"
+          style={{
+            position: "absolute",
+            inset: `${36 * zoom}px`,
+            border: "1px dashed rgba(120, 120, 120, 0.4)",
+            borderRadius: 2,
+            pointerEvents: "none",
+          }}
+        />
+      )}
       {pageSize && (
         <AcroFormLayer
           pdf={pdf}
           pageNumber={pageNumber}
           zoom={zoom}
           pageHeightPt={pageSize.h}
+          editTextMode={tool === "editText"}
         />
       )}
       {toolActive && (
@@ -990,16 +1120,22 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
             pageNumber={pageNumber}
             zoom={zoom}
             pageHeightPx={dims.h}
+            pageWidthPt={pageSize?.w ?? 612}
+            pageHeightPt={pageSize?.h ?? 792}
           />
           <PendingImageLayer
             pageNumber={pageNumber}
             zoom={zoom}
             pageHeightPx={dims.h}
+            pageWidthPt={pageSize?.w ?? 612}
+            pageHeightPt={pageSize?.h ?? 792}
           />
           <PendingShapeLayer
             pageNumber={pageNumber}
             zoom={zoom}
             pageHeightPx={dims.h}
+            pageWidthPt={pageSize?.w ?? 612}
+            pageHeightPt={pageSize?.h ?? 792}
           />
           <TextPromptOverlay
             pageNumber={pageNumber}
@@ -1010,6 +1146,13 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
             pageNumber={pageNumber}
             zoom={zoom}
             pageHeightPx={dims.h}
+          />
+          <CropOverlay
+            pageNumber={pageNumber}
+            zoom={zoom}
+            pageHeightPx={dims.h}
+            pageWidthPt={pageSize?.w ?? 612}
+            pageHeightPt={pageSize?.h ?? 792}
           />
         </>
       )}

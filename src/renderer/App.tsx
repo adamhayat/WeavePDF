@@ -13,6 +13,7 @@ import { Titlebar } from "./components/Titlebar/Titlebar";
 import { Toolstrip } from "./components/Toolstrip/Toolstrip";
 import { Sidebar } from "./components/Sidebar/Sidebar";
 import { Viewer } from "./components/Viewer/Viewer";
+import { CropActionBar } from "./components/Viewer/CropActionBar";
 import { DropZone } from "./components/DropZone/DropZone";
 import { SearchBar } from "./components/Search/SearchBar";
 import { CommandPalette, type PaletteAction } from "./components/CommandPalette/CommandPalette";
@@ -41,9 +42,6 @@ const WatermarkModal = lazy(() =>
 );
 const ExtractModal = lazy(() =>
   import("./components/ExtractModal/ExtractModal").then((m) => ({ default: m.ExtractModal })),
-);
-const CropModal = lazy(() =>
-  import("./components/CropModal/CropModal").then((m) => ({ default: m.CropModal })),
 );
 const HeaderFooterModal = lazy(() =>
   import("./components/HeaderFooterModal/HeaderFooterModal").then((m) => ({
@@ -134,6 +132,123 @@ function tabHasPendingEdits(tab: {
   );
 }
 
+function resolvePasteTarget(zoom: number, fallbackPage: number): {
+  page: number;
+  pageWidthPt: number;
+  pageHeightPt: number;
+  xPt: number;
+  yPt: number;
+} | null {
+  return resolvePagePointTarget({
+    zoom,
+    fallbackPage,
+    clientX: window.innerWidth / 2,
+    clientY: window.innerHeight / 2,
+    nearest: true,
+  });
+}
+
+function resolvePagePointTarget({
+  zoom,
+  fallbackPage,
+  clientX,
+  clientY,
+  nearest,
+  maxDistancePx,
+}: {
+  zoom: number;
+  fallbackPage: number;
+  clientX: number;
+  clientY: number;
+  nearest: boolean;
+  maxDistancePx?: number;
+}): {
+  page: number;
+  pageWidthPt: number;
+  pageHeightPt: number;
+  xPt: number;
+  yPt: number;
+} | null {
+  const pages = Array.from(document.querySelectorAll<HTMLElement>("[data-page]"))
+    .map((el) => {
+      const page = Number(el.dataset.page ?? el.getAttribute("data-page"));
+      const rect = el.getBoundingClientRect();
+      if (!Number.isFinite(page) || rect.width <= 0 || rect.height <= 0) return null;
+      return { page, rect };
+    })
+    .filter((p): p is { page: number; rect: DOMRect } => p != null);
+  if (pages.length === 0 || zoom <= 0) return null;
+
+  let best = pages.find((p) =>
+    clientY >= p.rect.top &&
+    clientY <= p.rect.bottom &&
+    clientX >= p.rect.left &&
+    clientX <= p.rect.right,
+  );
+  if (!best && nearest) {
+    const nearestPage = pages
+      .map((p) => {
+        const cx = Math.max(p.rect.left, Math.min(p.rect.right, clientX));
+        const cy = Math.max(p.rect.top, Math.min(p.rect.bottom, clientY));
+        return { ...p, d: Math.hypot(cx - clientX, cy - clientY) };
+      })
+      .sort((a, b) => a.d - b.d)[0];
+    if (!maxDistancePx || nearestPage.d <= maxDistancePx) best = nearestPage;
+  }
+  if (!best) return null;
+  const targetX = Math.max(best.rect.left, Math.min(best.rect.right, clientX));
+  const targetY = Math.max(best.rect.top, Math.min(best.rect.bottom, clientY));
+  return {
+    page: best.page || fallbackPage,
+    pageWidthPt: best.rect.width / zoom,
+    pageHeightPt: best.rect.height / zoom,
+    xPt: (targetX - best.rect.left) / zoom,
+    yPt: (best.rect.bottom - targetY) / zoom,
+  };
+}
+
+const IMAGE_DROP_EXTS = ["png", "jpg", "jpeg", "heic", "heif"] as const;
+type ImageDropExt = (typeof IMAGE_DROP_EXTS)[number];
+
+function isImageDropExt(ext: string): ext is ImageDropExt {
+  return IMAGE_DROP_EXTS.includes(ext as ImageDropExt);
+}
+
+async function imageBytesForPending(bytes: Uint8Array, ext: ImageDropExt): Promise<{
+  bytes: Uint8Array;
+  mime: "image/png" | "image/jpeg";
+  naturalWidth: number;
+  naturalHeight: number;
+}> {
+  const isJpeg = ext === "jpg" || ext === "jpeg";
+  let imageBytes = bytes;
+  let mime: "image/png" | "image/jpeg" = isJpeg ? "image/jpeg" : "image/png";
+  if (ext === "heic" || ext === "heif") {
+    const { decodeImageToPng } = await loadPdfOps();
+    imageBytes = await decodeImageToPng(bytesToBlob(bytes, "application/octet-stream"));
+    mime = "image/png";
+  }
+
+  const blob = bytesToBlob(imageBytes, mime);
+  const url = URL.createObjectURL(blob);
+  const img = new Image();
+  try {
+    await new Promise<void>((resolve, reject) => {
+      img.onload = () => resolve();
+      img.onerror = () => reject(new Error("Image decode failed"));
+      img.src = url;
+    });
+    return {
+      bytes: imageBytes,
+      mime,
+      naturalWidth: img.naturalWidth,
+      naturalHeight: img.naturalHeight,
+    };
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
 function isEditableShortcutTarget(target: EventTarget | null): boolean {
   const el =
     target instanceof HTMLElement
@@ -149,12 +264,17 @@ function isEditableShortcutTarget(target: EventTarget | null): boolean {
 // localStorage key that tracks whether the user has dismissed the first-launch
 // onboarding modal. Set on close (any path), checked on App mount.
 const WELCOME_FLAG = "weavepdf-welcomed";
+const MIN_WRAP_TEXT_WIDTH_PT = 120;
 
 export function App() {
   useTheme();
 
   const tabs = useDocumentStore((s) => s.tabs);
   const addTab = useDocumentStore((s) => s.addTab);
+  const restorePendingTextEdits = useDocumentStore((s) => s.restorePendingTextEdits);
+  const restorePendingImageEdits = useDocumentStore((s) => s.restorePendingImageEdits);
+  const restorePendingShapeEdits = useDocumentStore((s) => s.restorePendingShapeEdits);
+  const showToast = useUIStore((s) => s.showToast);
   const addBlankTab = useDocumentStore((s) => s.addBlankTab);
   const activeTab = useDocumentStore((s) => s.activeTab());
   const setCurrentPage = useDocumentStore((s) => s.setCurrentPage);
@@ -189,9 +309,10 @@ export function App() {
   const extractOpen = useUIStore((s) => s.extractOpen);
   const openExtract = useUIStore((s) => s.openExtract);
   const closeExtract = useUIStore((s) => s.closeExtract);
-  const cropOpen = useUIStore((s) => s.cropOpen);
+  // V1.0087: Crop is now a draggable tool mode (CropOverlay + CropActionBar).
+  // `cropOpen` and `closeCrop` are no longer read here; `openCrop` still
+  // enters the tool via palette / menu / hotkey "C".
   const openCrop = useUIStore((s) => s.openCrop);
-  const closeCrop = useUIStore((s) => s.closeCrop);
   const headerFooterOpen = useUIStore((s) => s.headerFooterOpen);
   const openHeaderFooter = useUIStore((s) => s.openHeaderFooter);
   const closeHeaderFooter = useUIStore((s) => s.closeHeaderFooter);
@@ -262,6 +383,11 @@ export function App() {
   // imperceptible to the user; freeing that work during boot is measurable.
   useEffect(() => {
     if (localStorage.getItem(WELCOME_FLAG)) return;
+    // V1.0068: skip the auto-open in E2E builds so Playwright's first
+    // interaction doesn't race against a 150 ms-delayed modal that
+    // intercepts pointer events. Same VITE_E2E gate the close-dialog
+    // and test hook installer use.
+    if (import.meta.env.VITE_E2E === "1") return;
     type IdleWin = Window & {
       requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => number;
       cancelIdleCallback?: (id: number) => void;
@@ -438,7 +564,7 @@ export function App() {
         wasDecrypted = true;
         pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
       }
-      addTab({
+      const newTabId = addTab({
         name: payload.name,
         // Decrypted files drop the original path so ⌘S routes to Save-As —
         // prevents overwriting the encrypted original with an unencrypted copy.
@@ -448,8 +574,92 @@ export function App() {
         pdf,
         numPages: pdf.numPages,
       });
+      // V1.0072: round-trip editability. If this PDF was saved by
+      // WeavePDF, it has overlay metadata stashed in its Info dict.
+      // Restore each text overlay as a pending edit; the saved
+      // `whiteout` field covers the previously-baked content so the
+      // editable overlay floats on top instead of stacking visually.
+      try {
+        const { extractWeaveMetadata, detectWeaveCanaryWithoutMetadata } = await loadPdfOps();
+        const meta = await extractWeaveMetadata(bytes);
+        if (!meta) {
+          // V1.0091: Acrobat-strip detection. If our metadata is gone
+          // but the /Keywords canary is still there, this file was
+          // saved by WeavePDF in the past and a third-party tool
+          // (Acrobat's "Optimize PDF", PDF/A converters, command-line
+          // flatteners) stripped our custom Info-dict key. Toast a
+          // non-modal warning so Adam doesn't wonder why his overlays
+          // disappeared.
+          const stripped = await detectWeaveCanaryWithoutMetadata(bytes);
+          if (stripped) {
+            showToast(
+              "WeavePDF editable layer was stripped by another app — overlays baked into the page",
+              "warn",
+            );
+          }
+        }
+        if (meta) {
+          if (meta.textEdits.length > 0) {
+            restorePendingTextEdits(
+              newTabId,
+              meta.textEdits.map((e) => ({
+                page: e.page,
+                xPt: e.xPt,
+                yPt: e.yPt,
+                size: e.size,
+                text: e.text,
+                widthPt: e.widthPt,
+                bold: e.bold,
+                italic: e.italic,
+                align: e.align,
+                fontName: e.fontName,
+                whiteout: e.whiteout,
+              })),
+            );
+          }
+          if (meta.imageEdits.length > 0) {
+            restorePendingImageEdits(
+              newTabId,
+              meta.imageEdits.map((e) => ({
+                page: e.page,
+                xPt: e.xPt,
+                yPt: e.yPt,
+                widthPt: e.widthPt,
+                heightPt: e.heightPt,
+                mime: e.mime,
+                bytes: base64ToUint8Array(e.dataBase64),
+                // V1.0091: carry the V1.0090 image-format options +
+                // V1.0091 layer styles through to the runtime state so
+                // a restored image renders + bakes exactly as it did
+                // before save.
+                rotation: e.rotation,
+                opacity: e.opacity,
+                flipH: e.flipH,
+                flipV: e.flipV,
+                border: e.border,
+                dropShadow: e.dropShadow,
+              })),
+            );
+          }
+          if (meta.shapeEdits.length > 0) {
+            restorePendingShapeEdits(newTabId, meta.shapeEdits);
+          }
+          const n = meta.textEdits.length + meta.imageEdits.length + meta.shapeEdits.length;
+          if (n > 0) {
+          // V1.0077: visible confirmation so the user knows the round-trip
+          // fired. The previous V1.0072 wiring had no UI feedback; a file
+          // saved before V1.0072 (or by a tool that strips Info-dict keys)
+          // would silently open with everything baked-only, leaving the
+          // user wondering whether the feature was working.
+            showToast(`Restored ${n} editable WeavePDF element${n === 1 ? "" : "s"}`);
+          }
+        }
+      } catch {
+        // Metadata extraction is best-effort. A malformed payload should
+        // never block the file from opening — just skip the restore.
+      }
     },
-    [addTab, openTabFromDraft],
+    [addTab, openTabFromDraft, restorePendingImageEdits, restorePendingShapeEdits, restorePendingTextEdits, showToast],
   );
 
   const handleRestoreFromList = useCallback(
@@ -552,6 +762,35 @@ export function App() {
     }
   }, [loadAsTab]);
 
+  // V1.0056: "New Blank PDF" (⌘N) — produce a fresh single-page Letter PDF
+  // via pdf-lib and load it as a path-less tab. Save routes to Save-As
+  // automatically because path:null + saveInPlace:false. The untitled
+  // name auto-increments ("Untitled.pdf" → "Untitled 2.pdf" → …) by
+  // scanning existing tab names so multiple new docs don't collide.
+  const newBlankPdfTab = useCallback(async () => {
+    const used = new Set<number>();
+    for (const t of useDocumentStore.getState().tabs) {
+      const m = t.name.match(/^Untitled(?: (\d+))?\.pdf$/);
+      if (!m) continue;
+      used.add(m[1] ? parseInt(m[1], 10) : 1);
+    }
+    let n = 1;
+    while (used.has(n)) n++;
+    const name = n === 1 ? "Untitled.pdf" : `Untitled ${n}.pdf`;
+    try {
+      const ops = await loadPdfOps();
+      const bytes = await ops.createBlankPdf();
+      await loadAsTab({
+        name,
+        path: null,
+        sizeBytes: bytes.byteLength,
+        bytes,
+      });
+    } catch (err) {
+      alert(`Couldn't create blank PDF: ${(err as Error).message ?? err}`);
+    }
+  }, [loadAsTab]);
+
   // V1.0053: pulled out of saveCurrent so we can save a SPECIFIC tab by id
   // (not just the active one). The unsaved-changes dialog's Save / Save All
   // path needs this to iterate dirty tabs without flipping the active tab
@@ -563,8 +802,13 @@ export function App() {
       const tab0 = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
       // Tab gone or empty — count as a no-op success so the close path proceeds.
       if (!tab0?.bytes) return true;
-      // Bake any floating text edits into the PDF before writing to disk.
-      await commitAllPending(tabId);
+      // Bake any newly-edited floating elements into the PDF before writing
+      // to disk. A freshly opened WeavePDF file can restore editable overlays
+      // from metadata while staying clean; those bytes already contain the
+      // baked visual content, so re-saving unchanged should not duplicate it.
+      if (tab0.dirty && tabHasPendingEdits(tab0)) {
+        await commitAllPending(tabId);
+      }
       const refreshed = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
       if (!refreshed?.bytes) return true;
       let targetPath = refreshed.path;
@@ -655,7 +899,7 @@ export function App() {
     // Export should match save/print output, so commit any floating overlays
     // before merging tabs together.
     for (const t of tabs) {
-      if (tabHasPendingEdits(t)) {
+      if (t.dirty && tabHasPendingEdits(t)) {
         await commitAllPending(t.id);
       }
     }
@@ -823,7 +1067,6 @@ export function App() {
     metadataOpen ||
     watermarkOpen ||
     extractOpen ||
-    cropOpen ||
     headerFooterOpen ||
     formFillOpen ||
     batchOpen ||
@@ -1036,7 +1279,9 @@ export function App() {
       setTool("none");
     }
   });
-  useHotkeys("mod+b", (e) => {
+  // V1.0061: sidebar shortcut is ⇧⌘B. Adam's pick — close to text Bold's
+  // ⌘B for memorability. See main.ts for the full remap history.
+  useHotkeys("shift+mod+b", (e) => {
     e.preventDefault();
     toggleSidebar();
   });
@@ -1091,7 +1336,7 @@ export function App() {
 
   // File paths the OS hands us (double-click PDF, Open With, drag on Dock icon).
   useEffect(() => {
-    return window.weavepdf.onOpenFilePath(async (filePath) => {
+    const dispose = window.weavepdf.onOpenFilePath(async (filePath) => {
       try {
         // V1.0027: if this file is ALREADY open in a tab, switch to it
         // instead of re-opening. Re-opening reloads the file from disk
@@ -1135,6 +1380,8 @@ export function App() {
         alert(`Couldn't open file: ${(err as Error).message ?? err}`);
       }
     });
+    window.weavepdf.notifyOpenFileListenerReady();
+    return dispose;
   }, [loadAsTab]);
 
   // Bridge the macOS application menu clicks to renderer actions. Read fresh
@@ -1181,6 +1428,7 @@ export function App() {
         case "showWelcome": openWelcome(); break;
         case "showWelcomeFinder": openWelcome(1); break;
         case "newTab": addBlankTab(); break;
+        case "newBlankPdf": void newBlankPdfTab(); break;
         case "closeTab": {
           // V1.0030: ⌘W closes the active tab. If it was the last tab,
           // close the BrowserWindow too (matches Chrome / Safari).
@@ -1211,8 +1459,8 @@ export function App() {
     openWelcome, addBlankTab,
   ]);
 
-  // Clipboard paste: drop a text string or image at the centre of the
-  // current page as a draggable/resizable pending edit.
+  // Clipboard paste: drop a text string or image where the viewer is looking
+  // (viewport center on the visible page) as a draggable/resizable pending edit.
   useEffect(() => {
     const onPaste = async (e: ClipboardEvent) => {
       // Don't hijack paste inside inputs, textareas, or contentEditable fields.
@@ -1251,16 +1499,22 @@ export function App() {
         });
         URL.revokeObjectURL(url);
 
-        const page = await activeTab.pdf.getPage(activeTab.currentPage);
+        const target = resolvePasteTarget(activeTab.zoom, activeTab.currentPage);
+        const pageNumber = target?.page ?? activeTab.currentPage;
+        const page = await activeTab.pdf.getPage(pageNumber);
         const vp = page.getViewport({ scale: 1 });
-        const maxW = Math.min(240, vp.width * 0.5);
+        const pageWidth = target?.pageWidthPt ?? vp.width;
+        const pageHeight = target?.pageHeightPt ?? vp.height;
+        const centerX = target?.xPt ?? pageWidth / 2;
+        const centerY = target?.yPt ?? pageHeight / 2;
+        const maxW = Math.min(240, pageWidth * 0.5);
         const w = Math.min(maxW, img.naturalWidth);
         const h = w * (img.naturalHeight / img.naturalWidth);
 
         addPendingImageEdit(activeTab.id, {
-          page: activeTab.currentPage,
-          xPt: (vp.width - w) / 2,
-          yPt: (vp.height - h) / 2,
+          page: pageNumber,
+          xPt: Math.max(0, Math.min(pageWidth - w, centerX - w / 2)),
+          yPt: Math.max(0, Math.min(pageHeight - h, centerY - h / 2)),
           widthPt: w,
           heightPt: h,
           bytes,
@@ -1272,15 +1526,18 @@ export function App() {
       const text = cd.getData("text/plain");
       if (text && text.trim()) {
         e.preventDefault();
-        const page = await activeTab.pdf.getPage(activeTab.currentPage);
+        const target = resolvePasteTarget(activeTab.zoom, activeTab.currentPage);
+        const pageNumber = target?.page ?? activeTab.currentPage;
+        const page = await activeTab.pdf.getPage(pageNumber);
         const vp = page.getViewport({ scale: 1 });
         const size = 12;
         addPendingTextEdit(activeTab.id, {
-          page: activeTab.currentPage,
-          xPt: 72, // 1" left margin
-          yPt: vp.height - 72 - size, // 1" top margin, baseline
+          page: pageNumber,
+          xPt: Math.max(0, Math.min(vp.width - MIN_WRAP_TEXT_WIDTH_PT, target?.xPt ?? 72)),
+          yPt: Math.max(size, Math.min(vp.height - size, target?.yPt ?? vp.height - 72 - size)),
           size,
           text: text.trim(),
+          widthPt: Math.max(MIN_WRAP_TEXT_WIDTH_PT, vp.width - (target?.xPt ?? 72) - 36),
         });
       }
     };
@@ -1297,6 +1554,7 @@ export function App() {
       e.preventDefault();
       if (!e.dataTransfer) return;
       const files = Array.from(e.dataTransfer.files);
+      let placedImageCount = 0;
       for (const f of files) {
         const filePath = window.weavepdf.getPathForFile(f);
         if (!filePath) continue;
@@ -1311,7 +1569,39 @@ export function App() {
               sizeBytes: file.sizeBytes,
               bytes,
             });
-          } else if (["png", "jpg", "jpeg", "heic", "heif"].includes(ext)) {
+          } else if (isImageDropExt(ext)) {
+            const tab = useDocumentStore.getState().activeTab();
+            const target =
+              tab?.pdf
+                ? resolvePagePointTarget({
+                  zoom: tab.zoom,
+                  fallbackPage: tab.currentPage,
+                  clientX: e.clientX,
+                  clientY: e.clientY,
+                  nearest: true,
+                  maxDistancePx: 96,
+                })
+                : null;
+            if (tab?.pdf && target) {
+              const image = await imageBytesForPending(bytes, ext);
+              const maxW = Math.min(240, target.pageWidthPt * 0.5);
+              const w = Math.min(maxW, image.naturalWidth);
+              const h = w * (image.naturalHeight / image.naturalWidth);
+              const offset = placedImageCount * 18;
+              const newId = useDocumentStore.getState().addPendingImageEdit(tab.id, {
+                page: target.page,
+                xPt: Math.max(0, Math.min(target.pageWidthPt - w, target.xPt - w / 2 + offset)),
+                yPt: Math.max(0, Math.min(target.pageHeightPt - h, target.yPt - h / 2 - offset)),
+                widthPt: w,
+                heightPt: h,
+                bytes: image.bytes,
+                mime: image.mime,
+              });
+              useUIStore.getState().setSelectedPendingImage(newId);
+              useUIStore.getState().setTool("none");
+              placedImageCount += 1;
+              continue;
+            }
             const pdfBytes = await convertImageBytesToPdf(bytes, ext);
             await loadAsTab({
               name: file.name.replace(/\.[^.]+$/, ".pdf"),
@@ -1345,6 +1635,7 @@ export function App() {
     const hasTab = !!activeTab;
     return [
       // File
+      { id: "new-blank-pdf", label: "New blank PDF", group: "File", shortcut: "⌘N", keywords: ["create", "blank", "empty", "untitled", "fresh"], run: newBlankPdfTab },
       { id: "open", label: "Open…", group: "File", shortcut: "⌘O", run: openFile },
       { id: "recent-drafts", label: "Recent drafts…", group: "File", shortcut: "⌘⌥R", keywords: ["history", "autosave", "resume", "draft", "revision"], run: openRecentDrafts },
       { id: "save", label: "Save", group: "File", shortcut: "⌘S", disabled: !hasTab, run: () => saveCurrent(false) },
@@ -1402,7 +1693,7 @@ export function App() {
       { id: "zoom-reset", label: "Zoom to 100%", group: "View", shortcut: "⌘0", disabled: !hasTab, run: () => activeTab && setZoom(activeTab.id, 1) },
     ];
   }, [
-    activeTab, tabs.length, openFile, saveCurrent, exportCombined,
+    activeTab, tabs.length, openFile, newBlankPdfTab, saveCurrent, exportCombined,
     setTool, openSignature, openMetadata, openWatermark, openExtract,
     openCrop, openHeaderFooter, openImagePicker, openFormFill, openBatch, openOcr,
     openDigitalSign, openAi, openRecentDrafts, openShortcutHelp, openWelcome, deleteSelected, rotateSelected, undo,
@@ -1436,10 +1727,12 @@ export function App() {
           // No tabs OR active tab is a blank ⌘T placeholder — show DropZone.
           // The blank tab keeps the title bar tab-strip visible, so the user
           // can still see + switch between other tabs.
-          <DropZone onOpen={openFile} />
+          <DropZone onOpen={openFile} onCreateBlank={newBlankPdfTab} />
         )}
       </div>
       <ContextMenuHost />
+      <ToastHost />
+      <CropActionBar />
       {/* Modals are conditionally mounted so their lazy bundles only load
           when the user actually opens them — keeps cold-launch parse work
           off the critical path. Each is wrapped in a single Suspense so
@@ -1450,7 +1743,8 @@ export function App() {
         {metadataOpen && <MetadataModal open={true} onClose={closeMetadata} />}
         {watermarkOpen && <WatermarkModal open={true} onClose={closeWatermark} />}
         {extractOpen && <ExtractModal open={true} onClose={closeExtract} />}
-        {cropOpen && <CropModal open={true} onClose={closeCrop} />}
+        {/* V1.0087: CropModal removed — Crop is now a draggable tool mode
+            (CropOverlay + CropActionBar mounted below). */}
         {headerFooterOpen && <HeaderFooterModal open={true} onClose={closeHeaderFooter} />}
         {formFillOpen && <FormFillModal open={true} onClose={closeFormFill} />}
         {batchOpen && <BatchModal open={true} onClose={closeBatch} />}
@@ -1562,6 +1856,43 @@ function ContextMenuHost() {
       items={menu?.items ?? []}
       onClose={close}
     />
+  );
+}
+
+// V1.0077: short-lived informational banner. Anchored bottom-center so it
+// doesn't fight the title bar or the toolstrip. Auto-dismisses 4s after
+// each new toast id; clicking the banner dismisses immediately. Currently
+// the only producer is `loadAsTab`'s round-trip metadata restore, which
+// uses the toast to make a previously-silent code path observable.
+function ToastHost() {
+  const toast = useUIStore((s) => s.toast);
+  const dismiss = useUIStore((s) => s.dismissToast);
+  useEffect(() => {
+    if (!toast) return;
+    const handle = window.setTimeout(() => dismiss(), 4000);
+    return () => window.clearTimeout(handle);
+  }, [toast?.id, dismiss]);
+  if (!toast) return null;
+  return (
+    <div
+      className="pointer-events-none fixed inset-x-0 bottom-6 z-[60] flex justify-center"
+      data-testid="toast-host"
+    >
+      <button
+        type="button"
+        onClick={dismiss}
+        className={
+          "pointer-events-auto rounded-full border px-3 py-1.5 text-[12px] shadow-lg backdrop-blur " +
+          (toast.tone === "warn"
+            ? "border-[var(--color-destructive)]/40 bg-[var(--panel-bg-raised)]/90 text-[var(--color-destructive)]"
+            : "border-[var(--color-accent)]/40 bg-[var(--panel-bg-raised)]/90 text-[var(--app-fg)]")
+        }
+        data-testid="toast"
+        data-toast-tone={toast.tone}
+      >
+        {toast.message}
+      </button>
+    </div>
   );
 }
 

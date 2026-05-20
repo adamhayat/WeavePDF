@@ -103,9 +103,17 @@ test("edit existing text whites out original text and exits on enter or blur", a
     await page.keyboard.press("Enter");
     await expect(input).toBeHidden();
     await expect(page.getByTestId("pending-text").filter({ hasText: "Edited WeavePDF text" })).toBeVisible();
-    await expect(page.getByLabel("Increase font size")).toBeHidden();
-    await expect(page.getByLabel("Decrease font size")).toBeHidden();
+    // V1.0075: format bar now stays visible after commit (selection
+    // persists so the user can immediately bold / resize / align the
+    // committed text without re-selecting it). Pre-V1.0075 it hid.
+    await expect(page.getByLabel("Increase font size")).toBeVisible();
+    await expect(page.getByLabel("Decrease font size")).toBeVisible();
 
+    await page.keyboard.press("Meta+z");
+    // V1.0075: ⌘Z first undoes the property change made by the in-place
+    // commit (the new text replacing the original whiteout edit's
+    // initial value). One more ⌘Z removes the whole edit. We just need
+    // the overlay gone before the next iteration.
     await page.keyboard.press("Meta+z");
     await expect(page.getByTestId("pending-text")).toHaveCount(0);
     await expect(page.getByTestId("pending-text-whiteout")).toHaveCount(0);
@@ -118,8 +126,9 @@ test("edit existing text whites out original text and exits on enter or blur", a
     await page.locator('[data-testid="toolstrip"]').click({ position: { x: 4, y: 4 } });
     await expect(input).toBeHidden();
     await expect(page.getByTestId("pending-text").filter({ hasText: "Blur-committed text" })).toBeVisible();
-    await expect(page.getByLabel("Increase font size")).toBeHidden();
-    await expect(page.getByLabel("Decrease font size")).toBeHidden();
+    // Same V1.0075 behavior on blur-commit — format bar stays.
+    await expect(page.getByLabel("Increase font size")).toBeVisible();
+    await expect(page.getByLabel("Decrease font size")).toBeVisible();
   } finally {
     await app.close();
   }

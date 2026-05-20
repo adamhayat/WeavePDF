@@ -46,6 +46,7 @@ export const IpcChannel = {
   SignatureClear: "signature:clear",
   MenuCommand: "menu:command",
   OpenFilePath: "app:open-file-path",
+  OpenFileListenerReady: "app:open-file-listener-ready",
   OcrRunImage: "ocr:run-image",
   OcrAvailable: "ocr:available",
   QpdfDecrypt: "qpdf:decrypt",
@@ -114,16 +115,24 @@ export const IpcChannel = {
   SnapshotsList: "snapshots:list",
   SnapshotsRead: "snapshots:read",
   /**
-   * Begin a native OS drag-and-drop carrying a single extracted PDF page as
-   * a real file. Renderer fires this from a thumbnail's `dragstart` after
-   * `e.preventDefault()`; main extracts the page with pdf-lib, writes it
-   * into the per-app tempdir, then calls `webContents.startDrag()` so the
-   * drag continues with file payload — drop on Finder/Desktop creates the
-   * single-page PDF; drop inside the sidebar is rejected by the OS (no drop
-   * zone) and the temp file is cleaned up later by macOS.
+   * Begin a native OS drag-and-drop carrying extracted PDF pages as a real
+   * file. Renderer fires this from a thumbnail's `dragstart` after
+   * `e.preventDefault()`; main extracts the requested pages with pdf-lib,
+   * writes them into the per-app tempdir, then calls
+   * `webContents.startDrag()` so the drag continues with file payload —
+   * drop on Finder/Desktop creates the extracted PDF; drop inside the
+   * sidebar is rejected by the OS (no drop zone) and the temp file is
+   * cleaned up later by macOS.
    */
   PagesStartDrag: "pages:start-drag",
 } as const;
+
+export type PageDragPayload = {
+  bytes: ArrayBuffer;
+  /** 1-based page numbers, in output order. */
+  pageNumbers: number[];
+  fileName: string;
+};
 
 /**
  * Manifest for a draft. Pending image bytes are inlined as base64 so the
@@ -262,6 +271,7 @@ export type MenuCommand =
   | "showWelcome"
   | "showWelcomeFinder"
   | "newTab"
+  | "newBlankPdf"
   | "closeTab";
 
 export type IpcChannelName = (typeof IpcChannel)[keyof typeof IpcChannel];

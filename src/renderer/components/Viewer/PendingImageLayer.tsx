@@ -1,17 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { X, Crop, Check } from "lucide-react";
+import { X, Crop, Check, RotateCw, FlipHorizontal2, FlipVertical2, Replace, Square, Layers2 } from "lucide-react";
 import { useDocumentStore, type PendingImageEdit } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import { bytesToBlob } from "../../../shared/buffers";
+import { resolveCrossPageTopLeft } from "../../lib/cross-page-drag";
 
 type Props = {
   pageNumber: number;
   zoom: number;
   pageHeightPx: number;
+  /** V1.0068: page dimensions in PDF points + global Margins toggle.
+   *  Used to clamp drag-move so the image stays within the active margin
+   *  rectangle when margins are enabled. */
+  pageWidthPt: number;
+  pageHeightPt: number;
 };
 
-export function PendingImageLayer({ pageNumber, zoom, pageHeightPx }: Props) {
+export function PendingImageLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt, pageHeightPt }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
+  const marginsEnabled = useUIStore((s) => s.marginsEnabled);
   if (!activeTab) return null;
 
   const edits = activeTab.pendingImageEdits.filter((e) => e.page === pageNumber);
@@ -26,6 +33,9 @@ export function PendingImageLayer({ pageNumber, zoom, pageHeightPx }: Props) {
           zoom={zoom}
           pageHeightPx={pageHeightPx}
           tabId={activeTab.id}
+          pageWidthPt={pageWidthPt}
+          pageHeightPt={pageHeightPt}
+          marginsEnabled={marginsEnabled}
         />
       ))}
     </>
@@ -37,13 +47,26 @@ type PendingImageProps = {
   zoom: number;
   pageHeightPx: number;
   tabId: string;
+  pageWidthPt: number;
+  pageHeightPt: number;
+  marginsEnabled: boolean;
 };
 
 const MIN_SIZE_PT = 16;
+const PAGE_MARGIN_PT = 36;
 
-function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
+function PendingImage({
+  edit,
+  zoom,
+  pageHeightPx,
+  tabId,
+  pageWidthPt,
+  pageHeightPt,
+  marginsEnabled,
+}: PendingImageProps) {
   const updateEdit = useDocumentStore((s) => s.updatePendingImageEdit);
   const removeEdit = useDocumentStore((s) => s.removePendingImageEdit);
+  const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
   const selected = useUIStore((s) => s.selectedPendingImageId === edit.id);
   const setSelectedId = useUIStore((s) => s.setSelectedPendingImage);
   // Crop sub-mode: user draws a rect on the image, Apply crops the bytes
@@ -67,6 +90,7 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
   const widthPx = edit.widthPt * zoom;
   const heightPx = edit.heightPt * zoom;
 
+  const addPendingImageEdit = useDocumentStore((s) => s.addPendingImageEdit);
   const dragState = useRef<{
     mode: "move" | "nw" | "ne" | "sw" | "se";
     startClientX: number;
@@ -75,44 +99,65 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
     startYPt: number;
     startWPt: number;
     startHPt: number;
+    currentPage: number;
+    pointerOffsetXPx: number;
+    pointerOffsetYPx: number;
     aspect: number;
+    /** V1.0070: option-drag clone target (defaults to edit.id). */
+    dragEditId: string;
+    cleanup?: () => void;
   } | null>(null);
 
-  const startDrag = useCallback(
-    (e: React.PointerEvent<HTMLElement>, mode: "move" | "nw" | "ne" | "sw" | "se") => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      e.stopPropagation();
-      dragState.current = {
-        mode,
-        startClientX: e.clientX,
-        startClientY: e.clientY,
-        startXPt: edit.xPt,
-        startYPt: edit.yPt,
-        startWPt: edit.widthPt,
-        startHPt: edit.heightPt,
-        aspect: edit.widthPt / edit.heightPt,
-      };
-      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
-      setSelectedId(edit.id);
-    },
-    [edit.xPt, edit.yPt, edit.widthPt, edit.heightPt, edit.id, setSelectedId],
-  );
+  const finishDrag = useCallback((pointerId?: number, captureTarget?: HTMLElement | null) => {
+    const s = dragState.current;
+    if (!s) return;
+    s.cleanup?.();
+    dragState.current = null;
+    if (pointerId != null && captureTarget) {
+      try {
+        captureTarget.releasePointerCapture(pointerId);
+      } catch {
+        /* already released */
+      }
+    }
+  }, []);
 
-  const onPointerMove = useCallback(
-    (e: React.PointerEvent<HTMLElement>) => {
+  const applyPointerMove = useCallback(
+    (clientX: number, clientY: number, shiftKey: boolean) => {
       const s = dragState.current;
       if (!s) return;
-      const dxPt = (e.clientX - s.startClientX) / zoom;
-      const dyPt = (e.clientY - s.startClientY) / zoom;
+      const dxPt = (clientX - s.startClientX) / zoom;
+      const dyPt = (clientY - s.startClientY) / zoom;
       // Shift locks aspect ratio for corner handles.
-      const lockAspect = e.shiftKey;
+      const lockAspect = shiftKey;
 
       if (s.mode === "move") {
-        updateEdit(tabId, edit.id, {
-          xPt: s.startXPt + dxPt,
-          yPt: s.startYPt - dyPt, // Y flips
+        const target = resolveCrossPageTopLeft({
+          currentPage: s.currentPage,
+          clientX,
+          clientY,
+          zoom,
+          pointerOffsetXPx: s.pointerOffsetXPx,
+          pointerOffsetYPx: s.pointerOffsetYPx,
+          widthPt: s.startWPt,
+          heightPt: s.startHPt,
+          marginsEnabled,
         });
+        let newX = s.startXPt + dxPt;
+        let newY = s.startYPt - dyPt; // Y flips
+        let nextPage = s.currentPage;
+        if (target) {
+          newX = target.xPt;
+          newY = target.yPt;
+          nextPage = target.page;
+        } else {
+          const m = marginsEnabled ? PAGE_MARGIN_PT : 0;
+          newX = Math.max(m, Math.min(pageWidthPt - m - s.startWPt, newX));
+          newY = Math.max(m, Math.min(pageHeightPt - m - s.startHPt, newY));
+        }
+        s.currentPage = nextPage;
+        // V1.0070: option-drag targets the clone via dragEditId.
+        updateEdit(tabId, s.dragEditId, { page: nextPage, xPt: newX, yPt: newY });
         return;
       }
 
@@ -166,18 +211,75 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
         heightPt: newH,
       });
     },
-    [zoom, updateEdit, tabId, edit.id],
+    [zoom, updateEdit, tabId, edit.id, marginsEnabled, pageWidthPt, pageHeightPt],
+  );
+
+  const startDrag = useCallback(
+    (e: React.PointerEvent<HTMLElement>, mode: "move" | "nw" | "ne" | "sw" | "se") => {
+      if (e.button !== 0) return;
+      e.preventDefault();
+      e.stopPropagation();
+      pushUndoStep(tabId);
+      // V1.0070: option-drag duplicates ONLY for the move mode (cloning
+      // mid-resize is confusing). Resize handles always target the
+      // original edit.
+      let dragEditId = edit.id;
+      if (mode === "move" && e.altKey) {
+        const { id: _unused, ...rest } = edit;
+        void _unused;
+        dragEditId = addPendingImageEdit(tabId, rest);
+        setSelectedId(dragEditId);
+      }
+      const target = e.currentTarget as HTMLElement;
+      const rect = target.getBoundingClientRect();
+      const handleWindowMove = (ev: PointerEvent) => {
+        if (!dragState.current) return;
+        ev.preventDefault();
+        applyPointerMove(ev.clientX, ev.clientY, ev.shiftKey);
+      };
+      const handleWindowUp = (ev: PointerEvent) => finishDrag(ev.pointerId, target);
+      if (mode === "move") {
+        window.addEventListener("pointermove", handleWindowMove, { capture: true });
+        window.addEventListener("pointerup", handleWindowUp, { capture: true, once: true });
+        window.addEventListener("pointercancel", handleWindowUp, { capture: true, once: true });
+      }
+      dragState.current = {
+        mode,
+        startClientX: e.clientX,
+        startClientY: e.clientY,
+        startXPt: edit.xPt,
+        startYPt: edit.yPt,
+        startWPt: edit.widthPt,
+        startHPt: edit.heightPt,
+        currentPage: edit.page,
+        pointerOffsetXPx: e.clientX - rect.left,
+        pointerOffsetYPx: e.clientY - rect.top,
+        aspect: edit.widthPt / edit.heightPt,
+        dragEditId,
+        cleanup: () => {
+          window.removeEventListener("pointermove", handleWindowMove, true);
+          window.removeEventListener("pointerup", handleWindowUp, true);
+          window.removeEventListener("pointercancel", handleWindowUp, true);
+        },
+      };
+      target.setPointerCapture(e.pointerId);
+      // setSelectedId is handled above for option-drag; for normal drag,
+      // select the original.
+      if (!e.altKey || mode !== "move") setSelectedId(edit.id);
+    },
+    [edit, setSelectedId, pushUndoStep, tabId, addPendingImageEdit, applyPointerMove, finishDrag],
+  );
+
+  const onPointerMove = useCallback(
+    (e: React.PointerEvent<HTMLElement>) => {
+      applyPointerMove(e.clientX, e.clientY, e.shiftKey);
+    },
+    [applyPointerMove],
   );
 
   const onPointerUp = useCallback((e: React.PointerEvent<HTMLElement>) => {
-    if (!dragState.current) return;
-    dragState.current = null;
-    try {
-      (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
-    } catch {
-      /* already released */
-    }
-  }, []);
+    finishDrag(e.pointerId, e.currentTarget as HTMLElement);
+  }, [finishDrag]);
 
   // Keyboard: arrow nudge (1pt, Shift = 10pt), Delete/Backspace to remove.
   useEffect(() => {
@@ -190,15 +292,19 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
       const step = e.shiftKey ? 10 : 1;
       if (e.key === "ArrowUp") {
         e.preventDefault();
+        pushUndoStep(tabId);
         updateEdit(tabId, edit.id, { yPt: edit.yPt + step });
       } else if (e.key === "ArrowDown") {
         e.preventDefault();
+        pushUndoStep(tabId);
         updateEdit(tabId, edit.id, { yPt: edit.yPt - step });
       } else if (e.key === "ArrowLeft") {
         e.preventDefault();
+        pushUndoStep(tabId);
         updateEdit(tabId, edit.id, { xPt: edit.xPt - step });
       } else if (e.key === "ArrowRight") {
         e.preventDefault();
+        pushUndoStep(tabId);
         updateEdit(tabId, edit.id, { xPt: edit.xPt + step });
       } else if (e.key === "Backspace" || e.key === "Delete") {
         e.preventDefault();
@@ -212,7 +318,7 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
     // listener (which would otherwise page-nav on arrow keys).
     window.addEventListener("keydown", onKey, { capture: true });
     return () => window.removeEventListener("keydown", onKey, { capture: true });
-  }, [selected, edit.xPt, edit.yPt, edit.id, tabId, updateEdit, removeEdit, setSelectedId]);
+  }, [selected, edit.xPt, edit.yPt, edit.id, tabId, updateEdit, removeEdit, setSelectedId, pushUndoStep]);
 
   const cropPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
     e.preventDefault();
@@ -307,6 +413,32 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
     }
   };
 
+  // V1.0057: right-click → "Align to page" + Delete.
+  const onContextMenu = (e: React.MouseEvent<HTMLDivElement>) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const align = useDocumentStore.getState().alignPendingElement;
+    useUIStore.getState().openContextMenu(e.clientX, e.clientY, [
+      { kind: "item", label: "Align to left margin", onClick: () => void align(tabId, "image", edit.id, "left") },
+      { kind: "item", label: "Center horizontally", onClick: () => void align(tabId, "image", edit.id, "center-h") },
+      { kind: "item", label: "Align to right margin", onClick: () => void align(tabId, "image", edit.id, "right") },
+      { kind: "separator" },
+      { kind: "item", label: "Align to top margin", onClick: () => void align(tabId, "image", edit.id, "top") },
+      { kind: "item", label: "Center vertically", onClick: () => void align(tabId, "image", edit.id, "center-v") },
+      { kind: "item", label: "Align to bottom margin", onClick: () => void align(tabId, "image", edit.id, "bottom") },
+      { kind: "separator" },
+      {
+        kind: "item",
+        label: "Delete",
+        danger: true,
+        onClick: () => {
+          removeEdit(tabId, edit.id);
+          setSelectedId(null);
+        },
+      },
+    ]);
+  };
+
   return (
     <div
       className="absolute z-20"
@@ -314,6 +446,7 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
       data-testid="pending-image"
       data-edit-id={edit.id}
       data-pending-element="image"
+      data-page-number={edit.page}
       onPointerDown={
         cropping
           ? cropPointerDown
@@ -327,6 +460,7 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
       }
       onPointerMove={cropping ? cropPointerMove : onPointerMove}
       onPointerUp={cropping ? cropPointerUp : onPointerUp}
+      onContextMenu={onContextMenu}
     >
       <img
         src={objectUrl}
@@ -340,7 +474,33 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
               ? "outline outline-2 outline-[var(--color-accent)]"
               : "hover:ring-2 hover:ring-[var(--color-accent)]/40")
         }
-        style={{ cursor: cropping ? "crosshair" : "move" }}
+        style={{
+          cursor: cropping ? "crosshair" : "move",
+          // V1.0090: live preview of image format options. CSS rotation
+          // direction matches pdf-lib's bake direction visually (both CW
+          // positive), so a user-facing "rotation" value is consistent
+          // between preview and printed output. Flip via scaleX/scaleY
+          // sign-flip; opacity is straight-through.
+          opacity: edit.opacity ?? 1,
+          transform: [
+            edit.rotation ? `rotate(${edit.rotation}deg)` : null,
+            edit.flipH ? "scaleX(-1)" : null,
+            edit.flipV ? "scaleY(-1)" : null,
+          ].filter(Boolean).join(" ") || undefined,
+          // V1.0091: live border + drop-shadow preview. Width in PDF
+          // points scales 1:1 with the rendered px since pendingImage
+          // positions are zoom-aware; the visible thickness matches the
+          // bake. Drop shadow flips the Y sign because CSS box-shadow
+          // uses screen-down-positive Y while pdf-lib uses screen-up-
+          // positive Y — both store the same negated value internally.
+          border: edit.border
+            ? `${edit.border.widthPt * zoom}px solid rgb(${Math.round(edit.border.color.r * 255)}, ${Math.round(edit.border.color.g * 255)}, ${Math.round(edit.border.color.b * 255)})`
+            : undefined,
+          boxSizing: edit.border ? "border-box" : undefined,
+          filter: edit.dropShadow
+            ? `drop-shadow(${edit.dropShadow.offsetXPt * zoom}px ${(-edit.dropShadow.offsetYPt) * zoom}px ${edit.dropShadow.blurPt * zoom}px rgba(${Math.round(edit.dropShadow.color.r * 255)}, ${Math.round(edit.dropShadow.color.g * 255)}, ${Math.round(edit.dropShadow.color.b * 255)}, ${edit.dropShadow.opacity}))`
+            : undefined,
+        }}
       />
       {cropping && cropRect && cropRect.w > 0 && cropRect.h > 0 && (
         <>
@@ -363,6 +523,176 @@ function PendingImage({ edit, zoom, pageHeightPx, tabId }: PendingImageProps) {
       )}
       {selected && !cropping && (
         <>
+          {/* V1.0090: floating image format toolbar. Anchored above the
+              image, mirroring the V1.0075 pending-text format bar.
+              Hosts the agent's must-haves: rotation (90° step), flip
+              H, flip V, opacity slider, replace. Crop already lives as
+              its own button on the side; kept there for back-compat
+              with users who learned the V1.0xx UX. z-50 sits above all
+              page-overlay elements per the V1.0090 fix in
+              PendingTextLayer. */}
+          <div
+            data-testid="pending-image-format-bar"
+            className="absolute -top-9 left-1/2 z-50 flex h-7 -translate-x-1/2 items-center gap-1 rounded-md border border-[var(--panel-border)] bg-[var(--panel-bg-raised)] px-1.5 shadow-md"
+            onPointerDown={(e) => e.stopPropagation()}
+          >
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.stopPropagation();
+                pushUndoStep(tabId);
+                const next = ((edit.rotation ?? 0) + 90) % 360;
+                updateEdit(tabId, edit.id, { rotation: next });
+              }}
+              className="flex h-5 w-5 items-center justify-center rounded text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]"
+              title="Rotate 90° clockwise"
+              data-testid="image-rotate"
+            >
+              <RotateCw className="h-3.5 w-3.5" strokeWidth={2} />
+            </button>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.stopPropagation();
+                pushUndoStep(tabId);
+                updateEdit(tabId, edit.id, { flipH: !edit.flipH });
+              }}
+              className={
+                "flex h-5 w-5 items-center justify-center rounded " +
+                (edit.flipH ? "text-[var(--color-accent)]" : "text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]")
+              }
+              title="Flip horizontal"
+              data-testid="image-flip-h"
+            >
+              <FlipHorizontal2 className="h-3.5 w-3.5" strokeWidth={2} />
+            </button>
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.stopPropagation();
+                pushUndoStep(tabId);
+                updateEdit(tabId, edit.id, { flipV: !edit.flipV });
+              }}
+              className={
+                "flex h-5 w-5 items-center justify-center rounded " +
+                (edit.flipV ? "text-[var(--color-accent)]" : "text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]")
+              }
+              title="Flip vertical"
+              data-testid="image-flip-v"
+            >
+              <FlipVertical2 className="h-3.5 w-3.5" strokeWidth={2} />
+            </button>
+            <div className="mx-0.5 h-3.5 w-px bg-[var(--panel-border)]" />
+            <span className="text-[10px] text-[var(--muted)]">Opacity</span>
+            <input
+              type="range"
+              min={10}
+              max={100}
+              step={1}
+              value={Math.round((edit.opacity ?? 1) * 100)}
+              onPointerDown={(e) => e.stopPropagation()}
+              onChange={(e) => {
+                updateEdit(tabId, edit.id, { opacity: Number(e.target.value) / 100 });
+              }}
+              className="h-4 w-20 accent-[var(--color-accent)]"
+              data-testid="image-opacity"
+              title="Opacity"
+            />
+            <div className="mx-0.5 h-3.5 w-px bg-[var(--panel-border)]" />
+            {/* V1.0091: Border toggle. Click to toggle a default 1pt
+                black border. Re-clicking removes the border. Custom
+                width / color is a follow-up. */}
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.stopPropagation();
+                pushUndoStep(tabId);
+                if (edit.border) {
+                  updateEdit(tabId, edit.id, { border: undefined });
+                } else {
+                  updateEdit(tabId, edit.id, {
+                    border: { widthPt: 1, color: { r: 0.05, g: 0.05, b: 0.1 } },
+                  });
+                }
+              }}
+              className={
+                "flex h-5 w-5 items-center justify-center rounded " +
+                (edit.border ? "text-[var(--color-accent)]" : "text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]")
+              }
+              title="Toggle 1pt border"
+              data-testid="image-border"
+            >
+              <Square className="h-3.5 w-3.5" strokeWidth={2} />
+            </button>
+            {/* V1.0091: Drop-shadow toggle. Click to toggle a default
+                soft-shadow preset (3pt offset down-right, 4pt blur,
+                40% black). Re-clicking removes the shadow. */}
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.stopPropagation();
+                pushUndoStep(tabId);
+                if (edit.dropShadow) {
+                  updateEdit(tabId, edit.id, { dropShadow: undefined });
+                } else {
+                  updateEdit(tabId, edit.id, {
+                    dropShadow: {
+                      offsetXPt: 3,
+                      // PDF Y goes UP; user-visual convention: shadow
+                      // drops DOWN. Negate offsetY so the toolbar's
+                      // default looks like a natural drop-shadow.
+                      offsetYPt: -3,
+                      blurPt: 4,
+                      opacity: 0.4,
+                      color: { r: 0, g: 0, b: 0 },
+                    },
+                  });
+                }
+              }}
+              className={
+                "flex h-5 w-5 items-center justify-center rounded " +
+                (edit.dropShadow ? "text-[var(--color-accent)]" : "text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]")
+              }
+              title="Toggle drop shadow"
+              data-testid="image-shadow"
+            >
+              <Layers2 className="h-3.5 w-3.5" strokeWidth={2} />
+            </button>
+            <div className="mx-0.5 h-3.5 w-px bg-[var(--panel-border)]" />
+            <button
+              type="button"
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={async (e) => {
+                e.stopPropagation();
+                // Replace: open file picker, swap bytes in place. Keeps
+                // position + size + format options unchanged.
+                const result = await window.weavepdf.openFileDialog({
+                  title: "Replace image",
+                  filters: [{ name: "Images", extensions: ["png", "jpg", "jpeg"] }],
+                  multi: false,
+                });
+                if (result.canceled || result.files.length === 0) return;
+                const file = result.files[0];
+                const isPng = file.name.toLowerCase().endsWith(".png");
+                pushUndoStep(tabId);
+                updateEdit(tabId, edit.id, {
+                  bytes: new Uint8Array(file.data),
+                  mime: isPng ? "image/png" : "image/jpeg",
+                });
+              }}
+              className="flex h-5 items-center gap-1 rounded px-1.5 text-[10px] text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]"
+              title="Replace image…"
+              data-testid="image-replace"
+            >
+              <Replace className="h-3 w-3" strokeWidth={2} />
+              <span>Replace</span>
+            </button>
+          </div>
           <ResizeHandle pos="nw" onDown={(e) => startDrag(e, "nw")} onMove={onPointerMove} onUp={onPointerUp} />
           <ResizeHandle pos="ne" onDown={(e) => startDrag(e, "ne")} onMove={onPointerMove} onUp={onPointerUp} />
           <ResizeHandle pos="sw" onDown={(e) => startDrag(e, "sw")} onMove={onPointerMove} onUp={onPointerUp} />
@@ -458,4 +788,3 @@ function ResizeHandle({
     />
   );
 }
-

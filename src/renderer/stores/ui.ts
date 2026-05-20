@@ -48,7 +48,11 @@ type UIStore = {
   welcomeOpen: boolean;
   welcomeInitialStep: 0 | 1;
   stickyPrompt: { page: number; xPt: number; yPt: number } | null;
-  textPrompt: { page: number; x: number; y: number } | null;
+  textPrompt: { page: number; x: number; y: number; widthPt: number } | null;
+  /** V1.0062: when true, new text overlays are sized to fit inside a 36pt
+   *  print margin on every edge. Toggled by the Margins button in the
+   *  toolstrip. Off = new text can extend all the way to the page edge. */
+  marginsEnabled: boolean;
   pendingImage: { bytes: Uint8Array; mime: "image/png" | "image/jpeg" } | null;
   // Shared colour + stroke settings for shape/highlight/draw tools.
   annotationColor: { r: number; g: number; b: number };
@@ -73,6 +77,7 @@ type UIStore = {
     rect: { x: number; y: number; width: number; height: number };
     screenX: number;
     screenY: number;
+    suggestedUrl?: string;
   } | null;
   // id of the currently selected pending image (for keyboard nudge/delete).
   selectedPendingImageId: string | null;
@@ -86,6 +91,30 @@ type UIStore = {
   editingPendingTextId: string | null;
   // Active right-click menu — one global instance rendered at the App level.
   contextMenu: { x: number; y: number; items: ContextMenuItem[] } | null;
+  /** V1.0087: draggable Crop tool state. Replaces the V1.0028
+   *  CropModal (numeric TLBR inputs). When `tool === "crop"`, the
+   *  CropOverlay component reads this rectangle and renders the scrim
+   *  + handles on the active page; the floating CropActionBar reads
+   *  it for the dimension readout. Coords are PDF points, bottom-left
+   *  origin, scoped to a single source page (the page the user was
+   *  viewing on tool entry) — Apply still produces uniform TLBR
+   *  margins across every page via `cropPages`. Cleared on Apply or
+   *  Cancel; persists across page-scroll within crop mode. */
+  cropDraft: {
+    pageNumber: number;
+    pageWPt: number;
+    pageHPt: number;
+    xPt: number;
+    yPt: number;
+    wPt: number;
+    hPt: number;
+  } | null;
+  /** V1.0077: short-lived informational banner anchored to the bottom of
+   *  the viewer. Used to confirm round-trip metadata restoration so the
+   *  user can SEE whether a reopened file's editable overlays came back.
+   *  Auto-dismisses after a few seconds — the App-level component owns
+   *  the timer. */
+  toast: { id: number; message: string; tone: "info" | "warn" } | null;
   // Active annotation / edit tool — null means plain viewer.
   tool:
     | "none"
@@ -152,7 +181,9 @@ type UIStore = {
   openAi: () => void;
   closeAi: () => void;
   setTool: (tool: UIStore["tool"]) => void;
-  setTextPrompt: (p: { page: number; x: number; y: number } | null) => void;
+  setTextPrompt: (p: { page: number; x: number; y: number; widthPt: number } | null) => void;
+  /** V1.0062: toggle whether new text overlays default to fit-inside-print-margins. */
+  toggleMargins: () => void;
   setStickyPrompt: (p: { page: number; xPt: number; yPt: number } | null) => void;
   setAnnotationColor: (c: { r: number; g: number; b: number }) => void;
   setStrokeWidth: (w: number) => void;
@@ -173,6 +204,9 @@ type UIStore = {
   setEditingPendingText: (id: string | null) => void;
   openContextMenu: (x: number, y: number, items: ContextMenuItem[]) => void;
   closeContextMenu: () => void;
+  showToast: (message: string, tone?: "info" | "warn") => void;
+  dismissToast: () => void;
+  setCropDraft: (d: UIStore["cropDraft"]) => void;
 };
 
 export const useUIStore = create<UIStore>((set) => ({
@@ -203,6 +237,7 @@ export const useUIStore = create<UIStore>((set) => ({
   welcomeInitialStep: 0,
   stickyPrompt: null,
   textPrompt: null,
+  marginsEnabled: true,
   pendingImage: null,
   annotationColor: { r: 0.05, g: 0.05, b: 0.1 },
   strokeWidth: 1.5,
@@ -216,6 +251,8 @@ export const useUIStore = create<UIStore>((set) => ({
   selectedPendingShapeId: null,
   editingPendingTextId: null,
   contextMenu: null,
+  toast: null,
+  cropDraft: null,
   tool: "none",
   setTheme: (theme) => {
     document.documentElement.setAttribute("data-theme", theme);
@@ -259,8 +296,17 @@ export const useUIStore = create<UIStore>((set) => ({
   },
   openHeaderFooter: () => set({ headerFooterOpen: true }),
   closeHeaderFooter: () => set({ headerFooterOpen: false }),
-  openCrop: () => set({ cropOpen: true }),
-  closeCrop: () => set({ cropOpen: false }),
+  // V1.0087: Crop is now a draggable tool mode, not a modal. The
+  // `openCrop` action remains so the palette / menu / hotkey ("C")
+  // wiring is unchanged — it now ENTERS crop tool mode and resets the
+  // draft (forces a fresh auto-detect seed on the active page).
+  // `closeCrop` exits crop tool mode if active. `cropOpen` stays false
+  // forever — the old modal is gone.
+  openCrop: () => set({ tool: "crop", cropDraft: null }),
+  closeCrop: () =>
+    set((s) =>
+      s.tool === "crop" ? { tool: "none", cropDraft: null } : { cropDraft: null },
+    ),
   openFormFill: () => set({ formFillOpen: true }),
   closeFormFill: () => set({ formFillOpen: false }),
   openBatch: () => set({ batchOpen: true }),
@@ -283,6 +329,7 @@ export const useUIStore = create<UIStore>((set) => ({
   closeAi: () => set({ aiOpen: false }),
   setTool: (tool) => set({ tool }),
   setTextPrompt: (p) => set({ textPrompt: p }),
+  toggleMargins: () => set((s) => ({ marginsEnabled: !s.marginsEnabled })),
   setStickyPrompt: (p) => set({ stickyPrompt: p }),
   setAnnotationColor: (c) =>
     set((s) => {
@@ -311,4 +358,8 @@ export const useUIStore = create<UIStore>((set) => ({
   setEditingPendingText: (id) => set({ editingPendingTextId: id }),
   openContextMenu: (x, y, items) => set({ contextMenu: { x, y, items } }),
   closeContextMenu: () => set({ contextMenu: null }),
+  showToast: (message, tone = "info") =>
+    set({ toast: { id: Date.now() + Math.random(), message, tone } }),
+  dismissToast: () => set({ toast: null }),
+  setCropDraft: (d) => set({ cropDraft: d }),
 }));

@@ -14,24 +14,42 @@ export function Viewer() {
   // the IntersectionObserver sees the old page still partially visible and would
   // race-override currentPage. Suppress observer updates while this flag is true.
   const suppressObserverRef = useRef(false);
+  // IntersectionObserver updates are read-only page tracking, not navigation.
+  // If we let the scroll effect respond to those same updates, manual scroll
+  // can snap back to the top of whichever page just became "most visible".
+  const observerUpdatedCurrentPageRef = useRef(false);
+  const lastScrollContextRef = useRef<{ tabId: string; numPages: number } | null>(null);
 
   // Scroll to the current page when it changes externally (e.g., sidebar click, search).
   useEffect(() => {
     if (!activeTab) return;
+    const previous = lastScrollContextRef.current;
+    const pageCountChanged =
+      previous?.tabId === activeTab.id && previous.numPages !== activeTab.numPages;
+    lastScrollContextRef.current = { tabId: activeTab.id, numPages: activeTab.numPages };
+
+    if (observerUpdatedCurrentPageRef.current) {
+      observerUpdatedCurrentPageRef.current = false;
+      return;
+    }
+
     const el = pageRefs.current.get(activeTab.currentPage);
     if (el && scrollerRef.current) {
       const container = scrollerRef.current;
       const target = el.offsetTop - 24;
       suppressObserverRef.current = true;
-      container.scrollTo({ top: target, behavior: "smooth" });
+      // Adding/deleting pages rebuilds layout while the user is often about
+      // to interact with the newly-created page. Jump directly instead of
+      // keeping a smooth scroll in flight under the pointer.
+      container.scrollTo({ top: target, behavior: pageCountChanged ? "auto" : "smooth" });
       // Smooth scroll is ~400–600ms; clear the flag a bit longer than that
       // so the observer can resume tracking once the new page has settled.
       const t = window.setTimeout(() => {
         suppressObserverRef.current = false;
-      }, 700);
+      }, pageCountChanged ? 120 : 700);
       return () => window.clearTimeout(t);
     }
-  }, [activeTab?.currentPage, activeTab?.id]);
+  }, [activeTab?.currentPage, activeTab?.id, activeTab?.numPages]);
 
   // Reading-order copy: pdf.js lays text spans out in content-stream order,
   // which for multi-column or form-style layouts often runs column-by-column
@@ -112,6 +130,7 @@ export function Viewer() {
           }
         }
         if (bestRatio > 0.25 && bestPage !== activeTab.currentPage) {
+          observerUpdatedCurrentPageRef.current = true;
           setCurrentPage(activeTab.id, bestPage);
         }
       },

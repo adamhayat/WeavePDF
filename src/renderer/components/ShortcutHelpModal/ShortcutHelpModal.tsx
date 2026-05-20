@@ -23,6 +23,7 @@ const sections: ShortcutSection[] = [
   {
     title: "File & Navigation",
     rows: [
+      { action: "New blank PDF", shortcut: "⌘N" },
       { action: "Open", shortcut: "⌘O" },
       { action: "Save", shortcut: "⌘S" },
       { action: "Save As", shortcut: "⌘⇧S" },
@@ -31,7 +32,7 @@ const sections: ShortcutSection[] = [
       { action: "Command Palette", shortcut: "⌘K" },
       { action: "Keyboard Shortcuts", shortcut: "⌘/" },
       { action: "Find in document", shortcut: "⌘F" },
-      { action: "Toggle sidebar", shortcut: "⌘B" },
+      { action: "Toggle sidebar", shortcut: "⇧⌘B" },
       { action: "Close tab", shortcut: "⌘W" },
       { action: "Switch tabs", shortcut: "⌘1-9" },
       { action: "Select all pages", shortcut: "⌘A" },
@@ -45,6 +46,7 @@ const sections: ShortcutSection[] = [
     rows: [
       { action: "Add Text", shortcut: "T" },
       { action: "Edit Existing Text", shortcut: "E" },
+      { action: "Bold / italic (on selected text)", shortcut: "⌘B  ⌘I" },
       { action: "Signature", shortcut: "S" },
       { action: "Place Image", shortcut: "I" },
       { action: "Sticky Note", shortcut: "N" },
