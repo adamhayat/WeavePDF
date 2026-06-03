@@ -36,7 +36,9 @@ class FinderSync: FIFinderSync {
         "pdf", "png", "jpg", "jpeg", "heic", "heif",
         "tif", "tiff", "gif", "bmp", "webp",
         // V1.0092: doc-class formats accepted by "Convert to PDF".
-        "doc", "docx", "rtf", "txt", "odt",
+        // V1.0108: `.pages` added — handled by the parent app's
+        // convertDocViaPages (AppleScript → Pages.app → export to PDF).
+        "doc", "docx", "rtf", "txt", "odt", "pages",
     ]
     static let imageOnly: Set<String> = [
         "png", "jpg", "jpeg", "heic", "heif",
@@ -44,8 +46,9 @@ class FinderSync: FIFinderSync {
     ]
     // V1.0092: extensions that flow through the textutil + printToPDF
     // pipeline in the parent app's runCli `doc-to-pdf` op.
+    // V1.0108: `.pages` included so the Combine menu accepts it.
     static let docOnly: Set<String> = [
-        "doc", "docx", "rtf", "txt", "odt",
+        "doc", "docx", "rtf", "txt", "odt", "pages",
     ]
     // Anything we can convert to PDF — images OR docs.
     static let convertable: Set<String> = imageOnly.union(docOnly)

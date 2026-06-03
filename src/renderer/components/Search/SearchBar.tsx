@@ -18,6 +18,7 @@ export function SearchBar() {
   const cursor = useUIStore((s) => s.searchCursor);
   const setSearchResults = useUIStore((s) => s.setSearchResults);
   const setSearchCursor = useUIStore((s) => s.setSearchCursor);
+  const showToast = useUIStore((s) => s.showToast);
 
   const inputRef = useRef<HTMLInputElement>(null);
   const replaceInputRef = useRef<HTMLInputElement>(null);
@@ -186,7 +187,8 @@ export function SearchBar() {
       await applyEdit(fresh.id, r.bytes);
       setReplaceResult(r.replaced);
     } catch (err) {
-      alert(`Replace failed: ${(err as Error).message ?? err}`);
+      console.error("replace text", err);
+      showToast("Couldn't replace that text.", "warn");
     } finally {
       setReplacing(false);
     }

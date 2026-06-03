@@ -5,6 +5,188 @@
 
 ## Current State
 
+**Status:** **V1.0114 — new Checkmark stamp tool (toolbar button + "V" shortcut + Command-Palette entry). Packaged + installed; relaunch to use.** Adam asked for "a checkmark symbol with a shortcut and toolbar option to easily add checkmarks" plus "maybe make checkboxes auto clickable?". Built the Checkmark tool: arm it (toolbar Check icon / press **V**), each click stamps a ✓ centered on the click; tool stays armed for ticking several boxes (Esc to stop). Colour popover + stroke slider apply. **Key design move:** a checkmark is just a pre-shaped 3-point `freehand` polyline, so it reuses the entire freehand pipeline (draggable overlay, undo, save round-trip, the V1.0112 rotation-aware `drawPath` bake) — zero new shape kinds/components/primitives. On "auto-clickable checkboxes": **real AcroForm checkboxes are already clickable** ([AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx) renders live `<input type=checkbox>`); drawn/scanned squares can't be auto-detected, so the Checkmark tool covers those. Files: [ui.ts](src/renderer/stores/ui.ts), [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx), [Toolstrip.tsx](src/renderer/components/Toolstrip/Toolstrip.tsx), [ColorPopover.tsx](src/renderer/components/Toolstrip/ColorPopover.tsx), [App.tsx](src/renderer/App.tsx), [ShortcutHelpModal.tsx](src/renderer/components/ShortcutHelpModal/ShortcutHelpModal.tsx). `npm run typecheck` green; no e2e spec yet (Adam QAs live). **Bumped V1.0113 → V1.0114** per Critical Rule #12. Still open: whole-paragraph editing (offered last turn, awaiting Adam's pick of auto-detect vs drag-region).
+
+---
+
+## V1.0113 (previous)
+
+**Status:** **V1.0113 — clicking text selects/copies it again; editing existing text now requires the Edit Text tool (the "Edit" button or "E").** Adam: clicking text should behave like a normal click by default and only edit via the edit button/shortcut. V1.0090 had dropped the `tool === "editText"` gate in `onTextLayerClick` ([PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx)) so every click on the pdf.js text layer promoted that glyph to a pending edit, making plain selection impossible. Re-gated the handler to bail unless `tool === "editText"`; an unarmed click now falls through to native selection (drag-select, ⌘C, right-click → Copy), and the OCR image-only fallback rides the same gate. Edit entry points are unchanged and already wired (toolbar Edit button + "E" shortcut). Removed the dead `blockingTools` set. Re-aligns with Critical Rule #3. Updated `tests/e2e/v1.0090-batch.spec.ts` #8 (unarmed click → 0 pending; armed → 1). `npm run typecheck` green. **Packaged + installed to `/Applications/WeavePDF.app` (was V1.0109 — that stale build is why Adam saw "clicking text still edits"; the whole session's V1.0105–V1.0113 work had never been packaged). Adam must relaunch to pick it up.** Open follow-up: Adam wants **whole-paragraph editing** (clicking a paragraph with Edit Text armed should promote the whole block as one multi-line box, not one line at a time) — not yet built. **Bumped V1.0112 → V1.0113** per Critical Rule #12. *(The patch was written against a V1.0110 baseline and read "V1.0110 → V1.0111"; renumbered to V1.0113 to sit on top of this session's uncommitted V1.0111–V1.0112 work rather than downgrade it.)*
+
+---
+
+## V1.0112 (previous)
+
+**Status:** **V1.0112 — implemented the bigger review fixes Adam green-lit: rotation-aware baking, digital-signature lock, security hardening, the alert()→toast sweep, AI brand reconciliation, and removed the dead framer-motion dep. All typecheck-green; app NOT launched (Adam still on screen). The rotated-page work needs Adam's visual QA on a real /Rotate PDF — see below.**
+
+**Context.** Continuation of the V1.0111 pre-launch review. Adam said "make all the coding changes and updates you identified and need," so this turn implemented the items previously triaged as "your decision," except the ones that genuinely need a purchase (notarization), a package install (vitest/eslint — pending Adam's OK), or live focus-steal re-verification (the Swift notification bridge).
+
+**Shipped in V1.0112:**
+- **Rotation-aware baking (the big P0).** New `pageBakeTransform(page)` helper in [pdf-ops.ts](src/renderer/lib/pdf-ops.ts) maps pdf.js DISPLAY-space overlay coords → pdf-lib user space and reports the upright draw-angle. **The point math is Node-verified against pdf.js `viewport.convertToPdfPoint` for all 4 rotations (24/24).** Wired into whiteout, drawText, drawWrappedText, drawRect, drawCircle, drawHighlight, drawLine, drawArrow, drawPath (freehand), drawStickyNote, and placeImage (composes page /Rotate with the image's own rotation). Plus fixed `redactRegion`'s double-rotation (it rasterizes upright, so the replacement page must be rotation 0). **Safety: for an unrotated page every transform reduces exactly to the old `+ pageContentOrigin` and `degrees(0)` is a no-op — so non-rotated PDFs (≈99% of use) are byte-identical (typecheck-confirmed).** Scoped OUT (still origin-only, misplaced on rotated pages): header/footer, watermark, Bates, OCR text layer — less common on rotated pages, flagged below.
+  - **NEEDS ADAM QA:** open/create a /Rotate 90/180/270 PDF, add text + whiteout + an image + a shape, save, reopen — confirm everything lands where placed and text reads upright. Position is verified; the rendered baseline/orientation is reasoned but un-rendered-here.
+- **Digital-signature lock.** New `signed` flag on `DocumentTab` ([document.ts](src/renderer/stores/document.ts)). `applyEdit(..., { signed: true })` from [DigitalSignModal](src/renderer/components/DigitalSignModal/DigitalSignModal.tsx) sets it; any later edit / commit / undo / redo clears it and toasts "…invalidated the document's digital signature." Stops a re-saved PDF from looking signed when its ByteRange is broken.
+- **alert() → toast (25 sites).** Every native `alert()` across App.tsx (17) + Sidebar/CompressModal/SearchBar/LinkPopover/FormFillModal/PageLayoutModal (8) now routes through the branded `showToast(…, "warn")`; raw error strings moved to `console.error` (no more leaking "Invalid object ref" to the user). BRAND fix.
+- **Security hardening (main.ts).** Explicit `webSecurity:true` + `allowRunningInsecureContent:false` on the main window; the `/tmp` Finder-sync log is now off unless `ACROFOX_LOG_LEVEL` is set (+ `mode 0o600`) so document filenames don't sit in world-readable /tmp; dropped `/tmp` + `os.tmpdir()` from the `isSafeWeavePdfPath` allowlist (world-writable staging area; Finder selections never live there); 25 MB cap on the AI handler's renderer text (disk-fill DoS).
+- **AI brand reconciliation.** [BRAND.md](BRAND.md) + [CLAUDE.md](CLAUDE.md) now permit on-device single-shot AI (summarize / rewrite / ask-one-question) and disavow only a *persistent conversational* assistant — keeps the shipped feature, ends the contradiction. (Reversible: delete the qa tab instead if Adam prefers.)
+- **Removed unused `framer-motion`** dependency (zero imports; also off-brand re: "no spring/bounce").
+- **Unit-test harness (vitest).** Adam approved vitest (declined eslint). `npm run test:unit` runs [tests/unit/pageBakeTransform.test.ts](tests/unit/pageBakeTransform.test.ts) — 10 tests that check the rotation transform against pdf.js `convertToPdfPoint` for all 4 rotations ± CropBox offset, **all passing**, so the rotation *position* math is now proven (only the visual *orientation* of baked text/images on rotated pages still wants Adam's eyes). Kept separate from the Playwright E2E suite. `capHistory`/`computeReorder`/`isSafeWeavePdfPath` need a small pure-module extraction before they can be tested the same way (their modules eagerly import pdf.js/Electron).
+
+**Still open (need Adam / can't do blindly):**
+1. **Notarization** — Apple Developer ID ($99/yr) + credentials. Needed before paid/public launch; fine for friends-beta with the README steps.
+2. **Notification-bridge auth** — the `DistributedNotificationCenter` ingress is unauthenticated; the /tmp allowlist tightening shrinks its blast radius, but real fix needs Swift HMAC + live focus-steal re-verify.
+3. **Extract pure modules so the rest can be unit-tested.** vitest is in (pageBakeTransform verified); `isSafeWeavePdfPath`, `capHistory`, and `computeReorder` each need lifting into a dependency-light module first (the arch agent's `security/path-safety.ts` etc.). eslint was declined.
+4. **QA tests** (redaction-removes-text, signature-validity, path-safety matrix) — E2E; write + run during the live QA pass.
+5. **Header/footer/watermark/Bates/OCR on rotated pages**, modal focus-traps/Escape, WelcomeModal trim, Toolstrip regrouping, god-object splits — flagged, not yet done.
+
+**Bumped V1.0111 → V1.0112** per Critical Rule #12.
+
+---
+
+## V1.0111 (previous)
+
+**Status:** **V1.0111 — pre-launch review pass. Seven specialist agents (PM, UX, PDF, competitive, security, QA, architecture) audited the whole app; the safe, high-value fixes landed this turn and the larger/riskier items are triaged below for Adam's call. App was NOT launched during the review (Adam was using the screen).**
+
+**What this was.** Adam asked, now on Opus 4.8, for a full review of the app built by earlier Claude versions — fundamental goals, design, implementation, every feature — via parallel specialist agents, then implement what's safe and summarize. Done as a read-only multi-agent review + a synthesis + a verified, typecheck-green fix batch.
+
+**Verification caught two things worth remembering.** (1) The macOS shell `grep` is a snapshot **shell function that silently drops matches** and flags `src/renderer/App.tsx` as "binary" (a stray non-UTF8 byte in a string). Several agent line-citations looked "hallucinated" until re-checked with `/usr/bin/grep -a` — they were real. **Use `/usr/bin/grep` (not bare `grep`) in this repo.** (2) **Redaction is genuinely secure** — `redactRegion` ([pdf-ops.ts](src/renderer/lib/pdf-ops.ts):1782) rasterizes the page region to a bitmap and replaces the page, so the underlying text bytes are destroyed, not just covered. The competitive/QA agents' "might be a black box over live text" fear is disproven.
+
+**Fixes shipped in V1.0111 (all typecheck-green, no app launch):**
+- **Undo/redo memory cap (was an OOM risk on big PDFs).** [document.ts](src/renderer/stores/document.ts) `capHistory()` keeps ≤20 snapshots AND trims oldest once retained bytes exceed ~300 MB (most-recent always kept; deep history degrades gracefully). Applied at all 7 full-bytes history sites.
+- **Silent edit failures now surface.** `applyEdit`/`undo`/`redo` wrap `loadPdf` in try/catch → quiet toast ("Couldn't apply/undo/redo that change.") instead of a void rejection that left the edit a silent no-op.
+- **Compress can no longer inflate.** `compressLight` returns the original bytes when object-stream packing didn't shrink the file.
+- **Escape no longer reaches past a modal to the document.** [App.tsx](src/renderer/App.tsx):1297 `useHotkeys("escape")` only runs `setTool("none")` when `!featureShortcutBlocked`; search/selection branches preserved.
+- **`prefers-reduced-motion` honored** ([index.css](src/renderer/index.css)) — strips transitions/animations + modal backdrop-blur under the OS Reduce-Motion setting.
+- **Toolstrip Info button** got its own `Info` icon (was a duplicate `FileText`, identical to Header/Footer).
+- **AiModal voice** — "Thinking…" → "Working…" (BRAND rule #6, no anthropomorphizing).
+- **Release hardened** — [publish-release.mjs](scripts/publish-release.mjs) scrubs `VITE_E2E` before `npm run make` so a release can't ship with the Node-inspect fuse ON; Gatekeeper instructions corrected for macOS 15 (System Settings → Privacy & Security → Open Anyway).
+- **Docs de-staled** — [CLAUDE.md](CLAUDE.md) no longer claims V1.0002 / lists shipped features (OCR, digital sign, AcroForm fill, batch, password, redaction) as "not built." New **README.md** written for the public repo with correct install/Gatekeeper steps and honest limits.
+
+**Top items triaged for Adam's decision (NOT changed — need a product call and/or live testing):**
+1. **`/Rotate` pages (P0, PDF agent).** No bake primitive consults `page.getRotation()`. On pages with `/Rotate` 90/180/270 (phone scans, faxes), placed text/images/shapes/whiteout/redaction/OCR land wrong. Biggest correctness gap by breadth; large fix, needs rotated-page fixtures + live verify.
+2. **Digital signature can be silently invalidated (P0).** Sign → any later pdf-lib re-save (commit/compress/watermark/metadata) rewrites the xref and breaks the `/ByteRange`. Needs a post-sign lock/confirm before further edits.
+3. **Security: `weavepdf://` ingress (P0/P1).** An unauthenticated system-wide `DistributedNotificationCenter` bridge ([main.ts](src/main/main.ts):78) lets any local process drive the file-mutating verbs; `isSafeWeavePdfPath` allowed-roots include `/tmp` + `/Volumes` (broader than intent). Kill/authenticate the bridge + tighten roots — needs the focus-steal regression re-verified live.
+4. **`alert()` → toast (~25 sites, BRAND).** App.tsx (~17) + 6 components use native `alert()` leaking raw `err.message`. Mechanical but high-churn; do as one focused pass.
+5. **Notarization.** Self-signed only → Gatekeeper friction for every recipient. Fine for a friends-beta with the README steps; get an Apple Developer ID ($99/yr) before a paid/public launch.
+6. **AI "Ask a question" tab** vs BRAND "no AI assistant chatbot" — reconcile (drop the qa tab, or amend the brand line to bless on-device single-shot Q&A). It IS local + non-conversational, so defensible either way — Adam's call.
+7. **Post-launch refactors:** split `main.ts` (3647 lines) and `pdf-ops.ts` (3269) by concern; stand up a `vitest` unit harness for the pure logic (`isSafeWeavePdfPath`, `capHistory`, `computeReorder`, coordinate math); wire up the dead `lint` script; remove unused `framer-motion`.
+
+Full per-agent findings are summarized in this turn's chat response.
+
+**Bumped V1.0110 → V1.0111** per Critical Rule #12.
+
+---
+
+## V1.0110 (previous)
+
+**Status:** **V1.0110 — whiteout is fully opaque, you can place text (and other elements) on top of a whiteout, and CMD+/CMD- keep the viewport center anchored.** Three Adam reports in one turn: "(1) you can still see some text faded after whiting out, it should be totally white; (2) we should be able to add a text element over a whiteout element; (3) when doing CMD+ to zoom in, it moves you from your view."
+
+**Fix 1 — opacity.** [PendingShapeLayer.tsx](src/renderer/components/Viewer/PendingShapeLayer.tsx)'s whiteout fill was `rgba(255,255,255,0.95)` — the remaining 5% transparency let the canvas-rendered glyphs underneath bleed through, so the on-screen overlay looked like a faint ghost of the original text even though the baked rectangle on save is full `rgb(1,1,1)`. Bumped whiteout and redact to fully opaque (`rgb(255,255,255)` / `rgb(0,0,0)`) so pre-save matches saved output. Same fix applied to the dragBox preview in [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx).
+
+**Fix 2 — click pass-through.** PendingShapeLayer's outer div sits at `z-20`, above the interaction overlay at `z-10`. Pre-V1.0110 the wrapper's `onPointerDown` stopped propagation + started a drag-move on every click, so picking the Text tool and clicking on top of a whiteout selected the whiteout instead of placing text. PendingShapeLayer now reads `tool` and threads `interactive = tool === "none" || tool === "editText"` to every shape variant; each variant sets `pointerEvents: interactive ? "auto" : "none"` on its outer div. With the wrapper inert, the click falls through to the interaction overlay and the active tool runs. Selection chrome (handles, delete chip, line endpoints) is gated on `selected && interactive` so a previously-selected shape doesn't keep clickable handles floating around mid-tool. The dashed outline still renders so the user can see what was selected.
+
+**Fix 3 — viewport anchor.** Pre-V1.0110 the zoom hotkeys called `setZoom(at.id, at.zoom * 1.1)` and the scroller kept its old `scrollTop` — content scaled in place but the "looking at" point drifted off-screen. [Viewer.tsx](src/renderer/components/Viewer/Viewer.tsx) gained a `useLayoutEffect` that remembers the previous `{tabId, zoom}` and, on any same-tab zoom change, rescales `scrollLeft` / `scrollTop` by the new/old ratio so the viewport-center content point stays anchored. The effect runs in the layout phase (post-DOM-mutation, pre-paint) so the user never sees a flash. Tab switches and first mount are skipped.
+
+**Tests.** `npm run typecheck` green.
+
+**Manual verify.** (1) Drag a whiteout over body text — the rectangle is now totally white, no ghost of the original glyphs. (2) With the Text tool active (or just clicking with no tool), click on top of the whiteout — a text prompt opens at the click position; the whiteout is not selected or moved. (3) Scroll mid-document, press ⌘+ / ⌘- a few times — visible content stays under the viewport center instead of jumping to the top.
+
+**Bumped V1.0109 → V1.0110** per Critical Rule #12.
+
+---
+
+## V1.0109 (previous)
+
+**Status:** **V1.0109 — `.pages` (and TIFF/GIF/BMP/WebP) added to the URL-handler safety allowlist so right-click Combine actually accepts them.** Adam tried V1.0108's `.pages` support and hit "WeavePDF rejected an unsafe file path / Desktop/1.pages". The V1.0108 work to teach the merge pipeline + Finder Sync about `.pages` was correct, but `WEAVEPDF_URL_ALLOWED_EXTS` (the belt-and-braces safety gate that re-validates every path coming through the `weavepdf://` URL handler — see `isSafeWeavePdfPath` in [main.ts](src/main/main.ts)) still only listed pdf/png/jpg/jpeg/heic/heif/doc/docx/rtf/txt/odt. The Finder extension dispatched the URL with `1.pages` included; the URL handler rejected it before reaching the merge pipeline.
+
+**Fix.** Added `pages` + `tif`/`tiff`/`gif`/`bmp`/`webp` to `WEAVEPDF_URL_ALLOWED_EXTS`. The extended image set matches what `transcodableImageExtensions` in `runCli` already accepts — the URL gate was silently narrower than the pipeline behind it. No new attack surface: each path still goes through the realpath / blocked-subtree / allowed-roots checks (`~/.ssh`, `/etc`, `/System`, app userData, etc.).
+
+**Tests.** `npm run typecheck` green.
+
+**Manual verify.** Right-click `~/Desktop/{1.pages, 2.pdf, 3.jpeg}` → WeavePDF → Combine into PDF. No rejection dialog. Output should have all three pages in selection order; the JPEG should display upright (V1.0108 EXIF fix).
+
+**Bumped V1.0108 → V1.0109** per Critical Rule #12.
+
+---
+
+## V1.0108 (previous)
+
+**Status:** **V1.0108 — Combine into PDF accepts `.pages`, JPEG EXIF orientation is honoured, and Rotate buttons act on the selected element instead of the whole page.** Adam right-clicked `~/Desktop/1.pages`, `2.pdf`, `3.jpeg` → "Combine into PDF" and got only two of the three files in the output, with the JPG rotated 90° from its natural orientation. He also reported "when I wrote inside of Weave, it changes the view from portrait to landscape as it rotates instead of rotating the document — it should only rotate the element inside not the entire page." Three issues, one shipped fix.
+
+**Issue 1 — `.pages` silently skipped.** [resources/extensions/finder-sync.swift](resources/extensions/finder-sync.swift)'s `supported` set didn't include `pages`, so when Adam right-clicked the trio the Finder extension filtered `1.pages` out of `selectedSupported()` before dispatching. The Combine action then ran with only the PDF + JPEG.
+
+**Fix.** Added `"pages"` to both `supported` and `docOnly` in finder-sync.swift, and to `DOC_LIKE_EXTENSIONS` in [main.ts](src/main/main.ts). `convertDocFileToPdf` now special-cases the `pages` extension — Pages.app is required (textutil refuses iWork archives) and a clear error is thrown if Pages isn't installed. `appendMergeInput` and `mergeWithQpdf` both gained a `DOC_LIKE_EXTENSIONS` branch that converts the doc to a temp PDF first, then folds it into the merge like any other PDF.
+
+**Issue 2 — JPEG rotated by EXIF orientation.** pdf-lib's `embedJpg` ignores the EXIF `Orientation` tag; phone/camera JPEGs that store landscape pixels with "rotate 90" metadata landed sideways on the merged PDF. (`3.jpeg` in Adam's repro had orientation = 6 → 90° CW expected at display time.) Importantly, `sips -s format jpeg` does NOT bake the rotation — only `sips --rotate <angle>` actually transforms pixels.
+
+**Fix.** New `readJpegOrientation(bytes)` helper in [main.ts](src/main/main.ts) parses the JPEG APP1 marker + EXIF IFD0 for the `Orientation` tag (0x0112). `loadImageBytesForPdf` now has a dedicated JPEG branch: if orientation ∈ {3, 6, 8} it shells out to `sips --rotate {180, 90, 270}` to write a rotated temp JPG, otherwise it passes the source bytes through unchanged. Mirror cases (orientations 2/4/5/7) are rare from phone cameras and fall through to as-is (we can add `--flip` support if a real case shows up). Verified against Adam's `3.jpeg` (orientation 6) — the merged page 4 now displays the prescription upright with readable text.
+
+**Issue 3 — rotation rotates the page when an element is selected.** The Toolstrip's Rotate L/R buttons and ⌘[ / ⌘] hotkeys both called `rotatePages`, which swaps the page's portrait/landscape orientation. Adam expected element-only rotation when he had a pending overlay selected.
+
+**Fix.** `rotateSelected` in [App.tsx](src/renderer/App.tsx) and `rotate` in [Toolstrip.tsx](src/renderer/components/Toolstrip/Toolstrip.tsx) now check the UI store first: if a pending image is selected, they update that overlay's `rotation` field via `updatePendingImageEdit` (the same mechanism the in-place format-bar rotate uses). If a pending text or shape is selected, they toast "This element can't be rotated — clear the selection to rotate the page" rather than silently flipping the page. With nothing selected, page rotation works as before.
+
+**Tests.** `npm run typecheck` green. Combine + EXIF fixes need real `.pages` / orientation-tagged JPEG files — Adam's `~/Desktop/{1.pages, 2.pdf, 3.jpeg}` is the manual repro fixture.
+
+**Manual verify.** (1) Right-click `1.pages`, `2.pdf`, `3.jpeg` → WeavePDF → Combine into PDF. Output should have all three pages in selection order; the JPEG should display upright. (2) Open a multi-page PDF, click ⌘[ — page rotates. Place an image, click on it, then click Rotate R — only the image rotates, page stays portrait. (3) Place a text overlay, select it, click Rotate — toast appears explaining text rotation isn't supported; page does not flip.
+
+**Bumped V1.0107 → V1.0108** per Critical Rule #12.
+
+---
+
+## V1.0107 (previous)
+
+**Status:** **V1.0107 — print-margin guides default to OFF.** Adam: "Make the default that margins are OFF, only comes on when clicking on the Margins button." V1.0062 introduced `marginsEnabled` defaulting to `true`, which constrained new text overlays to fit inside a 36pt printable area. Most of Adam's edits sit closer to the page edge than the default margin allows, so the constraint was getting in the way more often than it was helping.
+
+**Fix.** [ui.ts](src/renderer/stores/ui.ts) initial state `marginsEnabled: true` → `false`. The Margins toolstrip button still toggles it on per session. No other behaviour changed.
+
+**Tests.** `npm run typecheck` green. Manual: launch WeavePDF, drag a text box near the right page edge — pre-V1.0107 it snapped to 36pt margin, post-V1.0107 it goes all the way to the edge until the Margins button is clicked.
+
+**Bumped V1.0106 → V1.0107** per Critical Rule #12.
+
+---
+
+## V1.0106 (previous)
+
+**Status:** **V1.0106 — sidebar thumbnail zoom is always visible (was hidden when a page was selected); thumbnail drag-out that lands outside the sidebar no longer opens a new tab.** Adam tried V1.0105 and reported "I don't see a way to make the left sidebar smaller, and when dragging pages lower or higher on the list, it duplicates them still." Two distinct issues.
+
+**Issue 1 — invisible zoom controls.** V1.0105 put the ZoomOut/ZoomIn buttons in the no-selection header. But clicking any thumbnail calls `selectPage(..., "set")` (see [Sidebar.tsx](src/renderer/components/Sidebar/Sidebar.tsx)'s `onActivate`), which switches the header to the selection toolbar (N selected / rotate / delete) and hides the zoom row. Adam navigated by clicking a thumb → instantly lost the zoom UI.
+
+**Fix.** Extracted the zoom buttons into their own slim 28px strip directly under the header, always visible while the Pages tab is active. Strip also gains a "% reset" button between the icons — click `100%` to snap back to 1×. Selection-state header keeps its rotate/delete-only layout.
+
+**Issue 2 — drag still duplicates.** Likely a stale V1.0104 still in memory (Adam may not have fully relaunched after the install). V1.0105's sidebar reorder logic is correct on quit-and-reopen, but the safety net was thin: if the user released the drag *outside* the sidebar (over the page area or the title bar), the App.tsx window-level drop handler caught the temp file (`/var/folders/.../weavepdf-drag-*/...pdf`) and ran V1.0102's "open as new tab" path — looks like duplication.
+
+**Fix.** [App.tsx](src/renderer/App.tsx)'s window `onDrop` now `continue`s past any dropped file whose path contains `weavepdf-drag-`. The sidebar's V1.0105 internal-reorder path is unchanged. Drag-out to Finder still works because that drop lands in the OS, not the renderer.
+
+**Tests.** `npm run typecheck` green. Manual: open a multi-page PDF, click a thumb (selecting it), confirm the zoom strip is still visible under the selection toolbar; reorder a page via drag and confirm the doc page count doesn't change.
+
+**Bumped V1.0105 → V1.0106** per Critical Rule #12.
+
+---
+
+## V1.0105 (previous)
+
+**Status:** **V1.0105 — sidebar drag now reorders pages instead of duplicating them, plus a thumbnail zoom in the Pages header.** Adam screenshotted a 4-page merged invoice and said: "Reordering pages seems to create new pages or duplicate them instead of reordering. Also we should add a feature to zoom down the left side bar page viewer, so we can work faster when moving multiple pages."
+
+**Root cause for the reorder bug.** V1.0043 turned the thumbnail into an HTML5-draggable element that calls `window.weavepdf.pages.startDrag()` → `webContents.startDrag()` in main, which creates a real PDF in `os.tmpdir()/weavepdf-drag-*/` and starts an **OS-level Files drag** (so the user can drag a page out to Finder/Desktop). V1.0055 then added a sidebar-side `onDrop` handler that catches `Files` drops and **merges** them into the active document at the drop point — the path Adam uses to drop an external PDF into the open document. The two features collided: dragging a thumbnail within the sidebar, then dropping it back into the sidebar, was caught by the V1.0055 merge handler and stacked the dragged page into the document instead of reordering. Visually: drag page 1 to slot 4 → doc now has 5 pages, with page 1 duplicated.
+
+**Fix.** [Sidebar.tsx](src/renderer/components/Sidebar/Sidebar.tsx) gets a module-scoped `internalDragState` ref. `handleDragStart` records the dragged pageNumbers + a timestamp before calling `webContents.startDrag()`. The sidebar's `onDrop` now disambiguates: if any dropped file path contains `weavepdf-drag-` (the temp dir marker the main-process drag uses) AND `internalDragState` was set within the last 30s, the drop is an internal reorder — `computeReorder(numPages, movedPages, dropAt)` builds the new 0-based order and `reorderPages()` re-pages the document. Otherwise it's a real external PDF drop and the V1.0055 merge path runs. The new caret lands on the first moved page's new index.
+
+**`computeReorder`.** Pure helper, exported so the e2e helper-tests can reuse it. Sorts moved page indices ascending, builds the "rest" list, translates the drop-at index (which counts over ALL original pages) into a position in "rest" by counting moved pages before the drop, then inserts the moved block. Validated against six cases (single move forward/back, multi-page move, no-op self-drop, multi-page-to-start).
+
+**Zoom feature.** New `sidebarThumbScale` (default 1, range [0.6, 2.0]) in [ui.ts](src/renderer/stores/ui.ts). The Pages-header subheader now shows the page count alongside two zoom buttons (Lucide `ZoomOut` / `ZoomIn`, ±0.2 per click) — matches the existing `SidebarIcon` chrome so it doesn't add new visual weight. The `<aside>` width scales `50 + 150 × scale` and the `Thumb` effect uses `target = 150 × thumbScale` so the rendered canvas resolution stays sharp at any zoom. Session-only — no disk persistence yet.
+
+**Tests.** `npm run typecheck` green. `computeReorder` validated by a Node script against six cases (all pass). Drag-drop UI gesture relies on OS-level startDrag → drop integration that Playwright can't synthesise; Adam's manual verify covers it.
+
+**Adam's manual verify.**
+1. Open `Merged-20260526023417.pdf` (or any multi-page PDF). Drag page 1's thumbnail down past page 4. Pre-V1.0105 the doc grew to 5 pages with page 1 duplicated; post-V1.0105 the doc still has 4 pages, with the dragged page now in position 4 and the caret on it.
+2. Click the ZoomIn / ZoomOut icons next to the page count. The thumbnails should grow / shrink (and the sidebar widens to fit) without losing render fidelity.
+3. Dropping an external PDF into the sidebar still merges it into the doc at the drop point (V1.0055 behavior preserved).
+
+**Bumped V1.0104 → V1.0105** per Critical Rule #12.
+
+---
+
+## V1.0104 (previous)
+
 **Status:** **V1.0104 — edits stay where the user placed them on Canva-style PDFs (MediaBox y0 offset).** Adam edited `~/Desktop/test.pdf` (Canva export, MediaBox `[0, 7.83, 595.5, 850.08]`) and asked: "When I close in Weave and reopen, the date on the top right only partially covers the original, and the bottom signature/title/name aren't properly aligned." The on-screen WYSIWYG looked perfect; only the saved-and-reopened version drifted.
 
 **Root cause.** Canva sets the page's MediaBox lower-left at user-space y=7.83 (the spec allows any origin). WeavePDF's renderer captures every overlay position MediaBox-relative — i.e. (0, 0) = lower-left of the visible page — because that's what `pageSize.h - clickY / zoom` returns in [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx). Every pdf-lib baker in [pdf-ops.ts](src/renderer/lib/pdf-ops.ts) passed those coords straight into `drawText` / `drawRectangle` / `drawImage`, which treat their `x, y` as raw user-space. Result: every baked edit landed `mediaBox.y` pts low. On-screen positioning hid the bug because the same wrong axis was used on both sides; the saved bytes were the first time the wrong number left the renderer.

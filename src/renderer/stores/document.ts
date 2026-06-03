@@ -15,6 +15,25 @@ type RGB = { r: number; g: number; b: number };
 type DistributiveOmit<T, K extends keyof T> = T extends unknown ? Omit<T, K> : never;
 const MIN_WRAP_TEXT_WIDTH_PT = 120;
 
+// Undo/redo snapshots hold a full copy of the document bytes. Keep at most 20
+// levels (the historical cap) AND, for very large documents, drop the oldest
+// snapshots once the retained bytes pass ~300 MB — otherwise a long edit
+// session on a big scanned PDF can pin gigabytes of Uint8Arrays in the single
+// renderer process and OOM it. The most-recent snapshot is always kept, so the
+// next undo/redo step still works; deep history just degrades gracefully on
+// huge files.
+const MAX_HISTORY_ENTRIES = 20;
+const MAX_HISTORY_BYTES = 300 * 1024 * 1024;
+function capHistory(snapshots: Uint8Array[]): Uint8Array[] {
+  let kept = snapshots.slice(-MAX_HISTORY_ENTRIES);
+  let total = kept.reduce((n, b) => n + b.byteLength, 0);
+  while (kept.length > 1 && total > MAX_HISTORY_BYTES) {
+    total -= kept[0].byteLength;
+    kept = kept.slice(1);
+  }
+  return kept;
+}
+
 /**
  * A text annotation that lives as a draggable DOM overlay until the user
  * saves/exports/prints — at which point it gets baked into the PDF bytes.
@@ -165,6 +184,13 @@ export type DocumentTab = {
   // Monotonic counter incremented whenever the PDF bytes change — components
   // key renders off this so stale canvas state doesn't leak across edits.
   version: number;
+  /** V1.0111: true while this tab holds a PKCS#7-signed PDF whose ByteRange is
+   *  still intact. Set only by the digital-sign action (via `applyEdit`'s
+   *  `signed` option); cleared — with a warning toast — by any later edit,
+   *  commit, undo, or redo, because re-saving through pdf-lib rewrites the xref
+   *  and silently invalidates the signature. Stops a document looking signed
+   *  when it no longer validates. */
+  signed: boolean;
 };
 
 /** V1.0070: snapshot of all pending-edit arrays at a moment in time.
@@ -215,7 +241,7 @@ type DocumentStore = {
   clearSelection: (id: string) => void;
 
   // Edits
-  applyEdit: (id: string, newBytes: Uint8Array, opts?: { newCurrentPage?: number }) => Promise<void>;
+  applyEdit: (id: string, newBytes: Uint8Array, opts?: { newCurrentPage?: number; signed?: boolean }) => Promise<void>;
   undo: (id: string) => Promise<void>;
   redo: (id: string) => Promise<void>;
   markClean: (id: string, pathIfSaved: string) => void;
@@ -397,6 +423,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       currentPage: 1,
       zoom: 1,
       dirty: false,
+      signed: false,
       selectedPages: new Set(),
       pendingTextEdits: [],
       pendingImageEdits: [],
@@ -436,6 +463,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       currentPage: 1,
       zoom: 1,
       dirty: false,
+      signed: false,
       selectedPages: new Set(),
       pendingTextEdits: [],
       pendingImageEdits: [],
@@ -553,6 +581,17 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       // Destroy the old pdf.js document to free memory — do it after the new
       // one is ready so we never leave the tab without a live pdf proxy.
       void current.pdf?.destroy();
+      // V1.0111: a digital signature survives only if the signed bytes are
+      // written verbatim. `opts.signed` IS the signing edit; any other edit on
+      // a signed tab re-serializes the PDF and breaks the ByteRange, so warn
+      // and drop the signed flag instead of letting the file look signed.
+      const nowSigned = opts?.signed === true;
+      if (current.signed && !nowSigned) {
+        useUIStore.getState().showToast(
+          "That change invalidated the document's digital signature.",
+          "warn",
+        );
+      }
       set((s) => ({
         tabs: s.tabs.map((t) => {
           if (t.id !== id) return t;
@@ -568,16 +607,23 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
               newPdf.numPages,
             ),
             selectedPages: new Set(),
-            history: nextHistory.slice(-20), // cap at 20 undo levels
+            history: capHistory(nextHistory),
             // A new edit invalidates the redo stack — you can't "re-do" what
             // was undone once you've gone a different direction.
             redoStack: [],
             pendingRedoStack: [],
             dirty: true,
+            signed: nowSigned,
             version: t.version + 1,
           };
         }),
       }));
+    } catch (err) {
+      // A primitive can hand back bytes pdf.js refuses to load (or text the
+      // font can't encode). Surface it quietly instead of leaving the edit a
+      // silent no-op; the tab stays on its last good state.
+      console.error("applyEdit failed", err);
+      useUIStore.getState().showToast("Couldn't apply that change.", "warn");
     } finally {
       inFlight.delete(id);
     }
@@ -711,17 +757,23 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             selectedPages: new Set(),
             history: nextHistory,
             // Push the state we just undid onto the redo stack.
-            redoStack: [...t.redoStack, undoneBytes].slice(-20),
+            redoStack: capHistory([...t.redoStack, undoneBytes]),
             // Still dirty only if earlier edits remain to undo.
             dirty:
               nextHistory.length > 0 ||
               t.pendingTextEdits.length > 0 ||
               t.pendingImageEdits.length > 0 ||
               t.pendingShapeEdits.length > 0,
+            // Stepping through history can't be trusted to preserve a valid
+            // signature — under-claim rather than show a broken one as signed.
+            signed: false,
             version: t.version + 1,
           };
         }),
       }));
+    } catch (err) {
+      console.error("undo failed", err);
+      useUIStore.getState().showToast("Couldn't undo that change.", "warn");
     } finally {
       inFlight.delete(id);
     }
@@ -802,13 +854,17 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             selectedPages: new Set(),
             // The state we were at goes back onto the history stack so the
             // next ⌘Z returns to it.
-            history: [...t.history, redoneFrom].slice(-20),
+            history: capHistory([...t.history, redoneFrom]),
             redoStack: t.redoStack.slice(0, -1),
             dirty: true,
+            signed: false,
             version: t.version + 1,
           };
         }),
       }));
+    } catch (err) {
+      console.error("redo failed", err);
+      useUIStore.getState().showToast("Couldn't redo that change.", "warn");
     } finally {
       inFlight.delete(id);
     }
@@ -1040,7 +1096,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             numPages: newPdf.numPages,
             sizeBytes: bytes.byteLength,
             pendingTextEdits: [],
-            history: [...t.history, prevBytes].slice(-20),
+            history: capHistory([...t.history, prevBytes]),
             redoStack: [],
             pendingRedoStack: [],
             dirty: true,
@@ -1240,7 +1296,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             numPages: newPdf.numPages,
             sizeBytes: bytes.byteLength,
             pendingShapeEdits: [],
-            history: [...t.history, prevBytes].slice(-20),
+            history: capHistory([...t.history, prevBytes]),
             redoStack: [],
             pendingRedoStack: [],
             dirty: true,
@@ -1296,7 +1352,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             numPages: newPdf.numPages,
             sizeBytes: bytes.byteLength,
             pendingImageEdits: [],
-            history: [...t.history, prevBytes].slice(-20),
+            history: capHistory([...t.history, prevBytes]),
             redoStack: [],
             pendingRedoStack: [],
             dirty: true,
@@ -1483,6 +1539,14 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
 
       const newPdf = await loadPdf(bytes);
       void tab.pdf?.destroy();
+      // V1.0111: baking pending edits re-serializes the PDF, which breaks a
+      // PKCS#7 signature's ByteRange. Warn (once) and drop the signed flag.
+      if (tab.signed) {
+        useUIStore.getState().showToast(
+          "Saving these edits invalidated the document's digital signature.",
+          "warn",
+        );
+      }
       set((s) => ({
         tabs: s.tabs.map((t) => {
           if (t.id !== id) return t;
@@ -1495,12 +1559,13 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             pendingTextEdits: retainedTextEdits,
             pendingImageEdits: imageEdits,
             pendingShapeEdits: shapeEdits,
-            history: [...t.history, prevBytes].slice(-20),
+            history: capHistory([...t.history, prevBytes]),
             redoStack: [],
             pendingRedoStack: [],
             pendingHistory: [],
             pendingFuture: [],
             dirty: true,
+            signed: false,
             version: t.version + 1,
           };
         }),

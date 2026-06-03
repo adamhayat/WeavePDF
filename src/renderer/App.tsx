@@ -459,9 +459,7 @@ export function App() {
       // otherwise fall back to the disk bytes that were just opened.
       const seedAb = record.currentBytes ?? (payload ? u8ToAb(payload.bytes) : null);
       if (!seedAb) {
-        alert(
-          `Couldn't restore ${m.originalName}: the draft has no bytes and no source file is available.`,
-        );
+        useUIStore.getState().showToast(`Couldn't restore ${m.originalName}.`, "warn");
         return;
       }
       const bytes = new Uint8Array(seedAb);
@@ -469,7 +467,8 @@ export function App() {
       try {
         pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
       } catch (err) {
-        alert(`Couldn't restore ${m.originalName}: ${(err as Error).message ?? err}`);
+        console.error("restore", err);
+        useUIStore.getState().showToast(`Couldn't restore ${m.originalName}.`, "warn");
         return;
       }
 
@@ -550,9 +549,12 @@ export function App() {
         // Encrypted — prompt for password and decrypt via qpdf.
         const qpdfOk = await window.weavepdf.qpdf.available();
         if (!qpdfOk) {
-          alert(
-            `${payload.name} is password-protected. Install qpdf first:\n\n  brew install qpdf\n\nThen reopen the file.`,
-          );
+          useUIStore
+            .getState()
+            .showToast(
+              `${payload.name} is password-protected — install qpdf with brew install qpdf, then reopen it.`,
+              "warn",
+            );
           return;
         }
         const decrypted = await new Promise<Uint8Array | null>((resolve) => {
@@ -666,7 +668,7 @@ export function App() {
     async (m: DraftManifest) => {
       const record = await window.weavepdf.drafts.load(m.draftKey);
       if (!record) {
-        alert(`Couldn't load draft for ${m.originalName}.`);
+        useUIStore.getState().showToast(`Couldn't load the draft for ${m.originalName}.`, "warn");
         return;
       }
       // For path-keyed drafts, also read the disk bytes as a fallback so
@@ -699,7 +701,7 @@ export function App() {
     async (filePath: string, savedAt: string) => {
       const buf = await window.weavepdf.snapshots.read(filePath, savedAt);
       if (!buf) {
-        alert(`Couldn't read that saved version.`);
+        useUIStore.getState().showToast("Couldn't read that saved version.", "warn");
         return;
       }
       const bytes = new Uint8Array(buf);
@@ -754,10 +756,11 @@ export function App() {
             bytes: pdfBytes,
           });
         } else {
-          alert(`Unsupported file type: ${file.name}`);
+          useUIStore.getState().showToast(`Can't open ${file.name} — unsupported file type.`, "warn");
         }
       } catch (err) {
-        alert(`Couldn't open ${file.name}: ${(err as Error).message ?? err}`);
+        console.error("open file", err);
+        useUIStore.getState().showToast(`Couldn't open ${file.name}.`, "warn");
       }
     }
   }, [loadAsTab]);
@@ -787,7 +790,8 @@ export function App() {
         bytes,
       });
     } catch (err) {
-      alert(`Couldn't create blank PDF: ${(err as Error).message ?? err}`);
+      console.error("blank pdf", err);
+      useUIStore.getState().showToast("Couldn't create a blank PDF.", "warn");
     }
   }, [loadAsTab]);
 
@@ -852,7 +856,8 @@ export function App() {
         markClean(refreshed.id, targetPath);
         return true;
       } else {
-        alert(`Save failed: ${result.error}`);
+        console.error("save", result.error);
+        useUIStore.getState().showToast("Couldn't save that file.", "warn");
         return false;
       }
     },
@@ -916,7 +921,8 @@ export function App() {
     if (result.canceled) return;
     const write = await window.weavepdf.writeFile(result.path, toArrayBuffer(merged));
     if (!write.ok) {
-      alert(`Export failed: ${write.error}`);
+      console.error("export", write.error);
+      useUIStore.getState().showToast("Couldn't export that file.", "warn");
     }
   }, [tabs, commitAllPending]);
 
@@ -956,7 +962,7 @@ export function App() {
     if (!activeTab?.bytes) return;
     const qpdfOk = await window.weavepdf.qpdf.available();
     if (!qpdfOk) {
-      alert("Install qpdf first:\n\n  brew install qpdf");
+      useUIStore.getState().showToast("This needs qpdf — run brew install qpdf.", "warn");
       return;
     }
     setEncryptError(null);
@@ -1017,9 +1023,13 @@ export function App() {
         .trim();
       const docxAb = await window.weavepdf.convertTextToDocx(plain);
       const w = await window.weavepdf.writeFile(result.path, docxAb);
-      if (!w.ok) alert(`Save failed: ${w.error}`);
+      if (!w.ok) {
+        console.error("save", w.error);
+        useUIStore.getState().showToast("Couldn't save that file.", "warn");
+      }
     } catch (err) {
-      alert(`Word export failed: ${(err as Error).message ?? err}`);
+      console.error("word export", err);
+      useUIStore.getState().showToast("Couldn't export to Word.", "warn");
     }
   }, [activeTab, commitAllPending]);
 
@@ -1039,15 +1049,43 @@ export function App() {
       const md = await pdfToMarkdown(fresh.bytes);
       const ab = u8ToAb(new TextEncoder().encode(md));
       const w = await window.weavepdf.writeFile(result.path, ab);
-      if (!w.ok) alert(`Markdown export failed: ${w.error}`);
+      if (!w.ok) {
+        console.error("markdown export", w.error);
+        useUIStore.getState().showToast("Couldn't export to Markdown.", "warn");
+      }
     } catch (err) {
-      alert(`Markdown export failed: ${(err as Error).message ?? err}`);
+      console.error("markdown export", err);
+      useUIStore.getState().showToast("Couldn't export to Markdown.", "warn");
     }
   }, [activeTab, commitAllPending]);
 
   const rotateSelected = useCallback(
     async (delta: 90 | -90 | 180) => {
       if (!activeTab?.bytes) return;
+
+      // V1.0108: element-aware rotation. If a pending image is selected,
+      // rotate that overlay instead of the whole page. Adam: "it should
+      // only rotate the element inside not the entire page." For pending
+      // text/shape (no rotation field today) we no-op with a toast rather
+      // than silently flipping the page — that was the surprising
+      // behaviour the user hit.
+      const ui = useUIStore.getState();
+      if (ui.selectedPendingImageId) {
+        const tab = useDocumentStore.getState().tabs.find((t) => t.id === activeTab.id);
+        const edit = tab?.pendingImageEdits.find((e) => e.id === ui.selectedPendingImageId);
+        if (edit) {
+          const next = (((edit.rotation ?? 0) + delta) % 360 + 360) % 360;
+          useDocumentStore.getState().updatePendingImageEdit(activeTab.id, edit.id, {
+            rotation: next,
+          });
+          return;
+        }
+      }
+      if (ui.selectedPendingTextId || ui.selectedPendingShapeId) {
+        ui.showToast("This element can't be rotated — clear the selection to rotate the page.", "info");
+        return;
+      }
+
       const targets =
         activeTab.selectedPages.size > 0
           ? Array.from(activeTab.selectedPages)
@@ -1131,7 +1169,7 @@ export function App() {
     e.preventDefault();
     void printCurrent();
   });
-  useHotkeys("t,e,s,i,n,h,w,x,r,o,l,a,d,k,m,c", (e) => {
+  useHotkeys("t,e,s,i,n,h,w,x,r,o,l,a,d,k,m,c,v", (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (!canRunFeatureShortcut(e)) return;
     e.preventDefault();
@@ -1152,6 +1190,7 @@ export function App() {
       case "k": toggleShortcutTool("link"); break;
       case "m": toggleShortcutTool("measure"); break;
       case "c": openCrop(); break;
+      case "v": toggleShortcutTool("checkmark"); break;
     }
   }, undefined, [
     canRunFeatureShortcut,
@@ -1275,7 +1314,10 @@ export function App() {
       closeSearch();
     } else if (activeTab && activeTab.selectedPages.size > 0) {
       clearSelection(activeTab.id);
-    } else {
+    } else if (!featureShortcutBlocked) {
+      // A modal/overlay owns the screen — don't reach past it to clear the
+      // active tool on the document underneath. (Modals that want Escape to
+      // dismiss them register their own keydown handler.)
       setTool("none");
     }
   });
@@ -1377,7 +1419,8 @@ export function App() {
           });
         }
       } catch (err) {
-        alert(`Couldn't open file: ${(err as Error).message ?? err}`);
+        console.error("open file", err);
+        useUIStore.getState().showToast("Couldn't open that file.", "warn");
       }
     });
     window.weavepdf.notifyOpenFileListenerReady();
@@ -1558,6 +1601,13 @@ export function App() {
       for (const f of files) {
         const filePath = window.weavepdf.getPathForFile(f);
         if (!filePath) continue;
+        // V1.0106: skip the temp PDF produced by Sidebar's thumbnail
+        // drag-out (path contains `weavepdf-drag-`). If it lands here
+        // it means the user released outside the sidebar's reorder
+        // zone — opening it as a new tab is the V1.0102 image-drop
+        // confusion all over again. Drop-out to Finder still works
+        // because that drop never reaches us.
+        if (filePath.includes("weavepdf-drag-")) continue;
         try {
           const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
           const file = await window.weavepdf.readFile(filePath);
@@ -1619,7 +1669,8 @@ export function App() {
             });
           }
         } catch (err) {
-          alert(`Couldn't open ${f.name}: ${(err as Error).message ?? err}`);
+          console.error("open file", err);
+          useUIStore.getState().showToast(`Couldn't open ${f.name}.`, "warn");
         }
       }
     };
@@ -1650,6 +1701,7 @@ export function App() {
       { id: "add-signature", label: "Signature…", group: "Edit", shortcut: "S", disabled: !hasTab, keywords: ["sign"], run: openSignature },
       { id: "add-image", label: "Place image…", group: "Edit", shortcut: "I", disabled: !hasTab, keywords: ["photo", "picture"], run: openImagePicker },
       { id: "sticky-note", label: "Sticky note", group: "Edit", shortcut: "N", disabled: !hasTab, keywords: ["comment", "yellow"], run: () => setTool("sticky") },
+      { id: "checkmark", label: "Checkmark", group: "Edit", shortcut: "V", disabled: !hasTab, keywords: ["check", "tick", "checkbox", "yes", "done"], run: () => setTool("checkmark") },
       { id: "highlight", label: "Highlight", group: "Edit", shortcut: "H", disabled: !hasTab, keywords: ["yellow", "marker"], run: () => setTool("highlight") },
       { id: "whiteout", label: "Whiteout", group: "Edit", shortcut: "W", disabled: !hasTab, keywords: ["erase", "cover"], run: () => setTool("whiteout") },
       { id: "redact", label: "Redact region", group: "Edit", shortcut: "X", disabled: !hasTab, keywords: ["black", "remove", "censor"], run: () => setTool("redact") },

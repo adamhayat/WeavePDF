@@ -101,7 +101,17 @@ try {
 
 // ── Build ────────────────────────────────────────────────────────────────
 step("Building distributables (npm run make)");
-execSync("npm run make", { cwd: repoRoot, stdio: "inherit" });
+// Never let a release build inherit VITE_E2E=1 from the shell. That flag flips
+// the EnableNodeCliInspectArguments fuse ON (see forge.config.ts) so Playwright
+// can attach — but in a shipped build it turns the main process into an
+// attachable debug target (full local code execution past the IPC allowlist).
+// Scrub it before forge runs so a stray `export VITE_E2E=1` can't poison a release.
+if (process.env.VITE_E2E) {
+  console.log("  ⚠ VITE_E2E was set in this shell — clearing it for the release build (keeps the inspect fuse OFF)");
+}
+const buildEnv = { ...process.env };
+delete buildEnv.VITE_E2E;
+execSync("npm run make", { cwd: repoRoot, stdio: "inherit", env: buildEnv });
 
 const dmg = join(outDir, "WeavePDF.dmg");
 if (!existsSync(dmg)) die(`expected DMG missing at ${dmg}`);
@@ -136,7 +146,7 @@ if (existsSync(changelogPath)) {
   }
 }
 if (!body) {
-  body = `WeavePDF ${tag}.\n\nDownload **WeavePDF.dmg** below, drag to /Applications, right-click → Open the first time (Gatekeeper warning is expected for unsigned builds).`;
+  body = `WeavePDF ${tag}.\n\nDownload **WeavePDF.dmg** below and drag WeavePDF to /Applications. The build isn't notarized yet, so macOS blocks the first launch: open **System Settings → Privacy & Security**, scroll to the WeavePDF notice, and click **Open Anyway**. (On macOS 14 and earlier you can instead right-click the app → Open.)`;
 }
 
 // ── Publish ──────────────────────────────────────────────────────────────

@@ -57,9 +57,13 @@ const openFileListenerReadyWindowIds = new Set<number>();
 // open-file / right-click event the app handled.
 const FINDER_SYNC_LOG = "/tmp/weavepdf-quickaction.log";
 function logFinderSync(line: string): void {
+  // Off by default: this log records full file paths (potentially sensitive
+  // document names) into world-readable /tmp. Only write it when explicitly
+  // debugging via ACROFOX_LOG_LEVEL, and lock the file to the owner.
+  if (!process.env.ACROFOX_LOG_LEVEL) return;
   try {
     const stamp = new Date().toISOString();
-    appendFileSync(FINDER_SYNC_LOG, `[${stamp}] ${line}\n`);
+    appendFileSync(FINDER_SYNC_LOG, `[${stamp}] ${line}\n`, { mode: 0o600 });
   } catch {
     // Logging is best-effort; ignore if /tmp is wedged.
   }
@@ -219,8 +223,15 @@ function assertBlessed(p: string): void {
 //      extension's filter, which we don't trust.
 const WEAVEPDF_URL_ALLOWED_EXTS = new Set([
   "pdf", "png", "jpg", "jpeg", "heic", "heif",
+  // V1.0108: extended image set to match what the Combine pipeline already
+  // accepts (transcodableImageExtensions in runCli). Without these, the
+  // URL safety gate rejected paths the Finder extension had legitimately
+  // collected via "Combine into PDF".
+  "tif", "tiff", "gif", "bmp", "webp",
   // V1.0092: doc-class formats for the right-click "Convert to PDF" action.
-  "doc", "docx", "rtf", "txt", "odt",
+  // V1.0108: `.pages` added so right-click Combine accepts iWork files
+  // (Adam: "WeavePDF rejected an unsafe file path … /Desktop/1.pages").
+  "doc", "docx", "rtf", "txt", "odt", "pages",
 ]);
 const WEAVEPDF_URL_BLOCKED_BASENAMES = new Set([
   ".ssh", ".aws", ".gnupg", ".config", ".kube", ".docker",
@@ -272,8 +283,11 @@ function isSafeWeavePdfPath(p: string): boolean {
     path.join(homeReal, "Public"),
     path.join(homeReal, "Library", "Mobile Documents"), // iCloud Drive
     "/Volumes",
-    "/tmp", // some workflows pipe via /tmp; ext check above limits damage
-    os.tmpdir(),
+    // V1.0111: /tmp and os.tmpdir() removed from the allowlist. They're
+    // world-writable, so any local process could stage a file there for a
+    // weavepdf:// action to act on. Finder selections (the only legitimate
+    // URL-dispatched paths) never live in /tmp, and the app's own temp output
+    // is validated through assertBlessed, not this gate.
   ];
   return allowedRoots.some((root) => isInsidePath(real, root));
 }
@@ -590,7 +604,10 @@ async function withTempDir<T>(prefix: string, run: (dir: string) => Promise<T>):
 // already worked for images. textutil ships with macOS and reads .doc / .docx /
 // .rtf / .txt / .odt natively. V1.0093: Pages.app (Apple's own .docx layout
 // engine) added as the primary path for higher-fidelity output.
-const DOC_LIKE_EXTENSIONS = new Set(["doc", "docx", "rtf", "txt", "odt"]);
+// V1.0108: `.pages` joins the set. Apple Pages is the only thing that can
+// open `.pages` — `convertDocFileToPdf` below special-cases it so we don't
+// try to fall through to textutil (which can't read iWork archives).
+const DOC_LIKE_EXTENSIONS = new Set(["doc", "docx", "rtf", "txt", "odt", "pages"]);
 
 function pagesAppPath(): string | null {
   // On macOS 14+ Pages lives at /System/Applications (managed by Apple). On
@@ -716,6 +733,18 @@ async function convertDocFileToPdf(inPath: string, outPath: string): Promise<voi
   if (!DOC_LIKE_EXTENSIONS.has(ext)) {
     throw new Error(`Unsupported document extension: .${ext}`);
   }
+  // V1.0108: `.pages` can only be opened by Pages.app. textutil refuses
+  // iWork archives, so there's no fallback — fail with a clear message
+  // instead of producing an empty / corrupted PDF.
+  if (ext === "pages") {
+    if (!pagesAppPath()) {
+      throw new Error(
+        "Pages.app is required to convert .pages files. Install Pages from the App Store.",
+      );
+    }
+    await convertDocViaPages(inPath, outPath);
+    return;
+  }
   if (pagesAppPath()) {
     try {
       await convertDocViaPages(inPath, outPath);
@@ -805,6 +834,10 @@ function createMainWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Declare the secure defaults explicitly so a future Electron default
+      // change (or a copy-paste) can't silently weaken the main window.
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     },
   });
 
@@ -2214,6 +2247,15 @@ group.wait()
       text: string,
       extra?: string,
     ): Promise<string> => {
+      // Bound the renderer-supplied text so a buggy/compromised renderer can't
+      // make us write a multi-gigabyte temp file (local disk-fill DoS).
+      const MAX_AI_INPUT_BYTES = 25 * 1024 * 1024;
+      if (
+        Buffer.byteLength(text, "utf8") > MAX_AI_INPUT_BYTES ||
+        (extra != null && Buffer.byteLength(extra, "utf8") > MAX_AI_INPUT_BYTES)
+      ) {
+        throw new Error("That text is too large for the on-device model.");
+      }
       const bin = aiBinaryPath();
       if (!existsSync(bin)) {
         throw new Error(
@@ -2651,17 +2693,91 @@ async function runCli(args: string[]): Promise<number> {
   const directImageExtensions = new Set(["jpg", "jpeg", "png"]);
   const transcodableImageExtensions = new Set(["heic", "heif", "gif", "tif", "tiff", "bmp", "webp"]);
   const supportedImageExtensions = new Set([...directImageExtensions, ...transcodableImageExtensions]);
+  // V1.0108: phone/camera JPEGs ship with an EXIF `Orientation` tag — e.g.
+  // iPhone landscape-mode photos are stored as landscape pixels tagged
+  // "upper-right" (value 6) so display software rotates 90° CW. pdf-lib's
+  // `embedJpg` ignores the tag, so without correction those JPEGs land
+  // sideways on the merged PDF. Adam: "it's also rotating the JPG file
+  // for some reason." Note `sips -s format jpeg` does NOT bake the
+  // rotation — only `sips --rotate <angle>` actually transforms pixels.
+  const ORIENT_TO_ROTATE_CW: Record<number, number> = {
+    1: 0,
+    3: 180,
+    6: 90,
+    8: 270,
+  };
+  const readJpegOrientation = (bytes: Buffer): number => {
+    if (bytes.length < 4 || bytes[0] !== 0xff || bytes[1] !== 0xd8) return 1;
+    let i = 2;
+    while (i + 4 < bytes.length) {
+      if (bytes[i] !== 0xff) return 1;
+      const marker = bytes[i + 1];
+      if (marker === 0xd9 || marker === 0xda) return 1; // EOI / SOS — past metadata.
+      const size = bytes.readUInt16BE(i + 2);
+      if (marker === 0xe1 && i + 10 <= bytes.length) {
+        const magic = bytes.slice(i + 4, i + 10).toString("latin1");
+        if (magic === "Exif\0\0") {
+          const tiff = i + 10;
+          if (tiff + 8 > bytes.length) return 1;
+          const endian = bytes.slice(tiff, tiff + 2).toString("latin1");
+          const isLE = endian === "II";
+          if (!isLE && endian !== "MM") return 1;
+          const r16 = (o: number) => (isLE ? bytes.readUInt16LE(o) : bytes.readUInt16BE(o));
+          const r32 = (o: number) => (isLE ? bytes.readUInt32LE(o) : bytes.readUInt32BE(o));
+          if (r16(tiff + 2) !== 0x002a) return 1;
+          const ifd0 = tiff + r32(tiff + 4);
+          if (ifd0 + 2 > bytes.length) return 1;
+          const n = r16(ifd0);
+          for (let j = 0; j < n; j++) {
+            const entry = ifd0 + 2 + j * 12;
+            if (entry + 12 > bytes.length) return 1;
+            if (r16(entry) === 0x0112) return r16(entry + 8);
+          }
+          return 1;
+        }
+      }
+      i += 2 + size;
+    }
+    return 1;
+  };
   const extensionOf = (p: string) => path.extname(p).replace(/^\./, "").toLowerCase();
   const loadImageBytesForPdf = async (input: string): Promise<{ bytes: Buffer; isPng: boolean }> => {
     const ext = extensionOf(input);
     // pdf-lib only natively embeds PNG + JPEG. For every other common image
     // format, shell out to macOS's built-in `sips` to transcode to JPEG in a
     // tempfile first. Covers HEIC/HEIF/GIF/TIFF/BMP/WebP with no extra deps.
-    if (directImageExtensions.has(ext)) {
-      return {
-        bytes: await readFile(input),
-        isPng: ext === "png",
-      };
+    if (ext === "png") {
+      return { bytes: await readFile(input), isPng: true };
+    }
+    if (ext === "jpg" || ext === "jpeg") {
+      // V1.0108: bake EXIF orientation by rotating pixels via sips. Without
+      // this, iPhone landscape-mode JPEGs (orientation = 6) land sideways
+      // because pdf-lib's embedJpg ignores the orientation tag.
+      const raw = await readFile(input);
+      const orient = readJpegOrientation(raw);
+      const angle = ORIENT_TO_ROTATE_CW[orient];
+      if (!angle) {
+        // orientation 1 (normal) or unsupported mirror cases (2/4/5/7).
+        return { bytes: raw, isPng: false };
+      }
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "weavepdf-jpg-rot-"));
+      const tmpJpg = path.join(tmpDir, "rotated.jpg");
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn("sips", ["--rotate", String(angle), input, "--out", tmpJpg]);
+          let stderr = "";
+          child.stderr.on("data", (d) => (stderr += d.toString("utf8")));
+          child.stdout.on("data", () => {});
+          child.on("error", reject);
+          child.on("exit", (code) => {
+            if (code === 0) resolve();
+            else reject(new Error(stderr.trim() || `sips --rotate exited ${code}`));
+          });
+        });
+        return { bytes: await readFile(tmpJpg), isPng: false };
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      }
     }
     if (transcodableImageExtensions.has(ext)) {
       const tmpDir = await mkdtemp(path.join(os.tmpdir(), "weavepdf-img2pdf-"));
@@ -2765,7 +2881,23 @@ async function runCli(args: string[]): Promise<number> {
       await addImagePage(outDoc, input);
       return;
     }
-    throw new Error(`merge: unsupported input .${ext || "(none)"}; use PDFs or images`);
+    // V1.0108: doc-class inputs (.docx, .pages, .rtf, etc.) get converted
+    // to a temp PDF via `convertDocFileToPdf` (Pages.app first, textutil
+    // fallback) and then folded into the merge like any other PDF.
+    if (DOC_LIKE_EXTENSIONS.has(ext)) {
+      const tmpDir = await mkdtemp(path.join(os.tmpdir(), "weavepdf-merge-doc-"));
+      const tmpPdf = path.join(tmpDir, "converted.pdf");
+      try {
+        await convertDocFileToPdf(input, tmpPdf);
+        const src = await loadPdf(tmpPdf);
+        const copied = await outDoc.copyPages(src, src.getPageIndices());
+        for (const page of copied) outDoc.addPage(page);
+      } finally {
+        await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+      }
+      return;
+    }
+    throw new Error(`merge: unsupported input .${ext || "(none)"}; use PDFs, images, or doc/docx/rtf/odt/pages`);
   };
   const mergeWithQpdf = async (inputs: string[], output: string): Promise<boolean> => {
     const bin = qpdfBinaryPath();
@@ -2783,8 +2915,15 @@ async function runCli(args: string[]): Promise<number> {
           await addImagePage(imageDoc, input);
           await saveTo(imageDoc, imagePdf);
           pdfParts.push(imagePdf);
+        } else if (DOC_LIKE_EXTENSIONS.has(ext)) {
+          // V1.0108: doc-class inputs go through Pages/textutil to a
+          // temp PDF inside the same merge tmp dir, then qpdf treats
+          // them as ordinary PDFs.
+          const docPdf = path.join(tmpDir, `doc-${idx + 1}.pdf`);
+          await convertDocFileToPdf(input, docPdf);
+          pdfParts.push(docPdf);
         } else {
-          throw new Error(`merge: unsupported input .${ext || "(none)"}; use PDFs or images`);
+          throw new Error(`merge: unsupported input .${ext || "(none)"}; use PDFs, images, or doc/docx/rtf/odt/pages`);
         }
       }
       await new Promise<void>((resolve, reject) => {

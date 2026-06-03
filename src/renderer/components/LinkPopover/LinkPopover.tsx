@@ -16,6 +16,7 @@ export function LinkPopover() {
   const pendingLink = useUIStore((s) => s.pendingLink);
   const setPendingLink = useUIStore((s) => s.setPendingLink);
   const setTool = useUIStore((s) => s.setTool);
+  const showToast = useUIStore((s) => s.showToast);
   const activeTab = useDocumentStore((s) => s.activeTab());
   const applyEdit = useDocumentStore((s) => s.applyEdit);
   const [tab, setTab] = useState<"url" | "page">("url");
@@ -69,7 +70,8 @@ export function LinkPopover() {
       // link rectangle while the popover is closing.
       setTool("none");
     } catch (err) {
-      alert(`Couldn't add link: ${(err as Error).message ?? err}`);
+      console.error("add link", err);
+      showToast("Couldn't add that link.", "warn");
     } finally {
       setBusy(false);
     }

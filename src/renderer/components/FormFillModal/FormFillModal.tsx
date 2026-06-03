@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { X, FormInput } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
+import { useUIStore } from "../../stores/ui";
 import { getFormFields, setFormFields, type FormFieldInfo, type FormFieldValue } from "../../lib/pdf-ops";
 
 type Props = { open: boolean; onClose: () => void };
@@ -10,6 +11,7 @@ type ValueMap = Record<string, FormFieldValue>;
 export function FormFillModal({ open, onClose }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const applyEdit = useDocumentStore((s) => s.applyEdit);
+  const showToast = useUIStore((s) => s.showToast);
   const [fields, setFields] = useState<FormFieldInfo[]>([]);
   const [values, setValues] = useState<ValueMap>({});
   const [busy, setBusy] = useState(false);
@@ -47,7 +49,8 @@ export function FormFillModal({ open, onClose }: Props) {
       await applyEdit(activeTab.id, newBytes);
       onClose();
     } catch (err) {
-      alert(`Form fill failed: ${(err as Error).message ?? err}`);
+      console.error("form fill", err);
+      showToast("Couldn't fill that form.", "warn");
     } finally {
       setBusy(false);
     }

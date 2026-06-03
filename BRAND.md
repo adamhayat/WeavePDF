@@ -16,7 +16,7 @@ WeavePDF is a Mac-native, local-only PDF editor for prosumers and small-business
 **Anti-positioning — what WeavePDF is not**
 - Not SaaS. Not a subscription.
 - Not in the cloud. Nothing syncs.
-- Not bloated. No prepress, no portfolios, no AI assistant chatbot.
+- Not bloated. No prepress, no portfolios, no conversational AI assistant. (On-device, single-shot helpers — summarize, rewrite, ask one question — are in scope and stay local; a persistent chatbot that lingers, remembers, and upsells is not.)
 - Not Adobe. No nag, no upgrade prompt, no account.
 - Not a converter site or browser tool dressed as an app.
 

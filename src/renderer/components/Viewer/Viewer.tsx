@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useDocumentStore } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import { PageCanvas } from "./PageCanvas";
@@ -19,6 +19,36 @@ export function Viewer() {
   // can snap back to the top of whichever page just became "most visible".
   const observerUpdatedCurrentPageRef = useRef(false);
   const lastScrollContextRef = useRef<{ tabId: string; numPages: number } | null>(null);
+  // V1.0110: anchor CMD+/CMD- zoom to the viewport center. Pre-V1.0110 the
+  // scroller's scrollTop stayed put while content scaled, so a 1.1× zoom
+  // shifted whatever the user was looking at off-screen. Now the scroll
+  // position is rescaled by the zoom ratio so the same content point stays
+  // under the viewport center across zoom changes.
+  const zoomAnchorRef = useRef<{ tabId: string; zoom: number } | null>(null);
+
+  // V1.0110: rescale scroll position on zoom change so the viewport center
+  // stays anchored on the same content point. Runs in useLayoutEffect (post-
+  // DOM-mutation, pre-paint) so the user never sees a flash at the old
+  // scroll offset before the correction.
+  useLayoutEffect(() => {
+    if (!activeTab) {
+      zoomAnchorRef.current = null;
+      return;
+    }
+    const scroller = scrollerRef.current;
+    const prev = zoomAnchorRef.current;
+    zoomAnchorRef.current = { tabId: activeTab.id, zoom: activeTab.zoom };
+    if (!scroller) return;
+    // Skip on first mount or tab switch — only adjust when the SAME tab's
+    // zoom changed. Switching tabs is a context reset, not a zoom gesture.
+    if (!prev || prev.tabId !== activeTab.id) return;
+    if (prev.zoom === activeTab.zoom) return;
+    const ratio = activeTab.zoom / prev.zoom;
+    const oldCenterX = scroller.scrollLeft + scroller.clientWidth / 2;
+    const oldCenterY = scroller.scrollTop + scroller.clientHeight / 2;
+    scroller.scrollLeft = Math.max(0, oldCenterX * ratio - scroller.clientWidth / 2);
+    scroller.scrollTop = Math.max(0, oldCenterY * ratio - scroller.clientHeight / 2);
+  }, [activeTab?.zoom, activeTab?.id]);
 
   // Scroll to the current page when it changes externally (e.g., sidebar click, search).
   useEffect(() => {

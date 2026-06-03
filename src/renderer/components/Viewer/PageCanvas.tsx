@@ -226,6 +226,35 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
       return;
     }
 
+    if (tool === "checkmark") {
+      // V1.0114: a checkmark is a pre-shaped freehand polyline (✓) — a short
+      // stroke down to a low vertex, then a long stroke up. Reusing the
+      // freehand shape kind means it inherits the existing draggable overlay
+      // and the rotation-aware drawPath bake; no new shape kind/primitive
+      // needed. Centered on the click, ~18pt. The tool stays armed so you can
+      // tick several boxes in a row (Esc or another tool to stop).
+      const activeTab = useDocumentStore.getState().activeTab();
+      if (!activeTab) return;
+      const ui = useUIStore.getState();
+      const SIZE = 18;
+      const ox = pdfX - SIZE / 2;
+      const oy = pdfYFromBottom - SIZE / 2;
+      const points = [
+        { x: ox + SIZE * 0.0, y: oy + SIZE * 0.52 },
+        { x: ox + SIZE * 0.36, y: oy + SIZE * 0.0 },
+        { x: ox + SIZE * 1.0, y: oy + SIZE * 0.95 },
+      ];
+      const newId = useDocumentStore.getState().addPendingShapeEdit(activeTab.id, {
+        kind: "freehand",
+        page: pageNumber,
+        points,
+        color: ui.annotationColor,
+        thickness: Math.max(2, ui.strokeWidth),
+      });
+      useUIStore.getState().setSelectedPendingShape(newId);
+      return;
+    }
+
     if (tool === "image") {
       const pendingImage = useUIStore.getState().pendingImage;
       if (!pendingImage) {
@@ -320,7 +349,7 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
   // drag-to-draw tools (highlight/whiteout/shapes/redact/freehand). Text
   // cursor for the Add Text tool, which opens an inline input on click.
   const cursor =
-    tool === "signature" || tool === "image"
+    tool === "signature" || tool === "image" || tool === "checkmark"
       ? "copy"
       : tool === "text"
         ? "text"
@@ -660,47 +689,26 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
   // size, and stage a PendingTextEdit that will whiteout the original
   // region and draw the user's new text in its place.
   const onTextLayerClick = async (e: React.MouseEvent<HTMLDivElement>) => {
-    // V1.0090: drop the `tool === "editText"` gate. Adam: "I want PDFs
-    // to save extra data to make them fully editable in Weave once
-    // saved" — his real ask is that any text in the doc is click-to-
-    // edit without tool switching. The Edit Text tool button still
-    // works (it preselects the cursor + leaves the tool active for
-    // multi-click sessions); but clicking on a glyph with no tool
-    // active now also promotes it to a pending text edit. Only block
-    // when another DRAWING tool (rect/whiteout/etc.) is active so we
-    // don't fight the drawing gesture, OR when a text-creation prompt
-    // is already mounted (the Text tool's click sets the prompt then
-    // resets tool to "none"; the subsequent click handler must not
-    // also promote a baked span).
+    // V1.0113: clicking text is a normal click again. Editing existing text is now an explicit
+    // mode — arm the Edit Text tool (the toolbar "Edit" button or the "E" shortcut, both of which
+    // set `tool === "editText"`) and THEN click the word. Reverses V1.0090's always-on
+    // click-to-edit, which made ordinary text selection impossible, and re-aligns with Critical
+    // Rule #3. When Edit Text isn't armed we bail before touching the event so the browser performs
+    // native text selection. Drawing tools own their own overlay above this layer, so they never
+    // reach here.
+    if (tool !== "editText") return;
     if (!pageSize) return;
     if (!containerRef.current) return;
     if (useUIStore.getState().textPrompt) return;
-    const blockingTools = new Set<typeof tool>([
-      "highlight",
-      "whiteout",
-      "rect",
-      "circle",
-      "line",
-      "arrow",
-      "draw",
-      "image",
-      "sticky",
-      "crop",
-      "redact",
-      "link",
-      "measure",
-      "text",
-      "signature",
-    ]);
-    if (blockingTools.has(tool)) return;
     const span = (e.target as HTMLElement).closest("span") as HTMLElement | null;
     if (!span) {
       // V1.0052: image-only page → run OCR and pick the box nearest the click.
       // Only fires when pdf.js has zero text spans on this page, so a misclick
       // between paragraphs on a normal text-PDF stays a no-op (matches
-      // pre-V1.0052 behavior). Pre-V1.0090 this OCR fallback was gated
-      // to the Edit Text tool; same gate-removal applies — clicking on
-      // an image-only page with no active drawing tool also promotes.
+      // pre-V1.0052 behavior). V1.0113: this OCR fallback rides the same
+      // `tool === "editText"` gate above — OCR-promoting a scanned page is a
+      // deliberate Edit-Text action again, not something an ordinary (unarmed)
+      // click triggers; otherwise the click falls through to native selection.
       const layerHasText = textLayerRef.current?.querySelector("span") != null;
       if (layerHasText) return;
       e.preventDefault();
@@ -1008,8 +1016,9 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
         background: painted ? "#fff" : "transparent",
         boxShadow: painted ? "var(--page-shadow)" : "none",
       }}
-      // V1.0090: text-layer click is always-on (gated by `onTextLayerClick`
-      // itself, which short-circuits when a drawing tool is active).
+      // V1.0113: text-layer click only edits when the Edit Text tool is armed
+      // (`onTextLayerClick` bails unless `tool === "editText"`); otherwise it
+      // falls through to native text selection.
       onClick={onTextLayerClick}
       onContextMenu={onContextMenu}
     >
@@ -1069,9 +1078,9 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
                   tool === "highlight"
                     ? "rgba(255, 230, 0, 0.4)"
                     : tool === "whiteout"
-                      ? "rgba(255,255,255,0.85)"
+                      ? "rgb(255, 255, 255)"
                       : tool === "redact"
-                        ? "rgba(0,0,0,0.85)"
+                        ? "rgb(0, 0, 0)"
                         : "transparent",
                 border:
                   tool === "circle"

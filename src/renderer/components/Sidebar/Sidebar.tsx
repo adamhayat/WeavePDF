@@ -4,7 +4,7 @@ import { Fragment, useEffect, useMemo, useRef, useState } from "react";
 // to extract it as a PDF). Reorder lives in the right-click
 // menu via "Move up" / "Move down" — same end result, no gesture
 // disambiguation needed.
-import { Plus, RotateCw, RotateCcw, Trash2 } from "lucide-react";
+import { Plus, RotateCw, RotateCcw, Trash2, ZoomIn, ZoomOut } from "lucide-react";
 import { useDocumentStore, type DocumentTab } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
@@ -18,6 +18,43 @@ import { OutlinePanel } from "./OutlinePanel";
 import { RevisionsPanel } from "./RevisionsPanel";
 import { PromptModal } from "../PromptModal/PromptModal";
 import type { DraftManifest } from "../../../shared/ipc";
+
+// V1.0105: module-scoped tracker for "internal" sidebar drags. When the user
+// drags a thumbnail, `handleDragStart` calls `webContents.startDrag()` which
+// initiates an OS-level Files drag with a temp PDF payload (`weavepdf-drag-*`
+// in os.tmpdir()). That OS drag, if dropped back into the sidebar, lands as a
+// Files drop on `onDrop`. Pre-V1.0105 the V1.0055 PDF-merge handler caught it
+// and stacked the dragged page into the document — Adam: "Reordering pages
+// seems to create new pages or duplicate them." `onDrop` now consults this
+// ref. If the most recent dragstart fired within the last 30s, we treat the
+// drop as an internal reorder and call `reorderPages` instead of `insertAfter`.
+let internalDragState: { pageNumbers: number[]; startedAt: number } | null = null;
+
+/** V1.0105: given the current page count, the 1-based pages being moved, and
+ *  the 0-based drop index (where the moved block should sit relative to the
+ *  ORIGINAL page list), produce a 0-based source-index array suitable for
+ *  `reorderPages`. Pure function; tested via the e2e spec. */
+export function computeReorder(
+  numPages: number,
+  movedPages1Based: number[],
+  dropAt: number,
+): number[] {
+  const moved = Array.from(new Set(movedPages1Based.map((p) => p - 1))).sort(
+    (a, b) => a - b,
+  );
+  const movedSet = new Set(moved);
+  const rest: number[] = [];
+  for (let i = 0; i < numPages; i++) {
+    if (!movedSet.has(i)) rest.push(i);
+  }
+  // Translate dropAt (an index over all original pages) into a position over
+  // the "rest" list by skipping moved pages that fell before the drop point.
+  let adjustedDropAt = 0;
+  for (let i = 0; i < dropAt && i < numPages; i++) {
+    if (!movedSet.has(i)) adjustedDropAt++;
+  }
+  return [...rest.slice(0, adjustedDropAt), ...moved, ...rest.slice(adjustedDropAt)];
+}
 
 type Props = {
   /**
@@ -41,6 +78,9 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
   const open = useUIStore((s) => s.sidebarOpen);
   const sidebarTab = useUIStore((s) => s.sidebarTab);
   const setSidebarTab = useUIStore((s) => s.setSidebarTab);
+  const thumbScale = useUIStore((s) => s.sidebarThumbScale);
+  const setThumbScale = useUIStore((s) => s.setSidebarThumbScale);
+  const showToast = useUIStore((s) => s.showToast);
   const [pageLabelPrompt, setPageLabelPrompt] = useState<{ pageNumber: number } | null>(null);
   // V1.0055: drop-target index for an external-PDF drop into the thumbnails
   // panel. `null` = no drag in progress; integer N = "insert at position N"
@@ -122,9 +162,17 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
     await applyEdit(activeTab.id, newBytes, { newCurrentPage: afterPage + 1 });
   };
 
+  // V1.0105: the sidebar grows with the thumbnail zoom so 2× thumbs don't
+  // clip. Base 200px = 150pt thumb + 26px gutter + 12px+12px padding rounded.
+  // Width = 50px chrome + 150 × scale.
+  const sidebarWidthPx = Math.round(50 + 150 * thumbScale);
+
   return (
     <>
-    <aside className="flex h-full w-[200px] shrink-0 flex-col border-r border-[var(--panel-border)] bg-[var(--panel-bg)]">
+    <aside
+      className="flex h-full shrink-0 flex-col border-r border-[var(--panel-border)] bg-[var(--panel-bg)]"
+      style={{ width: sidebarWidthPx }}
+    >
       <div className="flex h-8 shrink-0 items-center gap-0.5 border-b border-[var(--panel-border)] px-1">
         <SidebarTabButton
           active={sidebarTab === "pages"}
@@ -192,11 +240,44 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
           </div>
         </div>
       ) : (
-        <div className="flex h-10 shrink-0 items-center justify-between border-b border-[var(--panel-border)] px-3 text-[11px] font-medium uppercase tracking-wider text-[var(--subtle)]">
-          Pages
+        <div className="flex h-10 shrink-0 items-center justify-between gap-2 border-b border-[var(--panel-border)] pl-3 pr-1 text-[11px] font-medium uppercase tracking-wider text-[var(--subtle)]">
+          <span>Pages</span>
           <span className="tnum normal-case text-[var(--muted)]">
             {activeTab.currentPage} / {activeTab.numPages}
           </span>
+        </div>
+      )}
+      {/* V1.0106: zoom strip always visible regardless of selection state.
+          Pre-V1.0106 the zoom buttons lived in the no-selection header — but
+          clicking a thumb selects the page, which switches the header to the
+          rotate/delete toolbar and hid the zoom controls. Adam: "I don't see
+          a way to make the left sidebar smaller." Now zoom + reset live in
+          their own slim strip directly under the header, always reachable. */}
+      {sidebarTab === "pages" && (
+        <div className="flex h-7 shrink-0 items-center justify-end gap-0.5 border-b border-[var(--panel-border)] pr-1">
+          <SidebarIcon
+            label="Smaller thumbnails"
+            onClick={() => setThumbScale(thumbScale - 0.2)}
+            data-testid="sidebar-zoom-out"
+          >
+            <ZoomOut className="h-3.5 w-3.5" strokeWidth={1.8} />
+          </SidebarIcon>
+          <button
+            type="button"
+            onClick={() => setThumbScale(1)}
+            title="Reset thumbnail size"
+            className="tnum h-6 min-w-[32px] rounded px-1 text-[10px] text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]"
+            data-testid="sidebar-zoom-reset"
+          >
+            {Math.round(thumbScale * 100)}%
+          </button>
+          <SidebarIcon
+            label="Larger thumbnails"
+            onClick={() => setThumbScale(thumbScale + 0.2)}
+            data-testid="sidebar-zoom-in"
+          >
+            <ZoomIn className="h-3.5 w-3.5" strokeWidth={1.8} />
+          </SidebarIcon>
         </div>
       )}
 
@@ -252,16 +333,53 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
           const dropAt = dropTargetIndex;
           setDropTargetIndex(null);
           if (dropAt == null || !activeTab?.bytes) return;
-          // Collect dropped PDF paths in drop order. Non-PDFs fall through
-          // to the window handler... wait, we already stopPropagation'd, so
-          // they're just ignored. Image / DOC merge can come later if asked.
-          const pdfPaths: string[] = [];
+
+          // V1.0105: detect internal drag (a sidebar thumbnail dragged
+          // within the same sidebar). The OS-level drag started by
+          // `webContents.startDrag()` carries a temp file under
+          // `os.tmpdir()/weavepdf-drag-*/`. If the dropped file path
+          // includes that marker AND a recent dragstart set
+          // `internalDragState`, treat the drop as a reorder rather than
+          // a PDF merge — Adam: "Reordering pages seems to create new
+          // pages or duplicate them."
+          const droppedPaths: string[] = [];
+          let internalMarkerSeen = false;
           for (const f of Array.from(e.dataTransfer.files)) {
             const filePath = window.weavepdf.getPathForFile(f);
             if (!filePath) continue;
-            const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
-            if (ext === "pdf") pdfPaths.push(filePath);
+            droppedPaths.push(filePath);
+            if (filePath.includes("weavepdf-drag-")) internalMarkerSeen = true;
           }
+          const recentInternal =
+            internalDragState && Date.now() - internalDragState.startedAt < 30_000;
+          if (internalMarkerSeen && recentInternal && internalDragState) {
+            const movedPages = internalDragState.pageNumbers;
+            internalDragState = null;
+            try {
+              const newOrder = computeReorder(activeTab.numPages, movedPages, dropAt);
+              // No-op if the dropped block is already at the drop point.
+              const isUnchanged = newOrder.every((src, i) => src === i);
+              if (isUnchanged) return;
+              const { reorderPages } = await loadPdfOps();
+              const newBytes = await reorderPages(activeTab.bytes, newOrder);
+              // Land the caret on the first moved page in its new position.
+              const newFirstMovedIndex = newOrder.indexOf(
+                Math.min(...movedPages.map((p) => p - 1)),
+              );
+              await applyEdit(activeTab.id, newBytes, {
+                newCurrentPage: newFirstMovedIndex + 1,
+              });
+            } catch (err) {
+              console.error("reorder pages", err);
+              showToast("Couldn't reorder those pages.", "warn");
+            }
+            return;
+          }
+
+          // External PDF drop — V1.0055 merge behaviour.
+          const pdfPaths = droppedPaths.filter((p) =>
+            p.split(".").pop()?.toLowerCase() === "pdf",
+          );
           if (pdfPaths.length === 0) return;
           try {
             const { insertAfter, countPages } = await loadPdfOps();
@@ -279,7 +397,8 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
             }
             await applyEdit(activeTab.id, bytes);
           } catch (err) {
-            alert(`Couldn't merge PDF: ${(err as Error).message ?? err}`);
+            console.error("merge pdf", err);
+            showToast("Couldn't add that PDF.", "warn");
           }
         }}
       >
@@ -294,6 +413,7 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
               active={activeTab.currentPage === pageNumber}
               selected={activeTab.selectedPages.has(pageNumber)}
               tab={activeTab}
+              thumbScale={thumbScale}
               onActivate={(mode) => {
                 if (mode === "set") {
                   setCurrentPage(activeTab.id, pageNumber);
@@ -380,7 +500,10 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                       });
                       if (result.canceled) return;
                       const w = await window.weavepdf.writeFile(result.path, u8ToAb(extracted));
-                      if (!w.ok) alert(`Extract failed: ${w.error}`);
+                      if (!w.ok) {
+                        console.error("extract", w.error);
+                        showToast("Couldn't extract those pages.", "warn");
+                      }
                     },
                   },
                   { kind: "separator" },
@@ -520,6 +643,7 @@ type ThumbProps = {
   active: boolean;
   selected: boolean;
   tab: DocumentTab;
+  thumbScale: number;
   onActivate: (mode: "set" | "toggle" | "range") => void;
   onContextMenu: (clientX: number, clientY: number) => void;
   onAddPageAfter: () => void;
@@ -540,9 +664,11 @@ function DropIndicator() {
 function AddPageSegment({
   afterPage,
   onClick,
+  widthPx,
 }: {
   afterPage: number;
   onClick: () => void;
+  widthPx: number;
 }) {
   return (
     <div
@@ -558,8 +684,9 @@ function AddPageSegment({
           e.stopPropagation();
           onClick();
         }}
+        style={{ width: widthPx }}
         className={cn(
-          "group/add flex h-6 w-[150px] items-center gap-2 rounded-md px-1 text-[11px] font-medium text-[var(--muted)] opacity-0 transition",
+          "group/add flex h-6 items-center gap-2 rounded-md px-1 text-[11px] font-medium text-[var(--muted)] opacity-0 transition",
           "group-hover:opacity-100 hover:bg-[var(--hover-bg)] hover:text-[var(--color-accent)] hover:opacity-100",
           "focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-accent)]/50",
         )}
@@ -611,6 +738,7 @@ function Thumb({
   active,
   selected,
   tab,
+  thumbScale,
   onActivate,
   onContextMenu,
   onAddPageAfter,
@@ -678,7 +806,8 @@ function Thumb({
     (async () => {
       const page = await pdf.getPage(pageNumber);
       if (cancelled) return;
-      const target = 150;
+      // V1.0105: thumb width scales with sidebarThumbScale (0.6×–2.0×).
+      const target = 150 * thumbScale;
       const baseViewport = page.getViewport({ scale: 1 });
       const scale = target / baseViewport.width;
       const viewport = page.getViewport({ scale });
@@ -749,7 +878,7 @@ function Thumb({
       cancelled = true;
       task?.cancel();
     };
-  }, [pdf, pageNumber, tab.version, pendingCount]);
+  }, [pdf, pageNumber, tab.version, pendingCount, thumbScale]);
 
   // V1.0045: the entire thumbnail is HTML5-draggable. Plain drag from anywhere
   // on the page card -> drag-out. No modifier, no dedicated handle, no per-app
@@ -769,6 +898,10 @@ function Thumb({
     const selectedPages = Array.from(tab.selectedPages).sort((a, b) => a - b);
     const pageNumbers =
       selected && selectedPages.length > 1 ? selectedPages : [pageNumber];
+    // V1.0105: remember which pages this drag carries so a drop back into
+    // the sidebar's thumbnail panel can be resolved as a reorder rather
+    // than as the V1.0055 PDF merge.
+    internalDragState = { pageNumbers, startedAt: Date.now() };
     window.weavepdf.pages.startDrag({
       bytes: slice,
       pageNumbers,
@@ -840,7 +973,13 @@ function Thumb({
       >
         {pageNumber}
       </span>
-      {showAddPageAfter && <AddPageSegment afterPage={pageNumber} onClick={onAddPageAfter} />}
+      {showAddPageAfter && (
+        <AddPageSegment
+          afterPage={pageNumber}
+          onClick={onAddPageAfter}
+          widthPx={Math.round(150 * thumbScale)}
+        />
+      )}
     </div>
   );
 }

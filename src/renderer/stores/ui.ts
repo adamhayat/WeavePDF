@@ -61,6 +61,12 @@ type UIStore = {
   // re-pick strip. Capped to the most recent unique entries.
   recentColors: Array<{ r: number; g: number; b: number }>;
   sidebarTab: "pages" | "outline" | "revisions";
+  /** V1.0105: zoom factor for the Pages sidebar thumbnails. Multiplies the
+   *  base 150pt thumbnail width (and the sidebar's own width) so the user
+   *  can shrink thumbs to scan more pages at once, or enlarge them to
+   *  preview content while reorganising. Session-only — defaults to 1.0
+   *  every cold launch. Range clamped to [0.6, 2.0] in setter. */
+  sidebarThumbScale: number;
   // Page layout in the viewer:
   //   single — vertical scroll, one page wide (default)
   //   spread — two pages side-by-side, no cover offset
@@ -130,6 +136,7 @@ type UIStore = {
     | "draw"
     | "image"
     | "sticky"
+    | "checkmark"
     | "crop"
     | "redact"
     | "link"
@@ -188,6 +195,7 @@ type UIStore = {
   setAnnotationColor: (c: { r: number; g: number; b: number }) => void;
   setStrokeWidth: (w: number) => void;
   setSidebarTab: (tab: UIStore["sidebarTab"]) => void;
+  setSidebarThumbScale: (scale: number) => void;
   setViewMode: (mode: UIStore["viewMode"]) => void;
   setMeasureScale: (s: UIStore["measureScale"]) => void;
   setPendingLink: (p: UIStore["pendingLink"]) => void;
@@ -237,12 +245,13 @@ export const useUIStore = create<UIStore>((set) => ({
   welcomeInitialStep: 0,
   stickyPrompt: null,
   textPrompt: null,
-  marginsEnabled: true,
+  marginsEnabled: false,
   pendingImage: null,
   annotationColor: { r: 0.05, g: 0.05, b: 0.1 },
   strokeWidth: 1.5,
   recentColors: [],
   sidebarTab: "pages",
+  sidebarThumbScale: 1,
   viewMode: "single",
   measureScale: null,
   pendingLink: null,
@@ -342,6 +351,8 @@ export const useUIStore = create<UIStore>((set) => ({
     }),
   setStrokeWidth: (w) => set({ strokeWidth: Math.max(0.5, Math.min(12, w)) }),
   setSidebarTab: (tab) => set({ sidebarTab: tab }),
+  setSidebarThumbScale: (scale) =>
+    set({ sidebarThumbScale: Math.max(0.6, Math.min(2.0, scale)) }),
   setViewMode: (mode) => set({ viewMode: mode }),
   setMeasureScale: (s) => set({ measureScale: s }),
   setPendingLink: (p) => set({ pendingLink: p }),

@@ -199,7 +199,7 @@ export function AiModal({ open, onClose }: Props) {
               {busy && (
                 <div className="flex items-center gap-2 text-[12px] text-[var(--muted)]">
                   <Sparkles className="h-3.5 w-3.5 animate-pulse text-[var(--color-accent)]" strokeWidth={2} />
-                  Thinking on-device…
+                  Working on-device…
                 </div>
               )}
               {error && (
@@ -252,7 +252,7 @@ export function AiModal({ open, onClose }: Props) {
               data-testid="ai-run"
             >
               {busy
-                ? "Thinking…"
+                ? "Working…"
                 : mode === "summarize"
                   ? "Summarize"
                   : mode === "qa"

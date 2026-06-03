@@ -41,6 +41,54 @@ function pageContentOrigin(page: PDFPage): { x: number; y: number } {
 
 type Rotation = 0 | 90 | 180 | 270;
 
+/** V1.0111: rotation- and CropBox-aware transform for baking user-placed
+ *  overlays. The renderer captures positions in pdf.js DISPLAY space —
+ *  bottom-left origin, relative to the visible (CropBox) page, with the page's
+ *  /Rotate already applied (see PageCanvas). pdf-lib draws in raw unrotated
+ *  user space, so on a /Rotate 90/180/270 page those coords land in the wrong
+ *  spot and unrotated glyphs read sideways. This maps a display point/rect to
+ *  absolute user space and reports the angle to pass to `rotate:` so text and
+ *  images stay upright on the displayed page.
+ *
+ *  For an unrotated page `point(dx,dy)` === `{dx + cropX, dy + cropY}` — i.e.
+ *  identical to the pre-V1.0111 `+ pageContentOrigin` path — so non-rotated
+ *  PDFs (the overwhelming majority) are byte-for-byte unaffected. The point
+ *  math is verified against pdf.js `viewport.convertToPdfPoint` for all four
+ *  rotations. */
+export function pageBakeTransform(page: PDFPage) {
+  const crop = page.getCropBox();
+  const rotation = ((((page.getRotation().angle % 360) + 360) % 360) || 0) as Rotation;
+  const rotated = rotation === 90 || rotation === 270;
+  // Display dims of the visible (CropBox) page.
+  const Wd = rotated ? crop.height : crop.width;
+  const Hd = rotated ? crop.width : crop.height;
+  const point = (dx: number, dy: number): { x: number; y: number } => {
+    let ux: number;
+    let uy: number;
+    switch (rotation) {
+      case 90: ux = Hd - dy; uy = dx; break;
+      case 180: ux = Wd - dx; uy = Hd - dy; break;
+      case 270: ux = dy; uy = Wd - dx; break;
+      default: ux = dx; uy = dy; break;
+    }
+    return { x: ux + crop.x, y: uy + crop.y };
+  };
+  // A display-space rect → its user-space axis-aligned bounds (width/height
+  // swap for 90/270). Correct for orientation-free fills: whiteout, highlight,
+  // rectangles.
+  const rect = (dx: number, dy: number, w: number, h: number) => {
+    const a = point(dx, dy);
+    const b = point(dx + w, dy + h);
+    return {
+      x: Math.min(a.x, b.x),
+      y: Math.min(a.y, b.y),
+      width: Math.abs(b.x - a.x),
+      height: Math.abs(b.y - a.y),
+    };
+  };
+  return { rotation, point, rect };
+}
+
 function toUint8(bytes: Uint8Array): Uint8Array {
   // Some pdf-lib saves return a wider typed array; normalise.
   return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
@@ -286,12 +334,12 @@ export async function whiteoutRegion(
 ): Promise<Uint8Array> {
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
+  const r = pageBakeTransform(page).rect(region.x, region.y, region.width, region.height);
   page.drawRectangle({
-    x: region.x + origin.x,
-    y: region.y + origin.y,
-    width: region.width,
-    height: region.height,
+    x: r.x,
+    y: r.y,
+    width: r.width,
+    height: r.height,
     color: rgb(1, 1, 1),
     borderWidth: 0,
   });
@@ -366,13 +414,16 @@ export async function drawText(
       : base0;
   const font = await doc.embedFont(resolved);
   const c = opts.color ?? { r: 0, g: 0, b: 0 };
-  const origin = pageContentOrigin(page);
+  const t = pageBakeTransform(page);
+  const p = t.point(opts.x, opts.y);
   page.drawText(opts.text, {
-    x: opts.x + origin.x,
-    y: opts.y + origin.y,
+    x: p.x,
+    y: p.y,
     size: opts.size,
     font,
     color: rgb(c.r, c.g, c.b),
+    // Keep glyphs upright on /Rotate 90/180/270 pages (no-op when rotation 0).
+    rotate: degrees(t.rotation),
   });
   const width = opts.text.length === 0
     ? 0
@@ -433,10 +484,11 @@ export async function drawWrappedText(
   const font = await doc.embedFont(resolved);
   const c = opts.color ?? { r: 0, g: 0, b: 0 };
   const align = opts.align ?? "left";
-  // V1.0104: shift caller-supplied MediaBox-relative coords into pdf-lib's
-  // PDF user space. Single shift applied once at the top so the wrap +
-  // alignment + per-line cursor math below stays unaware of the offset.
-  const origin = pageContentOrigin(page);
+  // V1.0104 + V1.0111: caller coords are MediaBox-relative DISPLAY space. The
+  // wrap + alignment + per-line cursor math below runs in that space; each
+  // final line position is then mapped through pageBakeTransform so the CropBox
+  // offset AND the page /Rotate are both honored (a no-op on normal pages).
+  const t = pageBakeTransform(page);
 
   // Build wrapped lines, remembering which ones are hard-wrapped (next is
   // a forced newline or end of text) — justify skips those because the
@@ -504,12 +556,14 @@ export async function drawWrappedText(
           const gap = (alignBoxWidth - wordsW) / (tokens.length - 1);
           let x = opts.x;
           for (const tok of tokens) {
+            const lp = t.point(x, cursorY);
             page.drawText(tok, {
-              x: x + origin.x,
-              y: cursorY + origin.y,
+              x: lp.x,
+              y: lp.y,
               size: opts.size,
               font,
               color: rgb(c.r, c.g, c.b),
+              rotate: degrees(t.rotation),
             });
             x += font.widthOfTextAtSize(tok, opts.size) + gap;
           }
@@ -517,12 +571,14 @@ export async function drawWrappedText(
           continue;
         }
       }
+      const lp = t.point(drawX, cursorY);
       page.drawText(text, {
-        x: drawX + origin.x,
-        y: cursorY + origin.y,
+        x: lp.x,
+        y: lp.y,
         size: opts.size,
         font,
         color: rgb(c.r, c.g, c.b),
+        rotate: degrees(t.rotation),
       });
     }
     cursorY -= lineGap;
@@ -757,12 +813,12 @@ export async function drawHighlight(
 ): Promise<Uint8Array> {
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
+  const rr = pageBakeTransform(page).rect(region.x, region.y, region.width, region.height);
   page.drawRectangle({
-    x: region.x + origin.x,
-    y: region.y + origin.y,
-    width: region.width,
-    height: region.height,
+    x: rr.x,
+    y: rr.y,
+    width: rr.width,
+    height: rr.height,
     color: rgb(color.r, color.g, color.b),
     opacity: 0.4,
     borderWidth: 0,
@@ -819,17 +875,20 @@ export async function placeImage(
   // V1.0104: shift caller-supplied MediaBox-relative coords into pdf-lib's
   // PDF user space. Applied at the centroid so the rotation math below
   // stays unchanged (the shift composes with the centroid translate).
-  const origin = pageContentOrigin(page);
-  // pdf-lib's drawImage `rotate` option rotates around the draw
-  // origin (= bottom-left of the un-rotated rectangle). To rotate
-  // around the visual CENTER (the user expectation when they say
-  // "rotate this image"), shift the origin so the centroid lands at
-  // (cx, cy) after rotation. Centroid of un-rotated img is (w/2, h/2);
-  // under rotation θ that maps to (w/2·cosθ − h/2·sinθ, w/2·sinθ +
-  // h/2·cosθ) relative to origin. So origin = centroid − that.
-  const cx = region.x + origin.x + w / 2;
-  const cy = region.y + origin.y + h / 2;
-  const θ = (rot * Math.PI) / 180;
+  const tf = pageBakeTransform(page);
+  // pdf-lib's drawImage `rotate` option rotates around the draw origin (=
+  // bottom-left of the un-rotated rectangle). To rotate around the visual
+  // CENTER, shift the origin so the centroid lands at (cx, cy) after rotation.
+  // V1.0104 + V1.0111: the centroid is mapped through pageBakeTransform (CropBox
+  // offset + page /Rotate), and the user's image rotation is composed with the
+  // page rotation so the image stays correctly oriented on /Rotate pages. For
+  // an unrotated page (tf.rotation === 0) this reduces to the prior centroid +
+  // `rot` math exactly.
+  const center = tf.point(region.x + w / 2, region.y + h / 2);
+  const cx = center.x;
+  const cy = center.y;
+  const totalRot = (((rot + tf.rotation) % 360) + 360) % 360;
+  const θ = (totalRot * Math.PI) / 180;
   const cosθ = Math.cos(θ);
   const sinθ = Math.sin(θ);
   const ox = cx - (w / 2) * cosθ + (h / 2) * sinθ;
@@ -863,7 +922,7 @@ export async function placeImage(
         height: sh,
         color: rgb(ds.color.r, ds.color.g, ds.color.b),
         opacity: stepOpacity,
-        rotate: rot ? degrees(rot) : undefined,
+        rotate: totalRot ? degrees(totalRot) : undefined,
         borderWidth: 0,
       });
     }
@@ -874,7 +933,7 @@ export async function placeImage(
     y: oy,
     width: w,
     height: h,
-    rotate: rot ? degrees(rot) : undefined,
+    rotate: totalRot ? degrees(totalRot) : undefined,
     opacity,
   });
 
@@ -890,7 +949,7 @@ export async function placeImage(
       height: h,
       borderColor: rgb(opts.border.color.r, opts.border.color.g, opts.border.color.b),
       borderWidth: opts.border.widthPt,
-      rotate: rot ? degrees(rot) : undefined,
+      rotate: totalRot ? degrees(totalRot) : undefined,
       // Important: do NOT set `color` — that would fill the rectangle
       // with that color and cover the image we just drew.
       opacity: 1,
@@ -945,8 +1004,11 @@ export async function flipImageBytes(
  */
 export async function compressLight(base: Uint8Array): Promise<Uint8Array> {
   const doc = await load(base);
-  const out = await doc.save({ useObjectStreams: true });
-  return toUint8(out);
+  const out = toUint8(await doc.save({ useObjectStreams: true }));
+  // Object-stream packing can leave an already-optimized or image-heavy PDF
+  // the same size or larger. Never hand back a bigger file than we were given
+  // — return the original so "Compress" can't silently inflate the document.
+  return out.byteLength < base.byteLength ? out : base;
 }
 
 // ─── Shape primitives — each one bakes a vector annotation into the PDF ───
@@ -966,14 +1028,14 @@ export async function drawRect(
 ): Promise<Uint8Array> {
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
+  const rr = pageBakeTransform(page).rect(region.x, region.y, region.width, region.height);
   const c = opts.color ?? { r: 0, g: 0, b: 0 };
   const f = opts.fill ?? null;
   page.drawRectangle({
-    x: region.x + origin.x,
-    y: region.y + origin.y,
-    width: region.width,
-    height: region.height,
+    x: rr.x,
+    y: rr.y,
+    width: rr.width,
+    height: rr.height,
     borderColor: rgb(c.r, c.g, c.b),
     borderWidth: opts.thickness ?? 1.5,
     opacity: opts.opacity ?? 1,
@@ -990,15 +1052,15 @@ export async function drawCircle(
 ): Promise<Uint8Array> {
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
+  const rr = pageBakeTransform(page).rect(region.x, region.y, region.width, region.height);
   const c = opts.color ?? { r: 0, g: 0, b: 0 };
   const f = opts.fill ?? null;
   // pdf-lib's drawEllipse uses center + radii.
   page.drawEllipse({
-    x: region.x + origin.x + region.width / 2,
-    y: region.y + origin.y + region.height / 2,
-    xScale: region.width / 2,
-    yScale: region.height / 2,
+    x: rr.x + rr.width / 2,
+    y: rr.y + rr.height / 2,
+    xScale: rr.width / 2,
+    yScale: rr.height / 2,
     borderColor: rgb(c.r, c.g, c.b),
     borderWidth: opts.thickness ?? 1.5,
     opacity: opts.opacity ?? 1,
@@ -1016,11 +1078,11 @@ export async function drawLine(
 ): Promise<Uint8Array> {
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
+  const tf = pageBakeTransform(page);
   const c = opts.color ?? { r: 0, g: 0, b: 0 };
   page.drawLine({
-    start: { x: start.x + origin.x, y: start.y + origin.y },
-    end: { x: end.x + origin.x, y: end.y + origin.y },
+    start: tf.point(start.x, start.y),
+    end: tf.point(end.x, end.y),
     color: rgb(c.r, c.g, c.b),
     thickness: opts.thickness ?? 1.5,
     opacity: opts.opacity ?? 1,
@@ -1038,14 +1100,14 @@ export async function drawArrow(
 ): Promise<Uint8Array> {
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
+  const tf = pageBakeTransform(page);
   const c = opts.color ?? { r: 0, g: 0, b: 0 };
   const thickness = opts.thickness ?? 1.5;
-  // V1.0104: shift the caller-supplied MediaBox-relative endpoints into
-  // pdf-lib's user space up front, so every derived point (shaft, head,
-  // SVG anchor) inherits the offset uniformly.
-  const startU = { x: start.x + origin.x, y: start.y + origin.y };
-  const endU = { x: end.x + origin.x, y: end.y + origin.y };
+  // V1.0104 + V1.0111: map the caller-supplied display-space endpoints into
+  // pdf-lib user space up front (CropBox offset + page /Rotate), so every
+  // derived point (shaft, head, SVG anchor) inherits the same transform.
+  const startU = tf.point(start.x, start.y);
+  const endU = tf.point(end.x, end.y);
 
   // Shaft: stop a bit short of the tip so the arrowhead meets cleanly.
   const dx = endU.x - startU.x;
@@ -1196,13 +1258,13 @@ export async function drawStickyNote(
 ): Promise<Uint8Array> {
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
   const font = await doc.embedFont(StandardFonts.Helvetica);
   const boxSize = 16;
-  // V1.0104: shift the caller-supplied MediaBox-relative origin into pdf-
-  // lib's user space; the marker rect, folded-corner SVG, and note text
-  // all derive from `pos` so a single shift covers them.
-  const pos = { x: position.x + origin.x, y: position.y + origin.y };
+  // V1.0104 + V1.0111: map the caller's display-space position into pdf-lib
+  // user space (CropBox offset + page /Rotate); the marker rect, folded-corner
+  // SVG, and note text all derive from `pos`. On rotated pages the small square
+  // marker lands correctly; the decorative fold may orient slightly differently.
+  const pos = pageBakeTransform(page).point(position.x, position.y);
   // Marker square
   page.drawRectangle({
     x: pos.x,
@@ -1330,29 +1392,28 @@ export async function drawPath(
   if (points.length < 2) return base;
   const doc = await load(base);
   const page = doc.getPage(page1Based - 1);
-  const origin = pageContentOrigin(page);
+  const tf = pageBakeTransform(page);
   const c = opts.color ?? { r: 0.1, g: 0.1, b: 0.1 };
   // pdf-lib's drawSvgPath treats the path's y as growing DOWN from {x, y}.
   // Anchor at (0, pageHeight) and flip each y into DOM-style coords.
-  // V1.0104: shift the SVG anchor by `origin.y` so the y-flip pivots
-  // around the visible page top, and shift each path x by `origin.x` so
-  // the caller's MediaBox-relative coords land at the right user-space x.
-  // Composed math: PDF_y = (pageHeight + origin.y) − (pageHeight − points[i].y)
-  // = origin.y + points[i].y, which is the user-space position of the
-  // caller's MediaBox-relative point.
+  // V1.0111: map every point through pageBakeTransform first (CropBox offset +
+  // page /Rotate), then express it in the flipped SVG frame. For an unrotated
+  // page this is identical to the old `+ origin` / `pageHeight + origin.y`
+  // composition; on a /Rotate page each stroke point lands in the right spot.
   const pageHeight = page.getHeight();
+  const u = points.map((p) => tf.point(p.x, p.y));
   const d =
-    `M ${points[0].x + origin.x} ${pageHeight - points[0].y} ` +
-    points
+    `M ${u[0].x} ${pageHeight - u[0].y} ` +
+    u
       .slice(1)
-      .map((p) => `L ${p.x + origin.x} ${pageHeight - p.y}`)
+      .map((p) => `L ${p.x} ${pageHeight - p.y}`)
       .join(" ");
   page.drawSvgPath(d, {
     borderColor: rgb(c.r, c.g, c.b),
     borderWidth: opts.thickness ?? 1.5,
     borderOpacity: opts.opacity ?? 1,
     x: 0,
-    y: pageHeight + origin.y,
+    y: pageHeight,
   });
   return toUint8(await doc.save());
 }
@@ -1819,16 +1880,18 @@ export async function redactRegion(
     });
     const pngBytes = new Uint8Array(await pngBlob.arrayBuffer());
 
-    // Replace the page with the flattened bitmap at the original page size.
+    // Replace the page with the flattened bitmap. pdf.js already applied the
+    // page's /Rotate when rendering, so the bitmap is UPRIGHT at display
+    // dimensions — the replacement page must therefore have rotation 0.
+    // V1.0111: pre-fix this re-applied the original /Rotate, which double-
+    // rotated redactions on any /Rotate 90/180/270 page (sideways, wrong
+    // aspect). The pageWidthPt/pageHeightPt above are the rotated (display)
+    // dims from getViewport, which is exactly what an upright, rotation-0 page
+    // needs.
     const doc = await load(base);
     const pngImage = await doc.embedPng(pngBytes);
-    // Grab original page rotation so the new flattened page preserves it
-    // (otherwise the rendered bitmap looks double-rotated).
-    const origPage = doc.getPage(page1Based - 1);
-    const rotation = origPage.getRotation();
     doc.removePage(page1Based - 1);
     const newPage = doc.insertPage(page1Based - 1, [pageWidthPt, pageHeightPt]);
-    newPage.setRotation(rotation);
     newPage.drawImage(pngImage, {
       x: 0,
       y: 0,

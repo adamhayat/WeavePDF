@@ -146,21 +146,19 @@ test("V1.0090 #6: image format toolbar exposes rotate / flip / opacity / replace
   }
 });
 
-test("V1.0090 #8: click on baked text (no tool active) promotes to a pending edit", async () => {
+test("V1.0113 #8: baked text only promotes to an edit when the Edit Text tool is armed", async () => {
   const { app, page } = await launchApp();
   try {
     await openFixture(page, "sample.pdf");
     await expect(page.getByText("1 / 5")).toBeVisible();
-
-    // Ensure no tool is active.
-    // (V1.0090 removes the editText gate — clicking baked text in the
-    // pdf.js text layer should promote it regardless of tool state.)
-    // Find a span in the text layer.
     const span: Locator = page.locator('[data-page="1"] .textLayer span').first();
     await expect(span).toBeVisible({ timeout: 10_000 });
+    // No tool armed → normal click, NO pending edit.
     await span.click();
-
-    // After click, a pending text edit should exist.
+    await expect(page.locator('[data-pending-element="text"]')).toHaveCount(0);
+    // Arm Edit Text → same click now promotes the span.
+    await page.getByTestId("tool-edit-text").click();
+    await span.click();
     await expect(page.locator('[data-pending-element="text"]')).toHaveCount(1, { timeout: 5_000 });
   } finally {
     await app.close();

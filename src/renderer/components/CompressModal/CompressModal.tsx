@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { X, Loader2, Sparkles, Check } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
+import { useUIStore } from "../../stores/ui";
 import { compressLight } from "../../lib/pdf-ops";
 import { formatBytes, cn } from "../../lib/cn";
 import { u8ToAb } from "../../../shared/buffers";
@@ -88,6 +89,7 @@ type RowState =
 export function CompressModal({ open, onClose }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const applyEdit = useDocumentStore((s) => s.applyEdit);
+  const showToast = useUIStore((s) => s.showToast);
   const [rows, setRows] = useState<Record<string, RowState>>({});
   const [appliedId, setAppliedId] = useState<string | null>(null);
   const [showCustom, setShowCustom] = useState(false);
@@ -210,7 +212,7 @@ export function CompressModal({ open, onClose }: Props) {
     if (!activeTab?.bytes) return;
     const gsOk = await window.weavepdf.ghostscript.available();
     if (!gsOk) {
-      alert("Ghostscript required for custom compression. Run `brew install ghostscript`.");
+      showToast("Custom compression needs Ghostscript — run brew install ghostscript.", "warn");
       return;
     }
     const customId = "custom";

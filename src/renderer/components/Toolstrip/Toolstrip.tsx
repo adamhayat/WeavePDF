@@ -11,6 +11,7 @@ import {
   Pencil,
   Image as ImageIcon,
   MessageSquare,
+  Check,
   Crop,
   RotateCw,
   RotateCcw,
@@ -24,6 +25,7 @@ import {
   Scissors,
   Droplets,
   FileText,
+  Info,
   Link as LinkIcon,
   Ruler,
   ShieldAlert,
@@ -82,6 +84,25 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
 
   const rotate = async (delta: 90 | -90 | 180) => {
     if (!activeTab.bytes) return;
+    // V1.0108: element-aware. Pending image selected → rotate the overlay;
+    // pending text/shape selected → no-op with toast; nothing selected →
+    // rotate the page(s). Mirrors `rotateSelected` in App.tsx so the
+    // toolbar buttons and ⌘[/⌘] hotkeys behave identically.
+    const ui = useUIStore.getState();
+    if (ui.selectedPendingImageId) {
+      const edit = activeTab.pendingImageEdits.find((e) => e.id === ui.selectedPendingImageId);
+      if (edit) {
+        const next = (((edit.rotation ?? 0) + delta) % 360 + 360) % 360;
+        useDocumentStore.getState().updatePendingImageEdit(activeTab.id, edit.id, {
+          rotation: next,
+        });
+        return;
+      }
+    }
+    if (ui.selectedPendingTextId || ui.selectedPendingShapeId) {
+      ui.showToast("This element can't be rotated — clear the selection to rotate the page.", "info");
+      return;
+    }
     const targets = hasSelection
       ? Array.from(activeTab.selectedPages)
       : [activeTab.currentPage];
@@ -175,6 +196,15 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
           onClick={tt("sticky")}
           data-testid="tool-sticky"
           title="Sticky note — click to place"
+        />
+        <ToolButton
+          label="Check"
+          hint="V"
+          icon={<Check className="h-[14px] w-[14px]" strokeWidth={2.5} />}
+          active={tool === "checkmark"}
+          onClick={tt("checkmark")}
+          data-testid="tool-checkmark"
+          title="Checkmark — click to place a ✓ (e.g. on a checkbox)"
         />
         <ToolButton
           label="Highlight"
@@ -358,7 +388,7 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
         <ToolButton
           label="Info"
           hint="⌘I"
-          icon={<FileText className="h-[14px] w-[14px]" strokeWidth={1.8} />}
+          icon={<Info className="h-[14px] w-[14px]" strokeWidth={1.8} />}
           onClick={openMetadata}
           data-testid="tool-metadata"
           title="Document properties"

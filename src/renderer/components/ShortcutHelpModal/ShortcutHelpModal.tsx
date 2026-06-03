@@ -50,6 +50,7 @@ const sections: ShortcutSection[] = [
       { action: "Signature", shortcut: "S" },
       { action: "Place Image", shortcut: "I" },
       { action: "Sticky Note", shortcut: "N" },
+      { action: "Checkmark", shortcut: "V" },
       { action: "Highlight", shortcut: "H" },
       { action: "Whiteout", shortcut: "W" },
       { action: "Redact", shortcut: "X" },

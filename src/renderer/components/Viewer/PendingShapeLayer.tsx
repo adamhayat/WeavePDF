@@ -21,6 +21,14 @@ const PAGE_MARGIN_PT = 36;
 export function PendingShapeLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt, pageHeightPt }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const marginsEnabled = useUIStore((s) => s.marginsEnabled);
+  // V1.0110: when the user picks a creation tool (text, image, signature,
+  // any drawing tool), pending shapes go pointer-events: none so the
+  // gesture targets the interaction layer underneath. Otherwise a placed
+  // whiteout sits at z-20 above the interaction layer and intercepts the
+  // click — the user can't add a text element on top of a whiteout.
+  // "editText" stays interactive (it acts on baked spans, not the shape).
+  const tool = useUIStore((s) => s.tool);
+  const shapesInteractive = tool === "none" || tool === "editText";
   if (!activeTab) return null;
   const shapes = activeTab.pendingShapeEdits.filter((e) => e.page === pageNumber);
   if (shapes.length === 0) return null;
@@ -36,6 +44,7 @@ export function PendingShapeLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt,
           pageWidthPt={pageWidthPt}
           pageHeightPt={pageHeightPt}
           marginsEnabled={marginsEnabled}
+          interactive={shapesInteractive}
         />
       ))}
     </>
@@ -50,6 +59,10 @@ type ShapeProps = {
   pageWidthPt: number;
   pageHeightPt: number;
   marginsEnabled: boolean;
+  /** V1.0110: false when a creation tool is active — shape's outer div
+   *  is pointer-events: none so clicks pass through to the interaction
+   *  layer below (e.g. "text" tool placing over a whiteout). */
+  interactive: boolean;
 };
 
 function PendingShape(props: ShapeProps) {
@@ -75,7 +88,7 @@ function PendingShape(props: ShapeProps) {
 
 type BoxKind = Extract<PendingShapeEdit, { kind: "rect" | "ellipse" | "highlight" | "whiteout" | "redact" }>;
 
-function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: BoxKind }) {
+function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: BoxKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
@@ -307,11 +320,14 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
     ]);
   }, [openLinkForShape, removeShape, setSelectedId, shape.id, shape.kind, tabId]);
 
-  // Visual style by kind.
+  // Visual style by kind. Whiteout is fully opaque (matches the baked
+  // `rgb(1, 1, 1)` rectangle): the prior 0.95 opacity let ~5% of the
+  // canvas-rendered glyphs bleed through, so the user-visible overlay
+  // looked like a faded ghost of the original text.
   const fill =
     shape.kind === "highlight" ? "rgba(255, 230, 0, 0.4)"
-      : shape.kind === "whiteout" ? "rgba(255, 255, 255, 0.95)"
-      : shape.kind === "redact" ? "rgba(0, 0, 0, 0.95)"
+      : shape.kind === "whiteout" ? "rgb(255, 255, 255)"
+      : shape.kind === "redact" ? "rgb(0, 0, 0)"
       : "transparent";
   const strokeColor =
     shape.kind === "rect" || shape.kind === "ellipse"
@@ -323,7 +339,7 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
   return (
     <div
       className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
+      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind={shape.kind}
@@ -347,7 +363,7 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
           boxSizing: "border-box",
         }}
       />
-      {selected && (
+      {selected && interactive && (
         <>
           <Handle pos="nw" onDown={(e) => startDrag(e, "nw")} onMove={onPointerMove} onUp={onPointerUp} />
           <Handle pos="ne" onDown={(e) => startDrag(e, "ne")} onMove={onPointerMove} onUp={onPointerUp} />
@@ -364,7 +380,7 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
 
 type LineKind = Extract<PendingShapeEdit, { kind: "line" | "arrow" }>;
 
-function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: LineKind }) {
+function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: LineKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
@@ -560,7 +576,7 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
   return (
     <div
       className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
+      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind={shape.kind}
@@ -605,7 +621,7 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
           </>
         )}
       </svg>
-      {selected && (
+      {selected && interactive && (
         <>
           {/* Endpoint hitboxes — sit on top of the SVG circles for pointer grabbing. */}
           <div
@@ -636,7 +652,7 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
 
 type FreehandKind = Extract<PendingShapeEdit, { kind: "freehand" }>;
 
-function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: FreehandKind }) {
+function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: FreehandKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
@@ -818,7 +834,7 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
   return (
     <div
       className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
+      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind={shape.kind}
@@ -837,7 +853,7 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
           className="pointer-events-none absolute inset-0 outline outline-2 outline-dashed outline-[var(--color-accent)]/60"
         />
       )}
-      {selected && (
+      {selected && interactive && (
         <DeleteChip onClick={() => { removeShape(tabId, shape.id); setSelectedId(null); }} />
       )}
     </div>
@@ -848,7 +864,7 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
 
 type StickyKind = Extract<PendingShapeEdit, { kind: "sticky" }>;
 
-function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled }: ShapeProps & { shape: StickyKind }) {
+function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: StickyKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
@@ -980,7 +996,7 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeight
   return (
     <div
       className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: MARKER_W * zoom, height: MARKER_H * zoom }}
+      style={{ left: leftPx, top: topPx, width: MARKER_W * zoom, height: MARKER_H * zoom, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind="sticky"

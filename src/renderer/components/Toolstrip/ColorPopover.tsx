@@ -40,7 +40,8 @@ export function ColorPopover() {
     tool === "circle" ||
     tool === "line" ||
     tool === "arrow" ||
-    tool === "draw";
+    tool === "draw" ||
+    tool === "checkmark";
   if (!relevant) return null;
 
   return (

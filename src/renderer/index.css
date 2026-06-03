@@ -115,6 +115,27 @@ body {
   animation: acr-shake 80ms ease-in-out 2;
 }
 
+/* Honor the macOS "Reduce Motion" accessibility setting. Strip transitions,
+   animations, and the modal backdrop blur so the app stays calm for users
+   with vestibular sensitivity. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+  .shake {
+    animation: none !important;
+  }
+  [class*="backdrop-blur"] {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+}
+
 /* pdf.js text layer — default styles so selection matches canvas.
    `user-select: text` is required because body has `select-none` on the chrome. */
 .textLayer {

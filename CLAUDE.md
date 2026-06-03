@@ -4,7 +4,7 @@
 > **Then `BRAND.md`** for the canonical brand identity (name, voice, palette, type, icon) — `BRAND.md` takes precedence over this file for voice and visual decisions. This file still wins on engineering rules.
 > **Update `HANDOFF.md` and `CHANGELOG.md` after every change — same turn, not later.** See Critical Rule #0.
 
-Local Mac-native alternative to Adobe Acrobat. No cloud, no account, no subscription. Target user: Adam (personal use on macOS). Current version: **V1.0002** — see `HANDOFF.md` for the full state. Display version comes from `package.json`'s semver patch field, padded to 4 digits (semver `1.0.2` → display `V1.0002`). Bump per Critical Rule #12.
+Local Mac-native alternative to Adobe Acrobat. No cloud, no account, no subscription. Target user: Adam (personal use on macOS). The current version is whatever `package.json`'s `"version"` says — see `HANDOFF.md`'s Status line for the live number; don't hardcode it here (it goes stale). Display version comes from `package.json`'s semver patch field, padded to 4 digits (semver `1.0.2` → display `V1.0002`, `1.0.111` → `V1.0111`). Bump per Critical Rule #12.
 
 The project shipped a full rename from "Acrofox" to **WeavePDF** in V1.0002 (see `HANDOFF.md` 2026-04-28 session log entry). Bundle ID is now `ca.adamhayat.weavepdf`, the installed app is `/Applications/WeavePDF.app`, the Finder Quick Actions are "Compress / Convert to PDF / Extract first page / Combine into PDF / Rotate 90° **with WeavePDF**", and the accent color shifted from electric violet to Loom Indigo. The new app icon is a flat indigo squircle with a page glyph and two crossing threads forming a `W`. All historical references in this file and in HANDOFF/CHANGELOG that still mention "Acrofox" are intentional historical context — do not "fix" them.
 
@@ -258,11 +258,15 @@ const app = await electron.launch({
 
 ## Known Follow-Ups / Deferred
 
-See the "Not yet built" section in `HANDOFF.md` for the authoritative list. Short version: password protection (needs qpdf), AcroForm fill, OCR (Swift bridge), PKCS#7 digital signatures, true content-removal redaction, Ghostscript-grade compression, drag-resize handles post-placement, right-click context menus, font-matching in Edit Text, batch ops, DOCX export, PDF/A, Bates numbering.
+See the "Not yet built" section in `HANDOFF.md` for the authoritative list.
+
+**Already shipped (do not re-implement — this list was stale through V1.0110):** password protect / encrypt + decrypt (qpdf, AES-256), AcroForm fill, Apple Vision OCR (Swift bridge), PKCS#7 digital signatures, content-removal redaction (`redactRegion` flattens the page region to a raster — the text bytes are gone, not just covered), batch ops, DOCX export, Bates numbering, right-click context menus.
+
+**Genuinely deferred:** Ghostscript-grade compression (current `compressLight` is structure-only object-stream packing; it now refuses to inflate), drag-resize handles on already-baked (non-pending) elements, font-matching in Edit Text, PDF/A conformance, and (correctness gaps found in the V1.0111 review) rotation-aware baking for `/Rotate` 90/180/270 pages and a post-sign edit lock so later edits can't silently invalidate a digital signature. See `HANDOFF.md` for the full pre-launch review findings.
 
 ## Non-Goals (v1)
 
-Form creation (filling is on the list; creating new fillable fields from scratch is not). PDF compare. AI assistant. Cloud sync. Account. DOCX/XLSX export. PDF/A. Prepress. Bates numbering. Toolbar customization UI. Skeuomorphic paper textures. Onboarding tutorials. Paywalls.
+Form creation (filling is on the list; creating new fillable fields from scratch is not). PDF compare. Conversational AI assistant (on-device single-shot summarize / rewrite / ask-one-question IS shipped — only a persistent chatbot is out). Cloud sync. Account. XLSX export. PDF/A. Prepress. Toolbar customization UI. Skeuomorphic paper textures. Onboarding tutorials. Paywalls. (DOCX export and Bates numbering were on this list but shipped — removed.)
 
 ## Visual Language
 

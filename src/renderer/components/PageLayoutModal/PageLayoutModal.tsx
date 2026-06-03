@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { X, Grid3x3, Maximize2, BookOpen, Scissors, Crop } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
+import { useUIStore } from "../../stores/ui";
 import {
   nUpPages,
   autoCropPages,
@@ -37,6 +38,7 @@ const PAPERS: Array<{ id: PaperSize; label: string }> = [
 export function PageLayoutModal({ open, onClose }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const applyEdit = useDocumentStore((s) => s.applyEdit);
+  const showToast = useUIStore((s) => s.showToast);
   const [tab, setTab] = useState<TabId>("nup");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ before: number; after: number; pages: number } | null>(null);
@@ -105,7 +107,8 @@ export function PageLayoutModal({ open, onClose }: Props) {
       const newPages = useDocumentStore.getState().tabs.find((t) => t.id === activeTab.id)?.numPages ?? beforePages;
       setResult({ before, after: out.byteLength, pages: newPages });
     } catch (err) {
-      alert(`${tab} failed: ${(err as Error).message ?? err}`);
+      console.error("page layout", err);
+      showToast(`Couldn't apply ${tab}.`, "warn");
     } finally {
       setBusy(false);
     }

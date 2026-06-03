@@ -86,7 +86,10 @@ export function DigitalSignModal({ open, onClose }: Props) {
         reason: reason.trim() || undefined,
         location: location.trim() || undefined,
       });
-      await applyEdit(fresh.id, new Uint8Array(signed));
+      // Pass `signed: true` so the tab is marked signed — any later edit that
+      // re-serializes the PDF will then warn and clear the flag rather than
+      // silently leaving a document that looks signed but no longer validates.
+      await applyEdit(fresh.id, new Uint8Array(signed), { signed: true });
       setPhase("done");
     } catch (err) {
       setError((err as Error).message ?? String(err));
