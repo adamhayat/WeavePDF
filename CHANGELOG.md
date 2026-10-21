@@ -3,7 +3,360 @@
 All notable changes to Acrofox PDF Editor.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
-## [Unreleased] — V1.0114 Checkmark tool + V1.0113 text-selection fix
+## [Unreleased] — V1.0135 Hotfix: ⌘V pasted a copied element twice
+
+Adam (2026-10-21, on V1.0134): *"I copied and pasted this and when I pasted it printed it twice and once over the image? Weird"* — the screenshot showed the 17 pt copy of the box plus a second, 12 pt copy over the image.
+
+### Fixed — V1.0135
+- **One ⌘V delivered two `paste` events.** On macOS Electron, the Edit menu's `role: "paste"` runs the browser paste command AND the page still receives the ⌘V keydown, which Blink turns into a second paste command (Electron's `before-input-event` docs describe the two as separate). The first event pasted the element copy; the second no longer matched the clipboard text byte-for-byte and fell through to the system-text path (a new 12 pt box at the centre of the view — "once over the image"). Both the copy and the paste handlers now swallow a second event that arrives within 150 ms of one they handled ([element-clipboard-actions.ts](src/renderer/lib/element-clipboard-actions.ts)), and the "is the system clipboard still what we wrote" check compares trimmed text. Regression tests: 3 in `v1.0134-elements.test.ts` (dedupe window, trailing-newline tolerance, handlers consult the dedupe before touching the page).
+
+## [Unreleased] — V1.0134 Thumbnails show the real elements; text frame hugs the text; ⌘C/⌘V, shift-select and text colour for placed elements
+
+Adam (2026-10-21), five reports in one session: *"Why is the left sidebar not showing proper preview of pasted screenshot"*, *"Why is text element showing a box outside of the right side"*, *"I can't copy the text element, command C and it won't copy and paste"*, *"Selecting both elements, I can only drag the image"*, *"Adding a link doesn't make the text blue, and I also don't see font color options."*
+
+### Fixed — V1.0134
+- **Sidebar thumbnails painted every placed element as a translucent purple rectangle** (since V1.0090), so a pasted screenshot showed as a purple box. The thumbnail now draws the real image (with rotation / flip / opacity / border), the real text (font, size, bold/italic, colour, wrapped to its width, alignment) and the real shapes, in the viewer's stacking order (`orderLayers`). Painter: [thumb-overlays.ts](src/renderer/lib/thumb-overlays.ts). The pdf.js page render goes to an offscreen canvas and only re-runs when the page bytes or the zoom change (the V1.0095 freeze guard is kept); the visible thumbnail is re-composited cheaply whenever an element changes, so it now follows drags and typing instead of snapping only on add/remove.
+- **A new text box's dashed frame ran out to the page edge.** The frame was drawn at the stored wrap width, which every creation path sets to "from here to the right margin / page edge". At rest the frame now hugs the text (the solid ring and the dashed frame coincide); it shows the stored width only while the width handle is being dragged. The width handle moved from the bottom-right corner (which the font-size handle also occupies) to the middle of the right edge.
+- **⌘C / ⌘X / ⌘V did nothing for a selected text box** (or image, or shape). The Edit menu's Copy/Paste are browser roles that only know about selected page text. The app now listens to the document's `copy` / `cut` / `paste` events (which both the menu roles and the keys dispatch, exactly once): ⌘C copies every selected element with all its attributes (and puts the text, or the PNG, on the system clipboard so it also pastes into other apps); ⌘V pastes copies offset 12 pt from the source, stepping on each repeat, and keeps them on the page; ⌘X cuts. If something newer has been copied in another app since, ⌘V pastes that instead (text → a text box, image → an image) at the centre of the visible part of the current page. [element-clipboard.ts](src/renderer/lib/element-clipboard.ts) (decisions) + [element-clipboard-actions.ts](src/renderer/lib/element-clipboard-actions.ts) (DOM wiring).
+- **Adding a link left the text black.** Add link from a text box's bar (whole text) now colours the box link-blue, and the colour is baked into the saved file. (A link on a URL *inside* a longer text is unchanged — the box keeps its colour.)
+
+### Added — V1.0134
+- **Multi-selection: shift-click** a second (third…) text box, image or shape to add it to the selection. Dragging any member moves them all together; arrow keys nudge them all; Delete removes them all; ⌘C copies them all. A plain click on a member keeps the group (that is how a group drag starts); a plain click elsewhere dissolves it. [group-move.ts](src/renderer/lib/group-move.ts).
+- **Text colour.** New swatch in the text box bar (after the link button): eight presets (black, grey, red, orange, green, link blue, violet, white) plus the system colour picker. Shown on screen, baked at save (`drawText` / `drawWrappedText` `color`), round-tripped through the WeavePDFEdits metadata (`color` on `WeavePdfTextEdit`), reflected in the thumbnail. [text-color.ts](src/renderer/lib/text-color.ts).
+
+### Tests — V1.0134
+- `tests/unit/v1.0134-elements.test.ts` (28): geometry + paste decisions + placement, thumbnail painter with a recording context (real image drawn, text wrapped/coloured/on the baseline, stacking order, other pages skipped), multi-selection semantics on the real UI store, a group drag through the real document store (text + whiteout, line, freehand follow an image by the same delta), colour reaching the PDF content stream (`rg`) and the metadata round-trip, plus source pins for the hugging frame, the handle position, every layer's group-aware selection and begin/follow/end wiring, the clipboard install, and every `color` reconstruction site. The frame pin was proven red by restoring the old page-wide frame.
+
+## [Unreleased] — V1.0133 Reopening a file from Finder shows the file as saved
+
+Adam (2026-10-20): *"when you updated a PDF, save it as the exact same filename, and reopen it in Weave, it opens the last version. You have to close again, then reopen again, and then it shows the correct updated PDF version."*
+
+### Fixed — V1.0133
+- **Opening a PDF from Finder (double-click / Open With / Dock) showed an older version when a tab for that path was already open.** Since V1.0027 the open path switched to the first tab whose path matched and never looked at the file — so after a Save As over the same name from another tab, a restored draft, or any tab that held an earlier version of the file, Finder brought the OLD tab forward. Every tab now records the on-disk stamp (mtime + size) of the bytes it read or wrote; a Finder open reads the file, reuses a tab only when its stamp matches the file now, replaces a stale tab that has nothing unsaved with a fresh load, and keeps a stale tab that carries unsaved work (the file opens beside it, with a toast). Pure resolver in [open-target.ts](src/renderer/lib/open-target.ts); `readFile` / `writeFile` IPC now return `mtimeMs`. Regression tests: `tests/unit/open-target.test.ts` (7, including Adam's two-tab case).
+
+## [Unreleased] — V1.0132 Up/Down arrows move between pages
+
+Adam (2026-10-13): *"Tapping arrow key down or up, scrolls the left sidebar, instead of moving slides/pages."*
+
+### Fixed — V1.0132
+- **↑/↓ scrolled the sidebar instead of changing page.** Only ←/→ were bound to page steps, so ↓ fell through to the browser's native scroll. ↑/↓ now step pages exactly like ←/→ (and still yield to text fields, dialogs, a selected placed element, and the crop box). When one thumbnail is selected the selection follows the page, and the sidebar keeps the current thumbnail in view. Regression test: `tests/unit/page-step.test.ts` (red with the old binding).
+
+## [Unreleased] — V1.0131 Print preview error with Full page; closing a tab selects the first tab
+
+Adam (2026-10-13): Print dialog showed *"Preview error: PDFWorker.fromPort - the worker is being destroyed…"* (2 per sheet + Full page On, no preview, Print disabled) — *"what's this?"*; and *"when closing a tab … the last tab is auto selected, we should revert back to the first tab not last."*
+
+### Fixed — V1.0131
+- **Print preview failed with Full page at 2/4/6/9 per sheet.** pdf.js runs every document on one shared worker; starting a document while another is still being destroyed throws "the worker is being destroyed". V1.0128's new trim step (`trimPagesToContentForPrint`) fired its destroy without waiting, then the preview loaded immediately. Every pdf-ops helper now awaits its destroy (also fixed the same pattern in redaction, auto-crop, Markdown export and replace-all), and the preview retries up to twice after a short wait if it still meets a teardown (tab closes destroy without waiting).
+
+### Changed — V1.0131
+- **Closing the tab you're on now selects the FIRST tab**, not the last (`activeAfterClose` in [tab-order.ts](src/renderer/lib/tab-order.ts); also used by Close tabs to the right).
+
+## [Unreleased] — V1.0130 Hotfix: opening files from Finder did nothing
+
+Adam (2026-10-13, on V1.0129): *"now when I open, nothing opens in Weave?"*
+
+### Fixed — V1.0130
+- **Files opened from Finder (double-click, Open With) never opened.** V1.0129's open batcher stored the browser's `setTimeout` in an object (`{ set: setTimeout }`) and called `timers.set(...)`. Chromium throws "Illegal invocation" when setTimeout is called with a foreign `this` (reproduced in a real Chromium tab); Node allows it, so the unit tests passed. Every open threw inside the IPC listener. The defaults are now wrappers (`(fn, ms) => setTimeout(fn, ms)`), and if batching ever throws the file is opened directly. Regression test stubs setTimeout with Chromium's `this` check (red with the V1.0129 code); the fixed batcher was also run in a real Chromium page.
+
+## [Unreleased] — V1.0129 Drag tabs to reorder; multi-file opens keep Finder's order
+
+Adam (2026-10-13): *"I should be able to move tabs around, also why when I open all it doesn't just auto open them in the right order?"* (five N5 invoices selected in Finder opened as 09-08, 08-04, 09-29, 09-28 …)
+
+### Added — V1.0129
+- **Drag a tab to reorder it** (@dnd-kit sortable, horizontal only, 5 px activation so a click is still a click). Right-click a tab → **Move Tab Left / Move Tab Right** for the same without dragging. New store action `moveTab`.
+
+### Fixed — V1.0129
+- **Opening several files from Finder gave a random tab order.** Finder sends one open-file event per file and each was read + loaded at the same time, so tabs appeared in the order the loads FINISHED. Files arriving together are now collected, sorted by name the way Finder lists them (natural order — 2 before 10), and opened one after another ([tab-order.ts](src/renderer/lib/tab-order.ts) `createOpenBatcher`). The File → Open dialog also opens in name order now (it used click order).
+
+## [Unreleased] — V1.0128 Print: remembers ALL settings; Full page works at 2/4/6/9 per sheet
+
+Adam (2026-10-13, on V1.0127): *"Why wouldn't full page work with multiple sheets? It could work here"* and *"It didn't remember that I used landscape mode, make sure it remembers ALL settings for print."*
+
+### Changed — V1.0128
+- **Orientation and copies are now remembered** too (V1.0127 deliberately left them per-job). A remembered orientation beats the document's shape. Only the page range still resets — "1-3" from one document would silently print part of the next.
+- **Full page works at 2/4/6/9 per sheet.** It trims every page's white margins to one shared content box (all tiles keep the same scale) before tiling, so the content fills its tile; vector, text stays sharp ([print-trim.ts](src/renderer/lib/print-trim.ts), `trimPagesToContentForPrint`). Rotated pages are never trimmed (safe fallback). Only "Fit all on one sheet" still disables it (it already fills the sheet). On Adam's N2 invoice the gain is small (~5%) — its content already runs to the page edges.
+
+### Fixed — V1.0128
+- **2/4/6/9-per-sheet tiled the wrong region of any page whose box doesn't start at 0,0** (Canva-style y0 offsets): pdf-lib's `embedPdf` ignores the box origin. The vector n-up now embeds each page's real CropBox. Found because the Full-page trim relies on it; pinned by a test that fails with the old embed.
+
+## [Unreleased] — V1.0127 Print: remembered settings, no more cut-off sheets, preview = printout
+
+Adam (2026-10-13): *"print settings remain the same for the next time"*; an A4 invoice printed 2-per-sheet on his Brother HL-2240 came out **cut off** whether Full page was on or off; *"full page doesn't even seem to change anything"*; *"make sure the print preview always 100% matches what comes out."*
+
+### Fixed — V1.0127
+- **Printouts cut off.** Since V1.0121 the Print dialog took Paper from the DOCUMENT. His invoice is A4, so Paper = A4 while the printer had Letter loaded: the job was laid out on an A4 sheet (842 pt wide in landscape), CUPS was told `media=A4`, and the Brother printed it onto Letter (792 pt) — ~18 mm fell off. Paper now defaults to **the printer's own paper** (its CUPS default PageSize, read with `lpoptions`, new [cups-media.ts](src/shared/cups-media.ts)); an off-size document is scaled onto that sheet. The preview therefore shows the real sheet.
+- **Preview = printout.** `lp` now gets `-o print-scaling=none`, so the driver prints the exact sheet the preview shows instead of rescaling/cropping it. A warning appears under Paper when the chosen paper isn't the one the printer is set up for.
+- **1-per-sheet shrink-to-fit kept an 18 pt border** (laser printers can't print the outer ~6 mm; the Brother's PPD: 18/12 pt), matching 2/4/6/9-up and Full page.
+- **Full page looked live but did nothing** at 2/4/6/9 per sheet (it only ever applied to 1 per sheet). It is now disabled there, with "Only for 1 page per sheet."
+
+### Added — V1.0127
+- **Print settings are remembered** across prints and restarts ([print-prefs.ts](src/renderer/lib/print-prefs.ts)): printer, paper, layout, scale, Full page, colour, two-sided. Only settings YOU change are stored (the dialog's own guesses are not). Per-job and not remembered: copies, page range, orientation (follows each document). A remembered printer that's gone falls back to the default.
+- Settled V1.0121's open question with Adam's real print: `-o landscape` does not double-rotate (2-up landscape came out correctly oriented).
+
+## [Unreleased] — V1.0126 ⌘S that sticks, saves that don't pile up, one undo timeline
+
+Adam: *"Why do I have this prompt after doing ⌘S? ⌘S doesn't save?"* (the save HAD been written — 15:55 — but the tab came back "unsaved"), plus *"fix all the little bugs… without controlling my screen."* Everything below was verified headless (vitest + PDFKit renders); the app was not launched.
+
+### Fixed — V1.0126: ⌘S, then "unsaved changes" (2026-10-09)
+- **Save took ~8 seconds on his form.** Every element was baked by re-parsing and re-writing the whole PDF (52 elements = 52 full rewrites of a 440 KB file). Closing the window inside that window hit the prompt because the save genuinely hadn't finished. New `bakeInOnePass` ([pdf-ops.ts](src/renderer/lib/pdf-ops.ts)) parses once, lets every primitive draw into the same document, writes once: **7.7 s → 0.25 s** on his real file.
+- **A text box still being edited wasn't saved.** It commits on blur and ⌘S never blurs, so the file got the OLD text; the later blur then marked the tab unsaved. The editing box (and new-text / sticky-note prompts) now register with the save-time flush ([pending-field.ts](src/renderer/lib/pending-field.ts)).
+- **A change that changes nothing no longer marks the tab unsaved** (clicking into a text box and out again used to) — [noop-patch.ts](src/renderer/lib/noop-patch.ts).
+- Form fields now clear only their OWN save-time flush on blur/unmount (they used to wipe the text box's).
+
+### Fixed — V1.0126: saves piled on top of each other (2026-10-09)
+- Save used to bake every element INTO the open document and keep it as an editable overlay too, so the next save drew it again on top. Consequences: deleting or moving an element after a save (or after reopening) left its old copy burned into the page; ghost copies; the file grew every save (his form: 406 → 922 content streams in an afternoon); merely opening Print Preview marked the tab unsaved.
+- **Now the tab keeps the clean page.** Save / Export / Print call `renderOutput` ([document.ts](src/renderer/stores/document.ts)), which bakes page + elements into a COPY. `tagWeaveBakes` marks every content stream (and every font/image resource) the save added; reopening a V1.0126 file runs `stripWeaveBakes` to peel exactly those off and restores the elements as overlays (metadata v3). Re-saving the same file 4× now gives byte-identical sizes (pinned by test). Pages merged in from another WeavePDF save keep their content (stale tags are cleared, never stripped). A document with a redaction is written flat (redaction rasterises the page and can't be peeled back).
+- Files saved by older versions (v1/v2, incl. his Scotia form) can't be un-baked — their old copies stay burned in; their elements still restore and stack correctly on top.
+
+### Fixed — V1.0126: undo order (2026-10-09)
+- ⌘Z always undid ELEMENT changes before PAGE changes, regardless of which came last, and with no element history left it **deleted the newest element** — so after reopening a saved file, ⌘Z deleted your saved elements one by one. Now one timeline ([undo-order.ts](src/renderer/lib/undo-order.ts)): ⌘Z undoes the most recent step, page or element; restored elements are never deleted by undo; undoing back to the saved state shows the tab as saved again.
+
+### Fixed — V1.0126: page operations left elements on the wrong page (2026-10-09)
+- Elements are stored by page number, and no page operation told them anything moved: delete page 1 and page 2's elements sat on page 3's content. Delete / reorder / move up-down / duplicate / insert blank / drop-to-merge now carry elements with their page ([page-remap.ts](src/renderer/lib/page-remap.ts); duplicate copies them). Rotate / crop / n-up / booklet / split / fit / auto-crop flatten the elements on affected pages first so they turn and scale WITH the page (`prepareGeometryEdit`). Extract pages now includes the pages' elements.
+- Find-and-replace edits WeavePDF text boxes directly instead of flattening every element into the page first.
+
+### Fixed — V1.0126: smaller (2026-10-09)
+- **"Close other tabs" / "Close tabs to the right" now ask** about each tab with unsaved work (they discarded it silently). Cancel stops there.
+- **Typed text is kept on an outside click.** Clicking elsewhere while a new text box or sticky note was open threw the text away; it's now kept (Escape / ✕ still discard).
+- **Emptying a text box removes it** instead of leaving an invisible element that kept the tab unsaved forever.
+- Print Preview renders from a private copy and no longer modifies the document.
+
+### Fixed — V1.0126: found by two read-only code reviews (2026-10-09)
+Each verified against the code before fixing; pinned in [v1.0126-fixes.test.ts](tests/unit/v1.0126-fixes.test.ts) (17 tests, each fix mutation-verified).
+- **One pasted tab or Windows line ending made the whole document unsaveable** ("WinAnsi cannot encode"). Tabs → spaces, `\r\n` → `\n`, silently; the single-line drawer turns line breaks into spaces.
+- **⌘Z / ⇧⌘Z / ⌘A while typing** acted on the DOCUMENT (undid a placed checkmark, selected every page). They now go to the focused text field.
+- **⌘I / ⌘E on a selected text box** also opened Document Properties / ran Export Combined PDF. The box's shortcut now wins; clicking those menu items still works.
+- **Two elements could be selected at once** (a just-placed signature + a clicked text box) — Delete removed both. Selection is now single.
+- **A selection left over from another tab** silently disabled ←/→ page turns and Backspace and made Rotate say "This element can't be rotated". Stale selections are now dropped.
+- **"You can't delete every page — close this document instead?"** closed without offering to save. Now goes through the Save / Don't Save prompt.
+- **Editing a filled form field's value with Edit Text / "Aa ▸"** left the field's OLD value in the file — Preview drew it on top of the new text. The save now blanks that field.
+- **Edit Text on a sans-serif form saved in Times** ("sans-serif" contains "serif") and text boxes always showed in Helvetica on screen; screen and file now use the same family.
+- **Drawn signatures** are cropped to the ink and sized like a signature (≤160×45 pt), so they start at the click instead of landing offset inside an oversized box. **"Redraw to replace"** no longer merges the new signature with the old one.
+- **Checkmarks / freehand strokes** save with round corners and ends, like on screen.
+- **Edit Text replacements near a page edge** no longer jump inside the margin away from the white box covering the original.
+- Element arrow-key nudges no longer fire while a dropdown field has focus.
+- **Undo after Save** could restore elements onto pages that no longer existed (after a delete / flatten), after which EVERY save threw. Save now keeps only element steps since the last page change, and any element past the last page is skipped at save.
+- **Digital signature:** saving with elements added now warns and drops the "signed" state (the V1.0111 warning was lost in the save rework).
+- **Deleting your last element** marked the tab saved while the file still contained it.
+- **Edits made while a save was being written** were marked saved.
+- **After ~60 undo steps** the saved-point marker drifted; rotating an image recorded no undo step; a click that recorded no new step left a stale redo alive.
+- **Rotating / cropping one page** flattened elements on EVERY page — now only that page's.
+- **Files rotated / cropped / re-paged by another tool** (e.g. Batch rotate) reopened with elements at stale positions; files whose content was rewritten elsewhere could show every element twice. Both now open flat (the page geometry is recorded at save and checked on reopen).
+- A false **"editable layer was stripped by another app"** warning on extracts / print ranges — the marker is now removed with the metadata.
+- Two bakes at once (Print Preview + ⌘S) no longer collide; a stale "can't be drawn" warning no longer leaks into a later save; ⌘S on an emptied text box removes it instead of saving its old text.
+
+### Tests
+- [save-roundtrip.test.ts](tests/unit/save-roundtrip.test.ts): 18 tests — reopen restores the clean page (PDFKit pixels), repeated saves don't grow (stream count AND byte size), delete-after-reopen really deletes, merged-in stale tags are cleared, redact-style rewrites refuse to tag, unified undo picks, page remaps, no-op patches. Each fix mutation-verified (old bake order, no strip, keep stale tags, keep resources → each turns a test red).
+- **Corrected a false-positive in V1.0125's pixel tests:** PDFKit renders unpainted page areas TRANSPARENT and the probe flattened alpha to BLACK, so "text is visible" checks passed regardless. Both suites now composite onto white; the controls are now meaningful.
+- [close-tab.test.ts](tests/unit/close-tab.test.ts): +2 (multi-close prompts / cancel).
+- Full unit suite: **181 pass**, 1 pre-existing skip. Typecheck clean. Built + installed to /Applications (WeavePDF was not running); never launched.
+
+## [Unreleased] — V1.0125 Layers: whiteout no longer sits on top of everything, and the saved file matches the screen
+
+### Fixed — V1.0125: whited-out text came back in the saved file (2026-10-09)
+- Adam: whited out "Condo / 485,000 / 550,000 / 200,000 / 100 / 24,000 / 2026/10/08" on a Scotiabank form. WeavePDF showed white; **Preview showed every one of them**. Byte-proven on the saved file: all of them are WeavePDF text boxes (`/WeavePDFEdits` metadata, 38 text + 16 shapes incl. 10 whiteouts), so the old bake order drew them back over the whiteouts.
+- **Root cause: the screen and the save used opposite stacking orders.** The viewer painted every element at `z-20` in DOM order text → images → shapes, so a whiteout covered every text box. `commitAllPending` drew shapes → images → text, so in the file every text box covered every whiteout. Neither looked at which came first.
+- **Fix: one stacking order for both.** New [layers.ts](src/renderer/lib/layers.ts): every text box, image and shape carries a `z` (new elements go on top), and both the viewer (CSS z-index inside one shared `pending-layer-stack` context in [PageCanvas.tsx](src/renderer/components/Viewer/PageCanvas.tsx)) and the bake ([bake-layers.ts](src/renderer/lib/bake-layers.ts), extracted from `commitAllPending` so tests run the exact save code) read the same `orderLayers` result. A text box's own Edit-Text whiteout is drawn at the text's layer, on screen and in the file.
+- **Reopen matches the file.** `z` is saved in the metadata. Files saved before V1.0125 have none, so they restore in their old bake order (shapes → images → text), which is what their pages actually show. Reopening Adam's current Scotia file therefore shows "Condo" etc. visible, exactly like Preview, until he moves the whiteouts to the front.
+
+### Fixed — V1.0125: you can add things on top of a whiteout (2026-10-09)
+- Text typed over a whiteout was created but painted UNDER it (shapes always rendered last), so it looked like nothing happened. New elements now land on top.
+- Elements fully hidden under a whiteout/redact that sits above them no longer catch clicks ([layers.ts](src/renderer/lib/layers.ts) `buriedIds`). Before, clicking a whited-out area with the Text tool hit the invisible text box underneath instead of placing new text. Once whited out, it's just white.
+
+### Added — V1.0125: Arrange (layer order) for every element (2026-10-09)
+- Right-click any text box, image, signature, shape, whiteout, line, arrow, freehand stroke or sticky note: **Bring to Front / Bring Forward / Send Backward / Send to Back** (greyed when already at that end). One undo step each. Lines, arrows, freehand strokes and sticky notes had no right-click menu at all; they now have Arrange + Delete.
+- ⌘[ / ⌘] were not used: they already rotate pages.
+
+### Tests
+- [layers.test.ts](tests/unit/layers.test.ts), 25 assertions: ordering, Arrange moves, legacy restore order (incl. an anonymised copy of Adam's file's element list: counts and kinds only), buried detection, viewer wiring pins, and **real bakes rendered by macOS PDFKit (Preview's engine) with pixels read back**: whited-out text is white in the saved file; text typed after a whiteout is dark; a control proves the probe can see dark text. **Mutation-verified:** putting the old shapes→images→text order back turns the "Adam's bug" test red.
+- Verified headless only. The app was not launched (new rule, see CLAUDE.md #13).
+
+## [Unreleased] — V1.0124 Verified the backlog of usability claims, then fixed them
+
+Every claim from the V1.0123 review was checked against the source before any code changed. **Four were FALSE and were deleted rather than "fixed"** — see the bottom of this section, because not fixing them is as much a result as the fixes.
+
+### Fixed — V1.0124: closing a tab no longer throws away unsaved work without asking (2026-08-18)
+- **The last destructive action in the app that never asked.** Closing the *window* or quitting always showed Save / Cancel / Don't Save. Closing a single **tab** — ⌘W, the tab's ✕, or the "Close tab" context item — called `closeTab()` directly, so a placed-but-unbaked signature, a drawn shape, typed text or a deleted page vanished silently.
+- **Fix.** New `ConfirmCloseTab` IPC ([ipc.ts](src/shared/ipc.ts) → [main.ts](src/main/main.ts)) shows the **same three-way dialog** the quit path already uses, driven from [close-tab.ts](src/renderer/lib/close-tab.ts). Chosen failure direction throughout: **anything that goes wrong keeps the tab open.** Save failed or Save-As cancelled → tab stays. The dialog itself failed to open → tab stays. Losing work because a dialog broke is the one outcome that must not happen.
+- **Tests.** [close-tab.test.ts](tests/unit/close-tab.test.ts) — 7 assertions; mutation-verified (reverting to an unconditional close turns 4 red).
+
+### Fixed — V1.0124: arrow keys and Backspace no longer hijack what you're typing (2026-08-18)
+- The app menu registered three **bare-key accelerators** — `Backspace` → *Delete Selected Pages*, `→` / `←` → *Next / Previous Page* ([main.ts](src/main/main.ts) `buildAppMenu`). A native macOS accelerator fires regardless of what has focus, so while typing in **any** text field — Watermark, Header/Footer, Metadata, a password prompt, the Add-Text box, the search bar, a form field — the arrow keys could jump pages instead of moving the caret, and Backspace could delete the selected *pages*.
+- **Fix.** Those three menu commands now ignore the keystroke whenever a text field owns the caret (`isEditableShortcutTarget`), which the codebase already used for its renderer-side shortcuts. The ⌘-modified equivalents are untouched. **Deliberately a no-op-if-harmless fix:** if Electron already suppresses these accelerators while typing, the guard simply never trips — it cannot regress either way, which matters because this could not be verified live (see below).
+
+### Fixed — V1.0124: Escape now closes every dialog (2026-08-18)
+- Escape worked in **3 of 20** overlays. The original design said "modals that want Escape register their own handler" and 15 never did, so the gesture appeared to work at random. (Nobody was ever *trapped* — every dialog has a ✕ and a working backdrop click — so this was a reflex defect, not a lockout.)
+- **Fix.** One shared [useEscapeClose](src/renderer/hooks/useEscapeClose.ts) hook, wired into 15 dialogs, each passing **the same guard as its own backdrop click** so the two dismissal paths agree (OCR won't close while busy, Batch while running, Digital Sign while signing).
+- 🔴 **My first attempt was wrong and the verification caught it.** I put a single handler in App.tsx's global Escape hotkey — but `react-hotkeys-hook` by design ignores events targeting an input/textarea/select, i.e. *exactly* when the user is typing in a dialog and most wants out, and a central handler also can't see per-modal busy flags. Reverted in favour of the per-modal hook.
+- **Tests.** [escape-close.test.ts](tests/unit/escape-close.test.ts) — pins the wiring for all 15 (plus the guard expressions), since a new modal added without the hook is invisible in review.
+
+### Fixed — V1.0124: straight lines and arrows are no longer discarded (2026-08-18)
+- The drag-commit gate was `if (box.w < 4 || box.h < 4) return;` for **every** tool. Line, Arrow and Measure take their endpoints from the drag's start/end and never use the box's area — so a perfectly **horizontal underline** (height ≈ 0) or a **vertical rule** (width ≈ 0) was silently dropped. That is the single most ordinary thing a Line tool is for.
+- **Fix.** Extracted to [drag-gate.ts](src/renderer/lib/drag-gate.ts): linear tools are judged on drag **length**, area tools still need both axes (a 200×2 "rectangle" is still an accident). 15 assertions, mutation-verified (9 red on revert).
+
+### Fixed — V1.0124: smaller confirmed defects (2026-08-18)
+- **A just-drawn shape can be recoloured.** The colour/weight controls only set the default for the *next* shape, so a shape's colour was frozen the instant it was drawn and the only remedy was delete-and-redraw. They now also restyle the selected shape (skipping highlight/whiteout/redact/sticky, which have fixed appearances).
+- **⌘K no longer opens the palette on top of a dialog.** Because the palette is z-50 and most dialogs are z-40, running a palette action from there mounted the new dialog *underneath* the visible one — it looked like nothing happened. ⌘K now toggles and stands down while another dialog owns the screen.
+- **The palette is no longer Escape-proof.** Escape lived only on its text input, so clicking a disabled row or the header killed it.
+- **Print no longer closes when you press Return.** The dialog focused its ✕ on open. Focus now goes to the dialog panel — Return does nothing, Escape still closes. (Focusing *Print* instead would be worse: Return would fire a real print job.)
+- **Extract no longer claims success when the file wasn't written.** The write result was discarded, so a failed write closed the dialog exactly like a success.
+- **Colour swatches are visible in dark mode.** Unselected swatches had a transparent border, making the near-black "Ink" dot invisible against the dark toolbar — after picking Red there was no visible target to get back to black.
+- **The sidebar shortcut is advertised correctly.** The command palette and both titlebar tooltips said ⌘B; the real binding is ⇧⌘B (⌘B is Bold).
+
+### Verified FALSE — V1.0124: claims that were NOT bugs, and were not "fixed" (2026-08-18)
+- **"Closing a dirty tab discards overlay-only work because overlays don't set `dirty`."** They do — all three `addPending*` reducers set `dirty: true`. The *mechanism* was wrong, but checking it surfaced the real, worse defect above (no prompt on the per-tab close path at all).
+- **"Print errors render grey because of a `var(--destructive` token typo."** No typo; `--color-destructive` resolves to red in both themes. *(A related real one was found separately: three uses of an undefined `var(--destructive)` in the print modal, corrected in V1.0123.)*
+- **"OCR and Compress have no busy state."** Both are well instrumented; OCR is the best-instrumented long operation in the app.
+- **"The overflowed tab strip is unreachable."** It is a native scroller.
+
+### Known and deliberately deferred — V1.0124
+- **A shape can't be dragged after drawing** (grabbing it makes a duplicate), **sticky-note/text-prompt text is lost on an outside click**, **emptying a text box leaves an invisible orphan that keeps the tab dirty**, and **Combined/DOCX export runs for seconds with no busy indicator**. All confirmed real; all are interaction reworks rather than one-line guards, and none could be verified live this session. Queued in `TODO.md`.
+
+⚠️ **Verification status:** typecheck green and **120 unit tests** pass (up from 96), with every new pin mutation-verified. **None of this was verified in the running app** — it was built and installed but deliberately not launched, because launching a freshly-signed build triggers the macOS keychain prompt and Adam was asleep. The Escape, palette, print-focus, colour-swatch and tab-close-dialog changes are UI behaviour that wants a real click-through.
+
+## [Unreleased] — V1.0123 Usability pass: what you see is what gets saved
+
+### Fixed — V1.0123: saving no longer writes the OLD value of the form field you're still typing in (2026-08-18)
+- Adam asked: *"if we save it, does it appear exactly as it does when editing?"* For AcroForm fields the answer was **no**. Reproduced live: typed `UNFLUSHED-VALUE` into a field, saved **without clicking away first**, and the file on disk kept the **previous** value — while the toast said "Saved.", the tab was marked **clean**, and the screen still showed the new text. Closing the tab afterwards wouldn't even warn.
+- **Root cause.** AcroForm text widgets commit their value on **blur**. Nothing in the save path blurs anything — the macOS **⌘S menu accelerator fires straight into the app with the caret still in the field** — so the typed value lived in React state only and `saveTabById` wrote the pre-edit bytes. (A *mouse* click on the toolbar Save button happened to work, because pressing the button blurs the field first; that's why this survived every previous manual QA pass.)
+- **Fix.** New [pending-field.ts](src/renderer/lib/pending-field.ts): the focused widget registers a committer while it holds the caret, and Save **and** Print await `flushActiveFormField()` before reading bytes. The widget unregisters on blur *and* on unmount, so a stale field can't commit into a later save.
+- **Same fix closes a second silent-loss path.** `applyEdit` / `commitAllPending` **silently return** when another edit is in flight (shared `inFlight` guard), so a ⌘S landing on top of a running edit skipped the overlay bake entirely and still wrote + toasted "Saved.". Save/Print now `await waitForTabIdle(tabId)` first (new export in [document.ts](src/renderer/stores/document.ts)) and refuse with *"Still applying your last change…"* rather than writing stale bytes. This is the hazard the V1.0122 comment named but only fixed for the unlock path.
+- **Tests.** [tests/unit/pending-field.test.ts](tests/unit/pending-field.test.ts) — 5 assertions (awaits the async commit, no-op when unfocused, a throwing commit can't take the save down, unregisters on blur, most-recent-field wins).
+
+### Fixed — V1.0123: one arrow or emoji no longer makes the whole document unsaveable (2026-08-18)
+- Reproduced live: typed `Total → ₹500 中文` into a text overlay. It rendered perfectly on screen; ⌘S then failed outright with **"Couldn't save: WinAnsi cannot encode "→" (0x2192)"** and **nothing was written** — the document could not be saved at all until the character was hunted down and deleted. Anything pasted from a web page or email (arrows, ≤, non-Latin scripts, emoji) triggers it.
+- **Root cause.** pdf-lib's `StandardFonts` are WinAnsi-encoded and **throw** on the first unrepresentable code point — from `drawText` *and* from `widthOfTextAtSize`, so wrapping threw too, and the exception propagated out of the whole save.
+- **Fix.** `sanitizeStandardFontText` in [pdf-ops.ts](src/renderer/lib/pdf-ops.ts) substitutes at bake time (`→` → `->`, `≥` → `>=`, …; anything with no stand-in becomes `?`), applied in `drawText`, `drawWrappedText` and `drawStickyNote`. A save can no longer fail this way. **Everything WinAnsi *can* represent is left untouched** — accents, curly quotes, en/em dashes, `•`, `½`, `€` all bake byte-identically (pinned by a test, since those are what Adam's documents actually contain).
+- **Silently altering someone's words is its own bug, so the save says what it changed** — *"Saved — but → ₹ 中 can't be drawn in a PDF font, so plain-text stand-ins were used."* Two traps here, both caught by verifying on the built app rather than trusting the code: (1) a separate warn toast from inside the bake was **wiped ~200 ms later by "Saved."** — the toast is single-slot — so the message is now folded into the save toast itself via a read-and-clear handoff (`takeLastUnsupportedChars`); (2) the first implementation instrumented `commitAllPendingTextEdits`, which **Save never calls** — the real path is `commitAllPending` (the classic wrong-consumer mistake this project keeps logging). Live-verified end to end.
+- **Tests.** [tests/unit/text-encoding.test.ts](tests/unit/text-encoding.test.ts) — 7 assertions including a **control that proves raw pdf-lib really does throw** on these inputs (so the suite can't pass vacuously). Mutation-verified: reverting each of the three sanitize sites turns its own test red.
+
+### Fixed — V1.0123: the print Range box no longer ejects you mid-edit (2026-08-18)
+- Reproduced live: with Range selected, clearing the box to retype (select-all + delete) instantly flipped the radio back to **All pages**, **disabled** the input and dropped focus — so the rest of what you typed went nowhere and the box stayed empty. Retyping required clicking the radio again.
+- **Root cause.** An effect switched to All-pages on *any* empty input, including the transient empty state in the middle of an edit. Now the switch is skipped while the caret is in the box, and applied on blur instead. (Genuine invalid input was already handled correctly — `9-2` shows *"Pages must be 1–4"* and disables Print; verified live.)
+
+### Fixed — V1.0123: dropping an unsupported file now says so (2026-08-18)
+- Dragging a `.txt` (or anything that isn't a PDF, image or Word file) onto the window did **absolutely nothing** — no toast, no error, no hint — leaving the user unable to tell whether the app was broken, still loading, or simply doesn't accept it. The drop handler's chain had no `else`. Now it names the extension and lists what WeavePDF does accept.
+
+### Verified — V1.0123: usability + WYSIWYG QA sweep (2026-08-18)
+- **Placement fidelity measured, not eyeballed** — placed text, checkmark, highlight and whiteout, then diffed the on-screen overlay against the *baked* pixels after save: centre drift **≤ 0.6 px** for text/checkmark/highlight. Dragging a text overlay before saving lands it exactly where dropped (`x=250` intended, `x=250` baked). At **140 % zoom** a click-placed checkmark has **(0,0)** drift. Multi-line (Shift+Enter) survives the round-trip.
+- **Also confirmed working:** single-letter tool shortcuts (`t/e/s/v`) correctly do *not* fire while typing in a form field or the search box; Escape closes search cleanly; a zero-size click with a shape tool creates nothing; an empty text prompt leaves no orphan; corrupt PDFs toast *"Couldn't open …"*; undo/redo are properly disabled on a freshly opened tab.
+- **Two "findings" were test artifacts, not bugs** — worth recording so they aren't re-reported: CDP-synthesised keystrokes bypass the **native menu bar**, so "⌘S does nothing in a form field" was the harness, not the app; and Playwright **auto-dismisses `window.confirm`**, which made the delete-every-page confirmation look like silent failure.
+
+## [Unreleased] — V1.0122 Review + live QA pass: deleted pages leave no residue, unlocked files never overwrite the original, print fixes
+
+### Fixed — V1.0122: deleted/extracted pages no longer leave their content recoverable in the saved file (2026-08-18)
+- Found by this session's adversarially-verified review of the V1.0121 work; confirmed three independent ways (incl. against a real app-saved artifact).
+- **Root cause.** The V1.0121 in-place rewrite fixed the catalog loss, but pdf-lib's `removePage` only detaches the leaf from the page tree — the page dict, its content streams and images stay in the object table, and `save()` serializes **every** indirect object with no garbage collection. So "Delete page" shipped the deleted page's full content in the file (recoverable by re-attaching the orphan — one `pushLeafNode` call renders it again), and "Extract pages" — the *sharing* feature — embedded the content of every NON-extracted page: extracting 1 page of a 500-page doc produced a file at **99.7% of the source size** carrying 499 recoverable pages. Directly against the app's own privacy bar (redaction exists precisely because covered-not-removed is unacceptable, and Adam shares insurance/MTO forms).
+- **Fix.** New `purgeUnreachableObjects` in [pdf-ops.ts](src/renderer/lib/pdf-ops.ts): mark-and-sweep from the trailer roots after the page splice; anything unreachable can't be rendered by a conforming reader and is deleted from the object table. Wired into `deletePages` and `extractPages`. Also fixed en route: when `form.removeField` throws for an orphan field (its widget's page already gone — the extract path), the field is now unlinked from `/Fields` so it can't anchor orphan pages via its widget's `/P`.
+- **Probe lesson (twice bitten this session):** a qpdf-based "is the content still there" probe is INVALID in both directions — qpdf inserts `%% Page N` comments that false-positive a text grep, and it garbage-collects unreferenced objects on rewrite so it false-negatives the orphans themselves. And pdf-lib hex-encodes text (`<436861…> Tj`), so a literal grep of raw bytes finds nothing. The test helper reads the raw object table via pdf-lib and searches decoded streams for the literal AND hex forms, with a control asserting the marker IS findable pre-delete.
+- **Tests.** [page-ops-preservation.test.ts](tests/unit/page-ops-preservation.test.ts) +4: no orphan `/Page` dicts in the object table, deleted content unrecoverable (control-first), extract-1-of-40 < 30% of source size, mixed-`/P` field survival. Mutation-verified: neutering the sweep turns 3 red; reverting the `/P` guard turns 1 red.
+
+### Fixed — V1.0122: an unlocked (owner-locked) file can no longer silently overwrite its encrypted original (2026-08-18)
+- **Root cause.** The V1.0121 open-boundary unlock swapped in decrypted bytes but never set `wasDecrypted`, so `addTab` kept the original path, `saveInPlace` stayed true, and the first ⌘S wrote the decrypted copy **over the owner-locked original with no dialog** — while the toast promised "unlocked a working copy". The comment above `addTab` states the exact invariant that was being violated.
+- **Fix.** The unlock branch now takes the same route as the password-prompt branch (path dropped ⇒ ⌘S routes to Save As). Same rule applied to the save-time decrypt (flips `saveInPlace` off) and the draft-restore path.
+- **Also (same review):** the save-time decrypt now VERIFIES it took effect (`applyEdit` can silently no-op mid-edit; the save now re-checks `isPdfEncrypted` and aborts with a toast instead of baking garbage), and an open-time unlock failure with qpdf present now shows the same warn toast as the qpdf-missing branch instead of only `console.error`.
+
+### Fixed — V1.0122: merging an owner-locked PDF no longer corrupts the open document (2026-08-18)
+- **Root cause.** Dropping an encrypted PDF onto the thumbnail rail merged its undecryptable streams into the plain host — and the merged container has **no /Encrypt dict**, so the save-time defence could never detect the damage (the guard's value cannot be true in its failure mode). The merged pages rendered blank.
+- **Fix.** New shared [unlock.ts](src/renderer/lib/unlock.ts) `unlockIfOwnerLocked` runs at every ingestion boundary that bypassed the open path: the Sidebar merge loop (skips + toasts a source it can't unlock rather than corrupt the host) and draft restore (pre-V1.0121 drafts can seed still-encrypted bytes). The misleading "last line of defence… merge" comment in App.tsx is corrected.
+
+### Fixed — V1.0122: print fixes from the review (2026-08-18)
+- **Stale `media=` to the printer (P1).** `handlePrint`'s `useCallback` deps omitted `settings.paper`, so changing ONLY the Paper dropdown sent the previous paper's `-o media=` to `lp` — CUPS pulled the wrong tray and rescaled/clipped: the exact V1.0121 "Paper never reached the printer" bug, reintroduced through a memoized closure. Dep added.
+- **Mixed-size docs / range prints (P2).** The fit decision sampled page 1 only; printing Range "2" of a Letter-p1 + A3-p2 doc skipped the fit and sent the A3 page out clipped with `media=Letter` forced. The decision now measures the pages actually being printed (early-exit on first mismatch, via the already-open pdf.js proxy).
+- **Filled forms no longer lose their answers when fitted (P2).** Custom-size sources route the default path through `fitToPaper`, which rebuilds via `embedPdf` — page content only, so a filled form printed with every answer missing. New `flattenFormsForPrint` bakes field values into page content before ANY rebuild path (fit, n-up, full-page, scale); on exotic fields it throws and the rebuild is skipped rather than losing values.
+- **Measurement-failure fallback un-inverted (P3).** A failed page measurement used to FORCE the destructive fit path for every print (`!sourceSheet || …`) — the opposite of the "keep the defaults" fallback the catch promises. No measurement ⇒ no fit.
+
+### Fixed — V1.0122: `npm run release` now actually enforces stable signing (2026-08-18)
+- forge.config.ts documents `WEAVEPDF_REQUIRE_SIGNING=1` as "used by `npm run release`" — but nothing set it, so a release could still silently ship an ad-hoc build (re-arming everyone's keychain prompt). [publish-release.mjs](scripts/publish-release.mjs) now sets it for the make step.
+
+### Changed — V1.0122: test hardening from the review (2026-08-18)
+- [rotation-render.test.ts](tests/unit/rotation-render.test.ts): the `|m0|>|m1|` assertion could not detect upside-down or mirrored text (a rotation sign-flip passed at every rotation). Now asserts the composed display matrix's signs: baseline advances right, ascenders up.
+- [encrypted-save.test.ts](tests/unit/encrypted-save.test.ts): the FIX-path assertion was loadability-only — the exact anti-pattern the sibling suite's header documents. Now asserts the baked text is extractable.
+- [tests/e2e/helpers.ts](tests/e2e/helpers.ts): `ensureFixturesExist` regenerates when `scripts/generate-fixtures.mjs` is newer than the fixtures (gitignored stale fixtures made the V1.0119 spec red on healthy machines).
+- [AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx): the invisible "Aa ▸" pill juts ~20px above each text field and hijacked placement clicks aimed at that strip; it is now suppressed while any tool is armed.
+- CHANGELOG duplicate V1.0115/V1.0117 headings removed; stale `[Unreleased]` umbrellas retitled.
+
+### Verified — V1.0122: full live QA pass of the installed app (2026-08-18)
+- Drove the installed production build over CDP (second instance; Adam's running instance untouched). All pass: open/render (ink-pixel counts), delete page 2 + undo (survivor ink identical), Add Text → bake → save-in-place → text extractable from disk, checkmark tool, form Tab/Shift+Tab (V1.0119), gap placement + field-fill-under-armed-tool (V1.0120), form values persist to saved bytes, print preview seeds A4+landscape from a landscape A4 doc with fitted preview (V1.0121), owner-locked open → unlock toast → delete → save → clean readable output, rotated-page checkmark placement + bake (thumbnail from baked bytes confirms), search (2/5 matches), zoom, view-mode toggle, command palette, revisions panel. Zero renderer console errors. Screenshots in `test-results/qa-2026-08-18/`.
+
+## V1.0121 — Deep QA pass: locked PDFs, form-destroying page ops, print sizing, silent ad-hoc signing
+
+### Fixed — V1.0121: owner-locked PDFs are unlocked at OPEN, so page ops and range printing work (2026-08-16)
+- Adam: *"CVOR_Certificate on my desktop — I can't delete page 2 or print just page 1."* Reproduced in one run against the real file.
+- **Root cause.** `CVOR_Certificate.PDF` is **owner-locked**: AES-128 encrypted with an *empty* user password, so pdf.js opens it with no prompt at all. The open path in [App.tsx](src/renderer/App.tsx) only decrypted inside `catch (isPasswordError)` — a branch that **cannot run for exactly the files that break**, because they never throw. The tab therefore held still-encrypted bytes, and pdf-lib (`ignoreEncryption: true`) copied undecryptable content streams into every structural result. pdf.js then *loads* that output happily and renders a **blank page** (`FormatError: Unknown compression method in flate stream`). Delete page 2 → blank. Print "Pages: 1" → blank sheet.
+- V1.0118 had patched only the **save** path — one of N consumers of those bytes, i.e. the wrong layer.
+- **Fix.** Decrypt **once at the open boundary**: after a successful pdf.js load, `isPdfEncrypted(bytes)` decides (not "did pdf.js refuse"), and qpdf unlocks with the empty password. Every downstream op now operates on clean bytes. A toast says the document was locked and a working copy was unlocked; with qpdf missing it says so plainly instead of leaving the user to discover blank pages.
+- **Also fixed — a data-loss path.** The save-time unlock sat *inside* `if (tab0.dirty && tabHasPendingEdits(tab0))`. A structural edit (delete/reorder/rotate/crop) sets `dirty` but adds no pending overlay, so the gate was false and the already-corrupted encrypted bytes were written **straight over the user's original file**. Encryption is a property of the bytes, so the check now hangs off `dirty` alone.
+- **Live-verified (2026-08-17)** on the real file in the installed app: delete page 2 → `PAGES 1/1` with page 1's rendered ink **unchanged at 164,226 px** (previously blank); print preview at Range = 1 renders the certificate at **92,970 px** of ink (previously a blank sheet). Adam's original stayed byte-identical. Driving the app needed a workaround for the `electron.launch` hang — attach over CDP to a normally-launched app (`--remote-debugging-port=9222` + `connectOverCDP`), which works on the **production** build; recipe in `HANDOFF.md`.
+- **Tests.** [tests/unit/encrypted-page-ops.test.ts](tests/unit/encrypted-page-ops.test.ts) — 11 assertions incl. a pin against the real `~/Desktop/CVOR_Certificate.PDF` (skipped when absent; it is deliberately not committed) and the RC4-40/RC4-128/AES-128/AES-256 matrix. **Why the existing suite missed this:** `encrypted-save.test.ts` asserted `reloadsInPdfJs(...)` — for a content-bearing page the broken output *does* load, only the text is gone. A loadability assertion cannot tell "correct" from "silently blank", so every new assertion checks **extracted text**.
+
+### Fixed — V1.0121: deleting, extracting or reordering pages no longer destroys filled form fields (2026-08-16)
+- **Root cause.** `deletePages` / `extractPages` / `reorderPages` each built a fresh `PDFDocument.create()` and copied the survivors in. `copyPages` carries **page content only** — so the new catalog had no AcroForm, no outline, no page labels and an empty Info dict. Deleting one page of a filled insurance form threw away the answers on **every other page**, and `getFormFields` then returned `[]` so the fields stopped being editable. Range printing goes through `extractPages`, so it silently flattened forms too.
+- **Fix.** All three now **mutate the loaded document** (`removePage` / `insertPage`), which leaves the catalog intact. Orphaned fields (whose only widget was on a removed page) are pruned via each widget's `/P` page ref.
+- **Trap found while fixing it:** pdf-lib does **not** invalidate its page cache in `removePage` — afterwards `getPageCount()` is correct while `getPages()` still returns every original page. Reading the live page set *after* removal silently yields "nothing was removed", so the survivor refs are captured **before** the splice.
+- **Tests.** [tests/unit/page-ops-preservation.test.ts](tests/unit/page-ops-preservation.test.ts) — 9 assertions (field values, metadata, order, range order, refusal to delete every page, pdf.js loadability). Old-vs-new proven side by side: the previous algorithm returned `fields: []`, the new one keeps `VALUE_1`/`VALUE_3`.
+
+### Fixed — V1.0121: printing no longer cuts off landscape / A4 / Legal documents (2026-08-16)
+- Adam: *"printing cuts off pages in the wrong way."*
+- **Root cause.** Print Preview hardcoded `paper: "letter"`, `orientation: "portrait"` regardless of the open document, and then decided whether to fit with `if (paper !== "letter" || orientation === "landscape")` — a test comparing the user's *selection* against a hardcoded assumption about the *source*, never against the real page. For a landscape or A4 document at defaults that test is false, so nothing was fitted and the oversized page went to the driver, which clipped the overflow.
+- **Fix.** Paper and orientation are now seeded from page 1's viewport (which already accounts for `/Rotate`), and the fit decision compares the **actual source page** against the chosen sheet. The same-size path is deliberately left untouched — `fitToPaper` rebuilds the document via `embedPdf`, which would drop the AcroForm.
+- **Also fixed.** The Paper dropdown reached the page geometry but **never the printer**: `lp` was never given `-o media=…`, so CUPS pulled its default tray and rescaled/clipped the job to that media. It is now passed (allowlisted, since it reaches an argv).
+- **Open, needs one real print:** the renderer bakes landscape into the page boxes *and* passes `-o landscape`, which may double-apply in some drivers. Left as-is deliberately — `cupsfilter` in PDF→PDF mode ignores both `landscape` and `media` (verified against a control), so no local probe can distinguish the two behaviours, and changing it blind risks breaking landscape printing that works today.
+
+### Fixed — V1.0121: the build no longer silently falls back to ad-hoc signing (2026-08-16)
+- Adam: *"whenever you make an update the security prompt comes up and I have to do Always Allow each time."*
+- **Root cause of the recurring prompt (measured).** macOS gates keychain items on an ACL **partition list**. Apple-signed code gets `apple:`, Developer-ID code gets a stable `teamid:<TEAM>` — but a **self-signed** certificate produces **no Team ID**, so macOS falls back to `cdhash:<hash>`, which changes on every rebuild. The `WeavePDF Safe Storage` item on this Mac had accumulated **51 cdhashes** — one per build Adam has clicked "Always Allow" for. Every other app's item on the same Mac carries a single `teamid:` entry. The V1.0027 "trust the cert" work fixed the *applications* half of the ACL (that half is correct today); the partition half was never addressable this way. **Verified by experiment:** signing with a self-signed cert carrying an `OU` still yields `TeamIdentifier=not set`, so there is no free workaround — a real fix needs an Apple Developer ID.
+- **Separately, and fixable now:** `detectSigningIdentity()` in [forge.config.ts](forge.config.ts) fell back to ad-hoc **silently** (it even discarded `security`'s stderr). It did exactly that during this session, producing an ad-hoc `/Applications/WeavePDF.app` — which guarantees the prompt *and* can make the saved signature unreadable. It now logs the identity it chose, warns loudly on fallback, and `WEAVEPDF_REQUIRE_SIGNING=1` turns the fallback into a hard build failure.
+
+### Fixed — V1.0121: CLAUDE.md's install snippet installed nothing (2026-08-16)
+- The documented "Package + install" commands still pointed at the pre-rename `out/Acrofox-darwin-arm64/Acrofox.app` and `/Applications/Acrofox.app`. `rm -rf` hit a path that doesn't exist and `cp` failed — so following the documented steps **silently left the old build in place**. This is the mechanism behind the recurring "the fix didn't take, it's still doing the old thing" reports (V1.0113 records exactly that). Paths corrected; the historical rename note is left intact.
+
+## V1.0120 — Signatures place on form PDFs; Tab jumps between fields
+
+### Fixed — V1.0120: signatures (and any click-to-place) now drop onto form PDFs (2026-06-08)
+- Adam: opened the signature modal, clicked OK, "then nothing happens, can't place down the signature." Reproduced on the same fillable credit-card form.
+- **Root cause.** The `AcroFormLayer` container is a full-page `absolute inset-0 z-[15]` div sitting *above* the z-10 interaction layer that handles click-to-place. With `pointer-events` on, it swallowed every click in the gaps between fields on a form PDF. So after OK armed `tool="signature"`, the placement click landed on the form layer and did nothing — and the same was true for image / text / checkmark placement on any form.
+- **Fix.** [AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx) — the container is now `pointer-events-none` so gap clicks fall through to the interaction handler, and each widget (text field wrapper, checkbox, radio, dropdown, and the edit-text target) is `pointer-events-auto` so a click ON a field still fills it (the V1.0076 "fields stay fillable under an active tool" behaviour is preserved). Side benefit: text selection in the gaps of a form PDF works again too.
+- **Tests.** New Playwright regression spec [tests/e2e/v1.0120-signature-placement-on-form.spec.ts](tests/e2e/v1.0120-signature-placement-on-form.spec.ts) (checkmark drops in a gap — a Keychain-free proxy for the signature click-path; and a field still fills under an active tool). `npm run typecheck` green. ⚠️ Same environment caveat as V1.0119 — the Playwright suite can't launch the packaged app here (a reboot-clears-it infra hang), so the spec is a guard rather than a green run this session.
+- **Bumped V1.0119 → V1.0120** per Critical Rule #12.
+
+### Fixed — V1.0119: Tab now jumps from one fillable form field to the next (2026-06-08)
+- Adam, filling a credit-card authorization form: "I should be able to jump from one fillable text to the next by clicking tab. That doesn't work."
+- **Root cause.** Each AcroForm text widget renders the "Aa ▸" format pill `<button>` in the DOM directly after its `<input>`, inside the same wrapper (added in V1.0074, *after* the V1.0039 fix that made Tab survive the async field-commit). The pill is focusable, so pressing Tab from a field focused that `opacity-0` pill instead of the next field — two Tabs were needed to cross one field and the in-between stop was invisible, so Tab appeared to do nothing.
+- **Fix.** [AcroFormLayer.tsx](src/renderer/components/Viewer/AcroFormLayer.tsx) — `tabIndex={-1}` on the pill removes it from the keyboard Tab/Shift+Tab order while leaving it clickable by mouse. The widgets are already emitted in reading order, so Tab now walks the text fields top-to-bottom (and Shift+Tab back up).
+- **Tests.** New Playwright regression spec [tests/e2e/v1.0119-form-tab-navigation.spec.ts](tests/e2e/v1.0119-form-tab-navigation.spec.ts) (Tab address→city, Shift+Tab city→address) plus a second text field added to the `sample-form.pdf` fixture. `npm run typecheck` green. ⚠️ The Playwright suite currently can't launch the packaged app in this environment (all smoke specs time out at `electron.launch` — an Electron 41 / Playwright 1.59 infra issue, unrelated to this change), so the spec is a guard for when e2e is healthy rather than a green run this session.
+- **Bumped V1.0118 → V1.0119** per Critical Rule #12.
+
+### Fixed — V1.0118: signing/editing an owner-locked (encrypted) PDF can now be saved (2026-06-03)
+- Adam's V1.0117 error toast revealed the real reason: **"Couldn't save: No password given."** His insurance forms (Northbridge OPCF 40, etc.) are **owner-locked** — encrypted to restrict editing, but they open with an *empty* user password so there's no prompt.
+- **Root cause (reproduced).** pdf-lib loads encrypted PDFs with `ignoreEncryption: true` but **never decrypts the content streams**. So baking an edit (the signature) either throws (`Expected instance of PDFDict` reading the encrypted page tree) or produces a file pdf.js then rejects ("No password given") — and the whole save fails. This had been failing **silently** before V1.0115's "Saved." toast surfaced it. A Node reproduction ([tests/unit/encrypted-save.test.ts](tests/unit/encrypted-save.test.ts)) encrypts a PDF with qpdf, confirms the bake fails, and confirms decrypt-first fixes it.
+- **Fix.** [App.tsx](src/renderer/App.tsx) `saveTabById` now, before baking, checks `isPdfEncrypted` ([pdf-ops.ts](src/renderer/lib/pdf-ops.ts), new export) and — if the doc is still encrypted at save time — decrypts it with qpdf (empty user password, which clears owner-only locks) and re-loads the clean bytes before committing the edits. The result is an editable, unencrypted copy. (PDFs that need a *real* user password are already decrypted at open via the password prompt, so this only catches the owner-only gap.)
+- **Tests.** New `tests/unit/encrypted-save.test.ts` (3 assertions: detect, reproduce the bug, prove the fix). `npm run typecheck` + `npm run test:unit` green (45 total).
+- **Note:** decryption needs qpdf (`brew install qpdf` — Adam has it). If it's missing the save now shows "Couldn't save: qpdf not installed…" instead of failing silently.
+- **Bumped V1.0117 → V1.0118** per Critical Rule #12.
+
+### Fixed — V1.0117: save failures now show the actual reason; no save path can vanish silently (2026-06-03)
+
+- Adam, after V1.0116: "(1) Save As doesn't load anything; (2) Save gives that error; (3) Closing says work not saved, but clicking Save does nothing." All three save paths failing — and the Save As *dialog itself* not appearing — meant the cause was hidden behind a generic toast.
+- **Fix.** [App.tsx](src/renderer/App.tsx) `saveTabById` is now wrapped end-to-end in try/catch. Any throw — `commitAllPending`, the `saveFileDialog` IPC, or `writeFile` — is caught and shown with its **real message** (e.g. "Couldn't save: EACCES: permission denied" or "…: path not permitted: …"), instead of rejecting into the `void saveCurrent(...)` call and vanishing. The write-refused branch likewise surfaces `writeResult.error`. This makes the failure diagnosable (was flying blind: the error only went to the renderer console).
+- **Suspected root cause (environmental, not a code regression):** the bake path is fully proven (42 Node assertions incl. the signature bake), and the dialog/write code wasn't changed this session — so a save being *refused* points at macOS file-access permission (TCC) for the unsigned app, likely after this session's repeated reinstalls. The fix on the user side is granting WeavePDF Full Disk Access; the proper fix is notarization (the pre-public hardening).
+- **Tests.** `npm run typecheck` + `npm run test:unit` green (42 bake + 4 rotation-render).
+- **Bumped V1.0116 → V1.0117** per Critical Rule #12.
+
+### Fixed — V1.0116: a failed in-place save now falls back to "Save As" instead of dead-ending (2026-06-03)
+- Adam (with a screenshot of the V1.0115 "Couldn't save that file." toast on two signed insurance PDFs): "it says that. It's these 2 files I can't save."
+- **The V1.0115 toast did its job — it exposed a *real* write failure** (previously silent). A 42-assertion Node repro ([tests/unit/save-bake.test.ts](tests/unit/save-bake.test.ts)) — now including `placeImage` (the signature bake) on every rotation, a CropBox-offset page, and with image rotation/border/shadow — confirms **no baker throws**. So the failure is in `window.weavepdf.writeFile` returning `{ok:false}`: `assertBlessed` rejecting the path, or the OS refusing the write (read-only / permission-restricted location, or a path this session never blessed). It's file-specific, which is why only those two failed.
+- **Fix.** [App.tsx](src/renderer/App.tsx) `saveTabById`: when a silent in-place write fails, instead of just toasting, fall back to a **Save As** dialog and retry the write at the chosen path. The user can always put their work somewhere writable, and the dialog re-blesses the chosen path (recovering a stale-bless case — e.g. overwriting the original via the picker). The raw write error is logged to `console.error` for diagnosis.
+- **Also verified this turn:** baked text renders **upright** (not sideways) on /Rotate 90/180/270 pages — new [tests/unit/rotation-render.test.ts](tests/unit/rotation-render.test.ts) reads it back via pdf.js `getTextContent`. The one part of the rotation work I couldn't confirm before is now proven (36→ now part of the 42 + 4 render checks).
+- **Tests.** `npm run typecheck` + `npm run test:unit` green.
+- **Bumped V1.0115 → V1.0116** per Critical Rule #12.
+
+### Fixed — V1.0115: saving an updated file now confirms ("Saved.") instead of looking like nothing happened (2026-06-03)
+- Adam: "Saving doesn't work when I update a file" — pressing Save did nothing visible, for every kind of edit.
+- **Root cause: the save was working, but completely silently.** An opened file has `saveInPlace = true` (document.ts — `!!init.path`, since V1.0041), so Save writes it back **in place with no Save-As dialog**, and the success path showed **no toast** either. With no dialog and no confirmation, a working save is indistinguishable from a broken one — "I pressed Save and nothing happened." A 32-test Node reproduction ([tests/unit/save-bake.test.ts](tests/unit/save-bake.test.ts)) confirmed the bake path and the pdf.js reload are sound on normal and rotated pages, so nothing was actually crashing.
+- **Fix.** [App.tsx](src/renderer/App.tsx) `saveTabById` now (1) shows a quiet **"Saved."** toast on a successful write (per BRAND: a toast when the action isn't visible), and (2) wraps `commitAllPending` in try/catch — previously a thrown bake rejected into the `void saveCurrent(...)` call and vanished; now any genuine failure shows "Couldn't save that file." instead of dying silently.
+- **Tests.** New `tests/unit/save-bake.test.ts` (32 assertions) exercises every bake primitive used by `commitAllPending` plus the pdf.js round-trip. `npm run typecheck` + `npm run test:unit` green.
+- **Bumped V1.0114 → V1.0115** per Critical Rule #12.
 
 ### Added — V1.0114: checkmark stamp tool (toolbar + "V" shortcut) (2026-06-03)
 - Adam: "add a checkmark symbol with a shortcut and toolbar option to easily add checkmarks. And maybe make checkboxes auto clickable?"

@@ -37,7 +37,7 @@ npm run dev           # Vite renderer + Electron main, HMR enabled
 npm run typecheck     # tsc --noEmit across main + renderer + tests
 
 # Package + install
-npm run package       # Builds .vite/ + out/Acrofox-darwin-arm64/Acrofox.app
+npm run package       # Builds .vite/ + out/WeavePDF-darwin-arm64/WeavePDF.app
 npm test              # Runs the packaged Playwright suite (currently 43 specs; see HANDOFF.md)
 
 # Publish a release to GitHub
@@ -52,13 +52,19 @@ npm run release       # Builds DMG via `npm run make`, extracts the V1.<patch>
                       # Draft a release for review: npm run release -- --draft
 
 # Reinstall to /Applications and refresh LaunchServices
-pkill -f "/Applications/Acrofox" 2>/dev/null ; sleep 1
-rm -rf /Applications/Acrofox.app
-cp -R out/Acrofox-darwin-arm64/Acrofox.app /Applications/
-xattr -dr com.apple.quarantine /Applications/Acrofox.app
-touch /Applications/Acrofox.app
+# 2026-10-13: NEVER `rm -rf` + `cp -R` straight into /Applications/WeavePDF.app.
+# macOS App Management blocks writing files (Info.plist, helpers) INTO a
+# `.app` bundle there from a terminal without that permission; the `rm`
+# succeeds and the copy half-fails, leaving a broken app with no icon
+# ("cannot be opened because of a problem"). Copy to a NON-.app staging name
+# first, then rename into place — the rename is allowed. Quit WeavePDF first.
+rm -rf /Applications/.weavepdf-install-tmp
+ditto out/WeavePDF-darwin-arm64/WeavePDF.app /Applications/.weavepdf-install-tmp \
+  && rm -rf /Applications/WeavePDF.app \
+  && mv /Applications/.weavepdf-install-tmp /Applications/WeavePDF.app
+codesign --verify --deep --strict /Applications/WeavePDF.app && echo OK
 /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-  -f /Applications/Acrofox.app
+  -f /Applications/WeavePDF.app
 
 # Fixtures + icon (regenerate after editing sources)
 npm run fixtures                  # writes resources/fixtures/*.pdf (pdf-lib)
@@ -79,7 +85,7 @@ node scripts/build-ai.mjs         # compiles resources/helpers/ai-bin (~62KB)
 
 ### Adding a new editing tool
 
-Most edits in Acrofox flow through this pipeline:
+Most edits in WeavePDF flow through this pipeline:
 
 > **User gesture** → **tool mode in `ui.ts`** → **interaction handler in `PageCanvas.tsx`** → **primitive in `pdf-ops.ts`** → **`applyEdit(tabId, newBytes)` in `document.ts`** → pdf.js reloads → viewer + thumbnails re-render.
 
@@ -122,13 +128,13 @@ await applyEdit(activeTab.id, newBytes); // reloads pdf.js, bumps version, adds 
 Renderer ↔ Main talks through [src/shared/ipc.ts](src/shared/ipc.ts). To add a new channel:
 
 1. Add the channel name to `IpcChannel` and any request/response types.
-2. Add the method to `AcrofoxApi` in [src/shared/api.ts](src/shared/api.ts).
+2. Add the method to `WeavePDFApi` in [src/shared/api.ts](src/shared/api.ts).
 3. Expose it through `contextBridge` in [src/preload/preload.ts](src/preload/preload.ts).
 4. Handle it with `ipcMain.handle(...)` in [src/main/main.ts](src/main/main.ts).
 
 ### Shipping changes to your Mac
 
-The bundled `.app` in `/Applications/Acrofox.app` is what you actually launch from Spotlight/Dock. Dev mode (`npm run dev`) is a separate process. After making changes you want to use, repackage and copy (see the "Package + install" snippet under Commands above).
+The bundled `.app` in `/Applications/WeavePDF.app` is what you actually launch from Spotlight/Dock. Dev mode (`npm run dev`) is a separate process. After making changes you want to use, repackage and copy (see the "Package + install" snippet under Commands above).
 
 ### Pushing a release to everyone
 
@@ -235,6 +241,7 @@ playwright.config.ts
 10. **Close pdf.js documents on tab-close** via `pdf.destroy()` (store does this in `closeTab` and `applyEdit`) — each keeps a worker alive otherwise.
 11. **Forge fuse `EnableNodeCliInspectArguments` stays ON** so Playwright can attach via `--inspect`. If we ever distribute publicly, flip it off + drop E2E against the shipped binary.
 12. **Always bump the version on every shipped change.** Single source of truth is `package.json`'s `"version"` (semver). Format is `1.0.<patch>`; the user-facing display is `V1.0<patch4>` (e.g. semver `1.0.1` → `V1.0001`, `1.0.42` → `V1.0042`). Increment the patch by 1 on every code-changing turn — bug fix, feature, doc-only refactor that ships with code, anything that goes into the next packaged build. Surfaces that show the version: macOS About panel (set in [main.ts](src/main/main.ts) via `app.setAboutPanelOptions`) and the footer of the `⌘/` Keyboard Shortcuts panel ([ShortcutHelpModal.tsx](src/renderer/components/ShortcutHelpModal/ShortcutHelpModal.tsx)). Both compute the display from `package.json` — touch only `package.json`. Note the new version in the same turn's `HANDOFF.md` "Current state" line and the `CHANGELOG.md` `[Unreleased]` section header.
+13. **Never take over Adam's computer to test (2026-10-09).** Adam: *"my computer would go into a long testing phase, opening and closing it and not being usable… reduce the testing to the features you build and their dependents… Make this the rule for every work here."* Default verification is `npm run typecheck` + targeted **headless** vitest tests for the changed feature and what depends on it, with no window. Render visual proof headless (rasterise the saved PDF bytes in node). **Do not launch the app** (no Playwright e2e, no CDP second instance, no `open -a`) unless Adam explicitly asks for live QA in that session; when a UI change can only be confirmed live, say so and hand him a short click-through list. Never fan out agents that launch the app. The full Playwright suite runs only on a release push, after warning him it will take over the screen.
 
 ## Environment Variables
 
@@ -248,7 +255,7 @@ All E2E specs launch the packaged `.app` via Playwright's Electron API:
 
 ```ts
 const app = await electron.launch({
-  executablePath: "/absolute/path/to/.../Acrofox.app/Contents/MacOS/Acrofox",
+  executablePath: "/absolute/path/to/.../WeavePDF.app/Contents/MacOS/WeavePDF",
 });
 ```
 

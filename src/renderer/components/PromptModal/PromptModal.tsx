@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { X } from "lucide-react";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = {
   open: boolean;
@@ -41,6 +42,7 @@ export function PromptModal({
     requestAnimationFrame(() => inputRef.current?.focus());
   }, [open, initialValue]);
 
+  useEscapeClose(open, onClose, !busy);
   if (!open) return null;
 
   const submit = async () => {

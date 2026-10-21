@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { X, FileClock, Trash2 } from "lucide-react";
 import type { DraftManifest } from "../../../shared/ipc";
 import { formatBytes, cn } from "../../lib/cn";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = {
   open: boolean;
@@ -24,6 +25,7 @@ export function RecentDraftsModal({ open, onClose, onRestore }: Props) {
       .finally(() => setLoading(false));
   }, [open]);
 
+  useEscapeClose(open, onClose);
   if (!open) return null;
 
   const refresh = async () => {

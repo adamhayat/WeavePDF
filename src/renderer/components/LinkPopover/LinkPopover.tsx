@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { Link as LinkIcon, X } from "lucide-react";
 import { useUIStore } from "../../stores/ui";
 import { useDocumentStore } from "../../stores/document";
+import { LINK_TEXT_COLOR } from "../../lib/text-color";
 // Lazy-loaded so the pdf-lib chunk (~425 KB) doesn't pull at boot. The
 // import resolves on first link-create click; pdf-lib parses then.
 const loadPdfOps = () => import("../../lib/pdf-ops");
@@ -65,6 +66,14 @@ export function LinkPopover() {
         target,
       );
       await applyEdit(activeTab.id, newBytes);
+      // V1.0134: a link on a whole text box turns the text link-blue, the
+      // way every other editor shows a link. Adam: "Adding a link doesn't
+      // make the text blue."
+      if (pendingLink.textEditId && pendingLink.coversWholeText) {
+        const store = useDocumentStore.getState();
+        store.pushUndoStep(activeTab.id);
+        store.updatePendingTextEdit(activeTab.id, pendingLink.textEditId, { color: LINK_TEXT_COLOR });
+      }
       setPendingLink(null);
       // Drop tool back to none so the user doesn't accidentally drag another
       // link rectangle while the popover is closing.

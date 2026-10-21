@@ -2,6 +2,7 @@ import { useState } from "react";
 import { X, Droplets } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
 import { drawTextWatermark } from "../../lib/pdf-ops";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -43,6 +44,8 @@ export function WatermarkModal({ open, onClose }: Props) {
   };
 
   const previewColor = COLORS[colorIdx];
+
+  useEscapeClose(open, onClose);
 
   return (
     <div

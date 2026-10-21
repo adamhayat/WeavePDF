@@ -176,16 +176,26 @@ export function SearchBar() {
     setReplacing(true);
     setReplaceResult(null);
     try {
-      // Commit pending text/image edits first so they're included in the
-      // search space (otherwise adding a Pending text containing the query
-      // would be ignored, then baked unchanged on save).
-      await useDocumentStore.getState().commitAllPending(activeTab.id);
-      const fresh = useDocumentStore.getState().tabs.find((t) => t.id === activeTab.id);
+      // V1.0126: replace inside WeavePDF's own text boxes directly (same
+      // case-insensitive match as the page text) instead of flattening every
+      // element into the page first — which used to make all of them
+      // permanently uneditable just to run a find-and-replace.
+      const store = useDocumentStore.getState();
+      const fresh = store.tabs.find((t) => t.id === activeTab.id);
       if (!fresh?.bytes) return;
+      let inBoxes = 0;
+      const pattern = new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+      for (const e of fresh.pendingTextEdits) {
+        const hits = e.text.match(pattern)?.length ?? 0;
+        if (hits === 0) continue;
+        inBoxes += hits;
+        store.pushUndoStep(fresh.id);
+        store.updatePendingTextEdit(fresh.id, e.id, { text: e.text.replace(pattern, () => replacement) });
+      }
       const { replaceAllText } = await loadPdfOps();
       const r = await replaceAllText(fresh.bytes, query, replacement);
-      await applyEdit(fresh.id, r.bytes);
-      setReplaceResult(r.replaced);
+      if (r.replaced > 0) await applyEdit(fresh.id, r.bytes);
+      setReplaceResult(r.replaced + inBoxes);
     } catch (err) {
       console.error("replace text", err);
       showToast("Couldn't replace that text.", "warn");

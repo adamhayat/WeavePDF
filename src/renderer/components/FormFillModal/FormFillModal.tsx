@@ -3,6 +3,7 @@ import { X, FormInput } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import { getFormFields, setFormFields, type FormFieldInfo, type FormFieldValue } from "../../lib/pdf-ops";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -57,6 +58,8 @@ export function FormFillModal({ open, onClose }: Props) {
   };
 
   const hasFields = fields.length > 0;
+
+  useEscapeClose(open, onClose);
 
   return (
     <div

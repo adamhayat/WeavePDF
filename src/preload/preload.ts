@@ -40,6 +40,10 @@ const api: WeavePDFApi = {
     }>,
   printWindow: () => ipcRenderer.invoke(IpcChannel.PrintWindow) as Promise<void>,
   notifyDirtyTabs: (names) => ipcRenderer.send(IpcChannel.NotifyDirtyTabs, names),
+  confirmCloseTab: (name) =>
+    ipcRenderer.invoke(IpcChannel.ConfirmCloseTab, name) as Promise<
+      "save" | "cancel" | "discard"
+    >,
   onSaveAllRequest: (cb) => {
     const listener = () => cb();
     ipcRenderer.on(IpcChannel.RequestSaveAll, listener);

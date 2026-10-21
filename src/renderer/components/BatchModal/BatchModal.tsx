@@ -2,6 +2,7 @@ import { useState } from "react";
 import { X, Layers, CheckCircle2, AlertCircle, Play } from "lucide-react";
 import { compressLight, drawTextWatermark, rotatePages } from "../../lib/pdf-ops";
 import { u8ToAb } from "../../../shared/buffers";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -34,6 +35,7 @@ export function BatchModal({ open, onClose }: Props) {
   const [running, setRunning] = useState(false);
   const [results, setResults] = useState<FileResult[]>([]);
 
+  useEscapeClose(open, onClose, !running);
   if (!open) return null;
 
   const pickFiles = async () => {

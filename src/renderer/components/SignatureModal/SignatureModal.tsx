@@ -3,6 +3,7 @@ import SignaturePad from "signature_pad";
 import { X, Trash2, PenLine, Type as TypeIcon } from "lucide-react";
 import { useUIStore } from "../../stores/ui";
 import { cn } from "../../lib/cn";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Tab = "draw" | "type";
 
@@ -73,6 +74,17 @@ export function SignatureModal({ open, onClose }: Props) {
       maxWidth: 2.2,
     });
     pad.addEventListener("endStroke", () => setDrawDirty(true));
+    // V1.0126: the saved signature is previewed by painting it onto the
+    // pad's canvas, so a new stroke used to be exported ON TOP of the old
+    // signature ("Redraw to replace" merged the two). Wipe the preview the
+    // moment a new stroke starts.
+    let showingSaved = false;
+    pad.addEventListener("beginStroke", () => {
+      if (showingSaved) {
+        showingSaved = false;
+        pad.clear();
+      }
+    });
     padRef.current = pad;
 
     // Preview existing sig when re-opening and user hasn't changed tab.
@@ -92,6 +104,7 @@ export function SignatureModal({ open, onClose }: Props) {
           w = ch * aspect;
         }
         ctx.drawImage(img, (cw - w) / 2, (ch - h) / 2, w, h);
+        showingSaved = true;
       };
       img.src = dataUrl;
     });
@@ -103,6 +116,7 @@ export function SignatureModal({ open, onClose }: Props) {
     };
   }, [open, tab]);
 
+  useEscapeClose(open, onClose);
   if (!open) return null;
 
   const handleClear = () => {

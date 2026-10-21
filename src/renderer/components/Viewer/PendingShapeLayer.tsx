@@ -3,6 +3,8 @@ import { X } from "lucide-react";
 import { useDocumentStore, type PendingShapeEdit } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
 import { resolveCrossPageTopLeft } from "../../lib/cross-page-drag";
+import { beginGroupMove, endGroupMove, followGroupMove } from "../../lib/group-move";
+import { arrangeMenuItems, usePageBuried, usePageLayerRanks } from "./layering";
 
 type Props = {
   pageNumber: number;
@@ -29,6 +31,8 @@ export function PendingShapeLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt,
   // "editText" stays interactive (it acts on baked spans, not the shape).
   const tool = useUIStore((s) => s.tool);
   const shapesInteractive = tool === "none" || tool === "editText";
+  const ranks = usePageLayerRanks(pageNumber);
+  const buried = usePageBuried(pageNumber);
   if (!activeTab) return null;
   const shapes = activeTab.pendingShapeEdits.filter((e) => e.page === pageNumber);
   if (shapes.length === 0) return null;
@@ -44,7 +48,8 @@ export function PendingShapeLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt,
           pageWidthPt={pageWidthPt}
           pageHeightPt={pageHeightPt}
           marginsEnabled={marginsEnabled}
-          interactive={shapesInteractive}
+          interactive={shapesInteractive && !buried.has(shape.id)}
+          layer={ranks.get(shape.id) ?? 1}
         />
       ))}
     </>
@@ -63,7 +68,30 @@ type ShapeProps = {
    *  is pointer-events: none so clicks pass through to the interaction
    *  layer below (e.g. "text" tool placing over a whiteout). */
   interactive: boolean;
+  /** V1.0125: stacking rank on the page (CSS z-index) — see layering.ts. */
+  layer: number;
 };
+
+/** V1.0125: right-click menu for shapes that had none (line, arrow,
+ *  freehand, sticky): Arrange + Delete. */
+function openShapeArrangeMenu(e: React.MouseEvent<HTMLElement>, tabId: string, shapeId: string) {
+  e.preventDefault();
+  e.stopPropagation();
+  useUIStore.getState().setSelectedPendingShape(shapeId);
+  useUIStore.getState().openContextMenu(e.clientX, e.clientY, [
+    ...arrangeMenuItems(tabId, shapeId),
+    { kind: "separator" },
+    {
+      kind: "item",
+      label: "Delete",
+      danger: true,
+      onClick: () => {
+        useDocumentStore.getState().removePendingShapeEdit(tabId, shapeId);
+        useUIStore.getState().setSelectedPendingShape(null);
+      },
+    },
+  ]);
+}
 
 function PendingShape(props: ShapeProps) {
   const { shape } = props;
@@ -88,11 +116,11 @@ function PendingShape(props: ShapeProps) {
 
 type BoxKind = Extract<PendingShapeEdit, { kind: "rect" | "ellipse" | "highlight" | "whiteout" | "redact" }>;
 
-function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: BoxKind }) {
+function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive, layer }: ShapeProps & { shape: BoxKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
-  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
+  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id || s.groupSelectedIds.includes(shape.id)); // V1.0134: or in the group
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
 
   const leftPx = shape.xPt * zoom;
@@ -121,6 +149,7 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
     const s = dragState.current;
     if (!s) return;
     s.cleanup?.();
+    endGroupMove(shape.id);
     dragState.current = null;
     if (pointerId != null && captureTarget) {
       try {
@@ -129,7 +158,7 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
         /* already released */
       }
     }
-  }, []);
+  }, [shape.id]);
 
   const applyPointerMove = useCallback(
     (clientX: number, clientY: number, shiftKey: boolean) => {
@@ -164,6 +193,7 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
         s.currentPage = nextPage;
         // V1.0070: option-drag targets the clone via dragShapeId.
         updateShape(tabId, s.dragShapeId, { page: nextPage, xPt: newX, yPt: newY });
+        followGroupMove(s.dragShapeId, { x: newX, y: newY });
         return;
       }
       let newX = s.startXPt;
@@ -224,8 +254,9 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
       pushUndoStep(tabId);
       let dragShapeId = shape.id;
       if (mode === "move" && e.altKey) {
-        const { id: _unused, ...rest } = shape;
-        void _unused;
+        // V1.0125: the clone is a NEW element — it gets its own (top) layer.
+        const { id: _unused, createdAt: _c, z: _z, ...rest } = shape;
+        void _unused; void _c; void _z;
         dragShapeId = addPendingShapeEdit(tabId, rest);
         setSelectedId(dragShapeId);
       } else {
@@ -263,6 +294,8 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
         },
       };
       target.setPointerCapture(e.pointerId);
+      // V1.0134: the other members of a multi-selection follow this drag.
+      if (mode === "move" && !e.altKey) beginGroupMove(tabId, shape.id);
     },
     [shape, setSelectedId, pushUndoStep, tabId, addPendingShapeEdit, applyPointerMove, finishDrag],
   );
@@ -308,6 +341,8 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
             { kind: "separator" as const },
           ]
         : []),
+      ...arrangeMenuItems(tabId, shape.id),
+      { kind: "separator" },
       {
         kind: "item",
         label: "Delete",
@@ -338,14 +373,15 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
 
   return (
     <div
-      className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, pointerEvents: interactive ? "auto" : "none" }}
+      className="absolute"
+      data-layer={layer}
+      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, zIndex: layer, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
       data-page-number={shape.page}
-      onPointerDown={(e) => { e.stopPropagation(); setSelectedId(shape.id); startDrag(e, "move"); }}
+      onPointerDown={(e) => { e.stopPropagation(); if (e.shiftKey && !e.altKey) { useUIStore.getState().toggleGroupSelect("shape", shape.id); return; } setSelectedId(shape.id); startDrag(e, "move"); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
       onContextMenu={onContextMenu}
@@ -380,11 +416,11 @@ function BoxShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt,
 
 type LineKind = Extract<PendingShapeEdit, { kind: "line" | "arrow" }>;
 
-function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: LineKind }) {
+function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive, layer }: ShapeProps & { shape: LineKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
-  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
+  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id || s.groupSelectedIds.includes(shape.id)); // V1.0134: or in the group
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
 
   // Bounding box for hit-testing + handle placement.
@@ -426,11 +462,12 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
     const s = dragState.current;
     if (!s) return;
     s.cleanup?.();
+    endGroupMove(shape.id);
     dragState.current = null;
     if (pointerId != null && captureTarget) {
       try { captureTarget.releasePointerCapture(pointerId); } catch { /* already released */ }
     }
-  }, []);
+  }, [shape.id]);
 
   const applyPointerMove = useCallback(
     (clientX: number, clientY: number) => {
@@ -472,6 +509,7 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
           fromX: s.startFromX + txX, fromY: s.startFromY + txY,
           toX: s.startToX + txX, toY: s.startToY + txY,
         });
+        followGroupMove(shape.id, { x: s.startFromX + txX, y: s.startFromY + txY });
       } else if (s.mode === "from") {
         updateShape(tabId, shape.id, {
           fromX: s.startFromX + dxPt, fromY: s.startFromY - dyPt,
@@ -529,6 +567,7 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
       };
       target.setPointerCapture(e.pointerId);
       setSelectedId(shape.id);
+      beginGroupMove(tabId, shape.id); // V1.0134: group follows (no-op for a handle drag)
     },
     [
       shape.fromX,
@@ -575,16 +614,18 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
 
   return (
     <div
-      className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, pointerEvents: interactive ? "auto" : "none" }}
+      className="absolute"
+      data-layer={layer}
+      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, zIndex: layer, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
       data-page-number={shape.page}
-      onPointerDown={(e) => { e.stopPropagation(); setSelectedId(shape.id); startDrag(e, "move"); }}
+      onPointerDown={(e) => { e.stopPropagation(); if (e.shiftKey && !e.altKey) { useUIStore.getState().toggleGroupSelect("shape", shape.id); return; } setSelectedId(shape.id); startDrag(e, "move"); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onContextMenu={(e) => openShapeArrangeMenu(e, tabId, shape.id)}
     >
       <svg width="100%" height="100%" style={{ overflow: "visible", pointerEvents: "none" }}>
         {shape.kind === "arrow" && (
@@ -652,11 +693,11 @@ function LineShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt
 
 type FreehandKind = Extract<PendingShapeEdit, { kind: "freehand" }>;
 
-function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: FreehandKind }) {
+function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive, layer }: ShapeProps & { shape: FreehandKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
-  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
+  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id || s.groupSelectedIds.includes(shape.id)); // V1.0134: or in the group
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
 
   // Compute bounding box over all points.
@@ -700,11 +741,12 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
     const s = dragState.current;
     if (!s) return;
     s.cleanup?.();
+    endGroupMove(shape.id);
     dragState.current = null;
     if (pointerId != null && captureTarget) {
       try { captureTarget.releasePointerCapture(pointerId); } catch { /* already released */ }
     }
-  }, []);
+  }, [shape.id]);
 
   const applyPointerMove = useCallback(
     (clientX: number, clientY: number) => {
@@ -747,6 +789,7 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
         page: nextPage,
         points: s.startPoints.map((p) => ({ x: p.x + txX, y: p.y + txY })),
       });
+      if (s.startPoints[0]) followGroupMove(shape.id, { x: s.startPoints[0].x + txX, y: s.startPoints[0].y + txY });
     },
     [zoom, updateShape, tabId, shape.id, marginsEnabled, pageWidthPt, pageHeightPt],
   );
@@ -791,6 +834,7 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
       };
       target.setPointerCapture(e.pointerId);
       setSelectedId(shape.id);
+      beginGroupMove(tabId, shape.id); // V1.0134: group follows (no-op for a handle drag)
     },
     [
       shape.points,
@@ -833,16 +877,18 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
 
   return (
     <div
-      className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, pointerEvents: interactive ? "auto" : "none" }}
+      className="absolute"
+      data-layer={layer}
+      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, zIndex: layer, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind={shape.kind}
       data-shape-id={shape.id}
       data-page-number={shape.page}
-      onPointerDown={startDrag}
+      onPointerDown={(e) => { if (e.shiftKey && !e.altKey) { e.stopPropagation(); useUIStore.getState().toggleGroupSelect("shape", shape.id); return; } startDrag(e); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onContextMenu={(e) => openShapeArrangeMenu(e, tabId, shape.id)}
     >
       <svg width="100%" height="100%" style={{ overflow: "visible", pointerEvents: "none" }}>
         <path d={pathD} stroke={strokeColor} strokeWidth={strokeWidth} fill="none" strokeLinecap="round" strokeLinejoin="round" />
@@ -864,11 +910,11 @@ function FreehandShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeig
 
 type StickyKind = Extract<PendingShapeEdit, { kind: "sticky" }>;
 
-function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive }: ShapeProps & { shape: StickyKind }) {
+function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeightPt, marginsEnabled, interactive, layer }: ShapeProps & { shape: StickyKind }) {
   const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
   const removeShape = useDocumentStore((s) => s.removePendingShapeEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
-  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id);
+  const selected = useUIStore((s) => s.selectedPendingShapeId === shape.id || s.groupSelectedIds.includes(shape.id)); // V1.0134: or in the group
   const setSelectedId = useUIStore((s) => s.setSelectedPendingShape);
   const [editing, setEditing] = useState(false);
   const [draftText, setDraftText] = useState(shape.text);
@@ -899,11 +945,12 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeight
     const s = dragState.current;
     if (!s) return;
     s.cleanup?.();
+    endGroupMove(shape.id);
     dragState.current = null;
     if (pointerId != null && captureTarget) {
       try { captureTarget.releasePointerCapture(pointerId); } catch { /* already released */ }
     }
-  }, []);
+  }, [shape.id]);
 
   const applyPointerMove = useCallback(
     (clientX: number, clientY: number) => {
@@ -935,6 +982,7 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeight
       }
       s.currentPage = nextPage;
       updateShape(tabId, shape.id, { page: nextPage, xPt: newX, yPt: newY });
+      followGroupMove(shape.id, { x: newX, y: newY });
     },
     [zoom, updateShape, tabId, shape.id, marginsEnabled, pageWidthPt, pageHeightPt],
   );
@@ -972,6 +1020,7 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeight
       };
       target.setPointerCapture(e.pointerId);
       setSelectedId(shape.id);
+      beginGroupMove(tabId, shape.id); // V1.0134: group follows (no-op for a handle drag)
     },
     [shape.xPt, shape.yPt, shape.page, shape.id, setSelectedId, editing, pushUndoStep, tabId, applyPointerMove, finishDrag],
   );
@@ -995,16 +1044,18 @@ function StickyShape({ shape, zoom, pageHeightPx, tabId, pageWidthPt, pageHeight
 
   return (
     <div
-      className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: MARKER_W * zoom, height: MARKER_H * zoom, pointerEvents: interactive ? "auto" : "none" }}
+      className="absolute"
+      data-layer={layer}
+      style={{ left: leftPx, top: topPx, width: MARKER_W * zoom, height: MARKER_H * zoom, zIndex: layer, pointerEvents: interactive ? "auto" : "none" }}
       data-testid="pending-shape"
       data-pending-element="shape"
       data-shape-kind="sticky"
       data-shape-id={shape.id}
       data-page-number={shape.page}
-      onPointerDown={startDrag}
+      onPointerDown={(e) => { if (e.shiftKey && !e.altKey) { e.stopPropagation(); useUIStore.getState().toggleGroupSelect("shape", shape.id); return; } startDrag(e); }}
       onPointerMove={onPointerMove}
       onPointerUp={onPointerUp}
+      onContextMenu={(e) => openShapeArrangeMenu(e, tabId, shape.id)}
       onDoubleClick={() => { setDraftText(shape.text); setEditing(true); }}
     >
       <div
@@ -1139,7 +1190,7 @@ function useShapeKeyboard(
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) {
         return;
       }
       const step = e.shiftKey ? 10 : 1;

@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { X, Scissors } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
 import { extractPages } from "../../lib/pdf-ops";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -30,7 +31,9 @@ export function ExtractModal({ open, onClose }: Props) {
     setBusy(true);
     setError(null);
     try {
-      const bytes = await extractPages(activeTab.bytes, pages);
+      // V1.0126: include the pages' editable elements in the extract.
+      const src = (await useDocumentStore.getState().renderOutput(activeTab.id, { flat: true })) ?? activeTab.bytes;
+      const bytes = await extractPages(src, pages);
       const suggested = (activeTab.name.replace(/\.[^.]+$/, "") || "extract") + `-pages.pdf`;
       const save = await window.weavepdf.saveFileDialog({
         title: "Save extracted pages",
@@ -38,7 +41,15 @@ export function ExtractModal({ open, onClose }: Props) {
         extensions: ["pdf"],
       });
       if (save.canceled) return;
-      await window.weavepdf.writeFile(save.path, toArrayBuffer(bytes));
+      // V1.0123: the write result was discarded, so a failed write (read-only
+      // volume, disk full, permission denied, a path assertBlessed rejects)
+      // closed the dialog exactly like a success — the user believed the pages
+      // had been extracted and only found out later that no file existed.
+      const written = await window.weavepdf.writeFile(save.path, toArrayBuffer(bytes));
+      if (!written.ok) {
+        setError(written.error || "Couldn't write that file. Try another location.");
+        return;
+      }
       onClose();
     } catch (err) {
       setError(String((err as Error).message ?? err));
@@ -46,6 +57,8 @@ export function ExtractModal({ open, onClose }: Props) {
       setBusy(false);
     }
   };
+
+  useEscapeClose(open, onClose);
 
   return (
     <div

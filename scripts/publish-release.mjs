@@ -111,6 +111,12 @@ if (process.env.VITE_E2E) {
 }
 const buildEnv = { ...process.env };
 delete buildEnv.VITE_E2E;
+// V1.0122: a release must never ship ad-hoc signed — an ad-hoc build re-arms
+// the macOS Keychain "Always Allow" prompt on every update for everyone who
+// installs it. forge.config.ts documents this flag as "used by npm run
+// release", but nothing actually set it until now, so the loud-warning
+// fallback could still let a release slip through ad-hoc.
+buildEnv.WEAVEPDF_REQUIRE_SIGNING = "1";
 execSync("npm run make", { cwd: repoRoot, stdio: "inherit", env: buildEnv });
 
 const dmg = join(outDir, "WeavePDF.dmg");

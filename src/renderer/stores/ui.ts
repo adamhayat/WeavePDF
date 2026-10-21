@@ -84,6 +84,10 @@ type UIStore = {
     screenX: number;
     screenY: number;
     suggestedUrl?: string;
+    /** V1.0134: set when the link was started from a text box's Add link.
+     *  `coversWholeText` → applying the link also colours the box link-blue. */
+    textEditId?: string;
+    coversWholeText?: boolean;
   } | null;
   // id of the currently selected pending image (for keyboard nudge/delete).
   selectedPendingImageId: string | null;
@@ -91,6 +95,13 @@ type UIStore = {
   selectedPendingTextId: string | null;
   // id of the currently selected pending shape (rect/ellipse/line/arrow/etc.)
   selectedPendingShapeId: string | null;
+  /** V1.0134: ids of EVERY selected element when more than one is selected
+   *  (shift-click adds to the selection). Empty for a single selection. The
+   *  three `selectedPending*Id` fields still name the primary element; a
+   *  layer treats an element as selected when it is the primary OR in this
+   *  list. Dragging or arrow-nudging any member moves the whole group;
+   *  Delete removes all of them; ⌘C copies all of them. */
+  groupSelectedIds: string[];
   // id of a pending text edit that should immediately enter edit mode — set
   // by the Edit-Existing-Text click handler so the user can start typing right
   // away instead of having to double-click the duplicate.
@@ -202,6 +213,11 @@ type UIStore = {
   setSelectedPendingImage: (id: string | null) => void;
   setSelectedPendingText: (id: string | null) => void;
   setSelectedPendingShape: (id: string | null) => void;
+  /** V1.0134: shift-click — add the element to the selection (or drop it
+   *  when it is already in). It becomes the primary. */
+  toggleGroupSelect: (kind: "text" | "image" | "shape", id: string) => void;
+  /** V1.0134: select exactly these elements (paste selects what it added). */
+  setGroupSelection: (primary: { kind: "text" | "image" | "shape"; id: string } | null, ids: string[]) => void;
   /**
    * Drop selection from every pending-edit kind in one call. Used by the
    * Viewer's background-click handler so clicking off a placed image/text/
@@ -258,6 +274,7 @@ export const useUIStore = create<UIStore>((set) => ({
   selectedPendingImageId: null,
   selectedPendingTextId: null,
   selectedPendingShapeId: null,
+  groupSelectedIds: [],
   editingPendingTextId: null,
   contextMenu: null,
   toast: null,
@@ -356,14 +373,68 @@ export const useUIStore = create<UIStore>((set) => ({
   setViewMode: (mode) => set({ viewMode: mode }),
   setMeasureScale: (s) => set({ measureScale: s }),
   setPendingLink: (p) => set({ pendingLink: p }),
-  setSelectedPendingImage: (id) => set({ selectedPendingImageId: id }),
-  setSelectedPendingText: (id) => set({ selectedPendingTextId: id }),
-  setSelectedPendingShape: (id) => set({ selectedPendingShapeId: id }),
+  // V1.0126: ONE selected element at a time. Each setter used to set only its
+  // own id, so a placed signature stayed selected after clicking a text box —
+  // Delete then removed BOTH and the arrow keys moved both.
+  // V1.0134: a plain click on a member of a multi-selection keeps the group
+  // (that click is how a group drag starts); a click on anything else, or a
+  // deselect, dissolves it.
+  setSelectedPendingImage: (id) =>
+    set((s) => id
+      ? { selectedPendingImageId: id, selectedPendingTextId: null, selectedPendingShapeId: null, groupSelectedIds: s.groupSelectedIds.includes(id) ? s.groupSelectedIds : [] }
+      : { selectedPendingImageId: null, groupSelectedIds: [] }),
+  setSelectedPendingText: (id) =>
+    set((s) => id
+      ? { selectedPendingTextId: id, selectedPendingImageId: null, selectedPendingShapeId: null, groupSelectedIds: s.groupSelectedIds.includes(id) ? s.groupSelectedIds : [] }
+      : { selectedPendingTextId: null, groupSelectedIds: [] }),
+  setSelectedPendingShape: (id) =>
+    set((s) => id
+      ? { selectedPendingShapeId: id, selectedPendingImageId: null, selectedPendingTextId: null, groupSelectedIds: s.groupSelectedIds.includes(id) ? s.groupSelectedIds : [] }
+      : { selectedPendingShapeId: null, groupSelectedIds: [] }),
+  toggleGroupSelect: (kind, id) =>
+    set((s) => {
+      const current = new Set(s.groupSelectedIds);
+      for (const p of [s.selectedPendingImageId, s.selectedPendingTextId, s.selectedPendingShapeId]) if (p) current.add(p);
+      if (current.has(id) && current.size > 1) {
+        current.delete(id);
+        const ids = Array.from(current);
+        // The primary must stay a selected element: keep whichever primary
+        // survives, else promote the first remaining member by kind lookup
+        // at the call site (layers pass their own kind, so just clear it).
+        const keepImage = s.selectedPendingImageId && current.has(s.selectedPendingImageId) ? s.selectedPendingImageId : null;
+        const keepText = s.selectedPendingTextId && current.has(s.selectedPendingTextId) ? s.selectedPendingTextId : null;
+        const keepShape = s.selectedPendingShapeId && current.has(s.selectedPendingShapeId) ? s.selectedPendingShapeId : null;
+        return {
+          selectedPendingImageId: keepImage,
+          selectedPendingTextId: keepText,
+          selectedPendingShapeId: keepShape,
+          // A lone survivor with no primary stays listed, so it is still
+          // selected (layers test primary OR group membership).
+          groupSelectedIds: ids.length > 1 || !(keepImage || keepText || keepShape) ? ids : [],
+        };
+      }
+      current.add(id);
+      const ids = Array.from(current);
+      return {
+        selectedPendingImageId: kind === "image" ? id : null,
+        selectedPendingTextId: kind === "text" ? id : null,
+        selectedPendingShapeId: kind === "shape" ? id : null,
+        groupSelectedIds: ids.length > 1 ? ids : [],
+      };
+    }),
+  setGroupSelection: (primary, ids) =>
+    set({
+      selectedPendingImageId: primary?.kind === "image" ? primary.id : null,
+      selectedPendingTextId: primary?.kind === "text" ? primary.id : null,
+      selectedPendingShapeId: primary?.kind === "shape" ? primary.id : null,
+      groupSelectedIds: ids.length > 1 || (!primary && ids.length > 0) ? ids : [],
+    }),
   clearAllPendingSelections: () =>
     set({
       selectedPendingImageId: null,
       selectedPendingTextId: null,
       selectedPendingShapeId: null,
+      groupSelectedIds: [],
       editingPendingTextId: null,
     }),
   setEditingPendingText: (id) => set({ editingPendingTextId: id }),

@@ -79,6 +79,15 @@ await mkdir(fixturesDir, { recursive: true });
   const addr = form.createTextField("address");
   addr.setText("Suite 700, Toronto, ON M2N 5X5");
   addr.addToPage(page, { x: 130, y: 666, width: 360, height: 22 });
+  // V1.0119: a second text field directly below the first so the
+  // Tab-navigation E2E (jump from one fillable field to the next) has two
+  // fields to move between. Created AFTER "address", so the existing
+  // form specs that target `.first()` still resolve to "address".
+  page.drawText("City:", {
+    x: 50, y: 634, size: 12, font: helv, color: rgb(0.18, 0.18, 0.22),
+  });
+  const city = form.createTextField("city");
+  city.addToPage(page, { x: 130, y: 620, width: 360, height: 22 });
   // The widget appearance stream needs to be baked so pdf.js renders the
   // value when the file is opened. pdf-lib bakes on save by default.
   const bytes = await pdf.save();

@@ -33,6 +33,11 @@ export const IpcChannel = {
    *  before-quit hook can show an "unsaved changes" confirmation dialog
    *  without a synchronous IPC roundtrip (which would deadlock). */
   NotifyDirtyTabs: "tabs:notify-dirty",
+  /** V1.0123: closing a single TAB (⌘W, the tab ✕, "Close Other Tabs")
+   *  destroyed unsaved work with no prompt — only closing the WINDOW or
+   *  quitting ever asked. Renderer calls this to get the same three-way
+   *  Save / Cancel / Don't Save answer for one tab. */
+  ConfirmCloseTab: "tabs:confirm-close",
   /** V1.0053: when the user clicks "Save" in the unsaved-changes dialog,
    *  main asks the renderer to save all dirty tabs and report back. Main
    *  defers the window close (or app quit) until SaveAllComplete arrives —
@@ -202,6 +207,12 @@ export type PrintOptions = {
   landscape: boolean;
   /** Page ranges to print, applied AFTER any baked-in n-up. Empty = all. */
   pageRanges?: Array<{ from: number; to: number }>;
+  /** V1.0121: CUPS media name for the sheet the user picked in Print Preview
+   *  ("Letter", "A4", "Legal", "A3", "A5", "Tabloid"). Previously never sent,
+   *  so the app resized the PDF's page boxes but the printer still pulled its
+   *  default tray — CUPS then rescaled/clipped to whatever media it chose, and
+   *  the Paper dropdown had no effect on the printed result. */
+  media?: string;
 };
 
 export type PrinterInfo = {
@@ -213,6 +224,8 @@ export type PrinterInfo = {
   isDefault: boolean;
   /** Status bitmask from CUPS. 0 = idle/ready. */
   status: number;
+  /** V1.0127: the printer's default paper size (CUPS PageSize), if known. */
+  defaultPaper?: import("./cups-media").CupsPaperKey;
 };
 
 export type DigitalCertInfo = {
@@ -282,6 +295,10 @@ export type OpenedFile = {
   path: string;
   name: string;
   sizeBytes: number;
+  /** V1.0133: the file's modification time when it was read — with
+   *  `sizeBytes`, the identity of the bytes a tab holds (see
+   *  renderer/lib/open-target.ts). */
+  mtimeMs: number;
   // File bytes as a transferable ArrayBuffer. pdf.js consumes Uint8Array.
   data: ArrayBuffer;
 };
@@ -307,4 +324,8 @@ export type SaveFileDialogResult =
   | { canceled: true }
   | { canceled: false; path: string };
 
-export type WriteFileResult = { ok: true } | { ok: false; error: string };
+export type WriteFileResult =
+  /** V1.0133: the written file's stamp, so the tab can record what is now
+   *  on disk (a later Finder open compares against it). */
+  | { ok: true; mtimeMs: number; sizeBytes: number }
+  | { ok: false; error: string };

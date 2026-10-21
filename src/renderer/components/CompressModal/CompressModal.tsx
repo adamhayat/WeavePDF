@@ -5,6 +5,7 @@ import { useUIStore } from "../../stores/ui";
 import { compressLight } from "../../lib/pdf-ops";
 import { formatBytes, cn } from "../../lib/cn";
 import { u8ToAb } from "../../../shared/buffers";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Engine = "pdflib" | "qpdf" | "mutool" | "gs" | "gs-advanced";
 
@@ -243,6 +244,8 @@ export function CompressModal({ open, onClose }: Props) {
       }));
     }
   };
+
+  useEscapeClose(open, onClose);
 
   return (
     <div

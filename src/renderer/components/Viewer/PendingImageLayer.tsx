@@ -2,7 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { X, Crop, Check, RotateCw, FlipHorizontal2, FlipVertical2, Replace, Square, Layers2 } from "lucide-react";
 import { useDocumentStore, type PendingImageEdit } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
+import { arrangeMenuItems, usePageBuried, usePageLayerRanks } from "./layering";
 import { bytesToBlob } from "../../../shared/buffers";
+import { beginGroupMove, endGroupMove, followGroupMove } from "../../lib/group-move";
 import { resolveCrossPageTopLeft } from "../../lib/cross-page-drag";
 
 type Props = {
@@ -19,6 +21,8 @@ type Props = {
 export function PendingImageLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt, pageHeightPt }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const marginsEnabled = useUIStore((s) => s.marginsEnabled);
+  const ranks = usePageLayerRanks(pageNumber);
+  const buried = usePageBuried(pageNumber);
   if (!activeTab) return null;
 
   const edits = activeTab.pendingImageEdits.filter((e) => e.page === pageNumber);
@@ -36,6 +40,8 @@ export function PendingImageLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt,
           pageWidthPt={pageWidthPt}
           pageHeightPt={pageHeightPt}
           marginsEnabled={marginsEnabled}
+          layer={ranks.get(edit.id) ?? 1}
+          buried={buried.has(edit.id)}
         />
       ))}
     </>
@@ -50,6 +56,10 @@ type PendingImageProps = {
   pageWidthPt: number;
   pageHeightPt: number;
   marginsEnabled: boolean;
+  /** V1.0125: stacking rank on the page (CSS z-index) — see layering.ts. */
+  layer: number;
+  /** V1.0125: hidden under a whiteout/redact above it — takes no clicks. */
+  buried: boolean;
 };
 
 const MIN_SIZE_PT = 16;
@@ -63,11 +73,14 @@ function PendingImage({
   pageWidthPt,
   pageHeightPt,
   marginsEnabled,
+  layer,
+  buried,
 }: PendingImageProps) {
   const updateEdit = useDocumentStore((s) => s.updatePendingImageEdit);
   const removeEdit = useDocumentStore((s) => s.removePendingImageEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
-  const selected = useUIStore((s) => s.selectedPendingImageId === edit.id);
+  // V1.0134: selected = the primary OR a member of a shift-click group.
+  const selected = useUIStore((s) => s.selectedPendingImageId === edit.id || s.groupSelectedIds.includes(edit.id));
   const setSelectedId = useUIStore((s) => s.setSelectedPendingImage);
   // Crop sub-mode: user draws a rect on the image, Apply crops the bytes
   // and resizes the overlay; Cancel exits without changes.
@@ -112,6 +125,7 @@ function PendingImage({
     const s = dragState.current;
     if (!s) return;
     s.cleanup?.();
+    endGroupMove(edit.id);
     dragState.current = null;
     if (pointerId != null && captureTarget) {
       try {
@@ -120,7 +134,7 @@ function PendingImage({
         /* already released */
       }
     }
-  }, []);
+  }, [edit.id]);
 
   const applyPointerMove = useCallback(
     (clientX: number, clientY: number, shiftKey: boolean) => {
@@ -158,6 +172,7 @@ function PendingImage({
         s.currentPage = nextPage;
         // V1.0070: option-drag targets the clone via dragEditId.
         updateEdit(tabId, s.dragEditId, { page: nextPage, xPt: newX, yPt: newY });
+        followGroupMove(s.dragEditId, { x: newX, y: newY });
         return;
       }
 
@@ -225,8 +240,9 @@ function PendingImage({
       // original edit.
       let dragEditId = edit.id;
       if (mode === "move" && e.altKey) {
-        const { id: _unused, ...rest } = edit;
-        void _unused;
+        // V1.0125: the clone is a NEW element — it gets its own (top) layer.
+        const { id: _unused, createdAt: _c, z: _z, ...rest } = edit;
+        void _unused; void _c; void _z;
         dragEditId = addPendingImageEdit(tabId, rest);
         setSelectedId(dragEditId);
       }
@@ -266,6 +282,8 @@ function PendingImage({
       // setSelectedId is handled above for option-drag; for normal drag,
       // select the original.
       if (!e.altKey || mode !== "move") setSelectedId(edit.id);
+      // V1.0134: the other members of a multi-selection follow this drag.
+      if (mode === "move" && !e.altKey) beginGroupMove(tabId, edit.id);
     },
     [edit, setSelectedId, pushUndoStep, tabId, addPendingImageEdit, applyPointerMove, finishDrag],
   );
@@ -286,7 +304,7 @@ function PendingImage({
     if (!selected) return;
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) {
         return;
       }
       const step = e.shiftKey ? 10 : 1;
@@ -427,6 +445,8 @@ function PendingImage({
       { kind: "item", label: "Center vertically", onClick: () => void align(tabId, "image", edit.id, "center-v") },
       { kind: "item", label: "Align to bottom margin", onClick: () => void align(tabId, "image", edit.id, "bottom") },
       { kind: "separator" },
+      ...arrangeMenuItems(tabId, edit.id),
+      { kind: "separator" },
       {
         kind: "item",
         label: "Delete",
@@ -441,9 +461,11 @@ function PendingImage({
 
   return (
     <div
-      className="absolute z-20"
-      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx }}
+      className="absolute"
+      style={{ left: leftPx, top: topPx, width: widthPx, height: heightPx, zIndex: layer, pointerEvents: buried ? "none" : "auto" }}
       data-testid="pending-image"
+      data-buried={buried || undefined}
+      data-layer={layer}
       data-edit-id={edit.id}
       data-pending-element="image"
       data-page-number={edit.page}
@@ -454,6 +476,11 @@ function PendingImage({
               // Stop propagation so Viewer's background-click deselect
               // doesn't immediately undo the selection we're about to make.
               e.stopPropagation();
+              // V1.0134: shift-click adds to / drops from the multi-selection.
+              if (e.shiftKey && !e.altKey) {
+                useUIStore.getState().toggleGroupSelect("image", edit.id);
+                return;
+              }
               setSelectedId(edit.id);
               startDrag(e, "move");
             }

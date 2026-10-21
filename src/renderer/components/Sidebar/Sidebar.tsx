@@ -1,17 +1,22 @@
+import { requestCloseTab } from "../../lib/close-tab";
 import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import { remapForDelete, remapForDuplicate, remapForInsertAfter, remapForOrder } from "../../lib/page-remap";
 // V1.0045: removed @dnd-kit's drag-to-reorder. The thumbnail's plain
 // drag is now reserved for HTML5 native drag-out (drag a page to Finder
 // to extract it as a PDF). Reorder lives in the right-click
 // menu via "Move up" / "Move down" — same end result, no gesture
 // disambiguation needed.
 import { Plus, RotateCw, RotateCcw, Trash2, ZoomIn, ZoomOut } from "lucide-react";
-import { useDocumentStore, type DocumentTab } from "../../stores/document";
+import { useDocumentStore, type DocumentTab, type PendingImageEdit } from "../../stores/document";
+import { paintPendingOverlays } from "../../lib/thumb-overlays";
+import { bytesToBlob } from "../../../shared/buffers";
 import { useUIStore } from "../../stores/ui";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
 // Lazy-loaded so the pdf-lib chunk doesn't pull at boot. Sidebar is
 // rendered eagerly when a doc is open, but every pdf-ops call here fires
 // from a click handler — chunk parses on the first such click.
 const loadPdfOps = () => import("../../lib/pdf-ops");
+import { unlockIfOwnerLocked } from "../../lib/unlock";
 import { u8ToAb } from "../../../shared/buffers";
 import { cn } from "../../lib/cn";
 import { OutlinePanel } from "./OutlinePanel";
@@ -89,6 +94,19 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
   const [dropTargetIndex, setDropTargetIndex] = useState<number | null>(null);
   const thumbsContainerRef = useRef<HTMLDivElement | null>(null);
 
+  // V1.0132: keep the current page's thumbnail on screen. Stepping pages with
+  // the arrow keys (or scrolling the viewer) moves the highlight; without this
+  // it could walk off the bottom of the panel. "nearest" = no scroll at all
+  // while the thumbnail is already visible.
+  const currentPage = activeTab?.currentPage;
+  useEffect(() => {
+    if (currentPage == null) return;
+    const row = thumbsContainerRef.current?.querySelector<HTMLElement>(
+      `[data-page-number="${currentPage}"]`,
+    );
+    row?.scrollIntoView({ block: "nearest" });
+  }, [currentPage, activeTab?.id, open, sidebarTab]);
+
   if (!open || !activeTab?.pdf) return null;
 
   const selectedCount = activeTab.selectedPages.size;
@@ -102,14 +120,16 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
         `You can't delete every page. Close this document instead?\n\n(${activeTab.name})`,
       );
       if (confirmed) {
-        useDocumentStore.getState().closeTab(activeTab.id);
+        // V1.0126: through the unsaved-work prompt — this used to close the
+        // tab outright and lose every unsaved edit.
+        void requestCloseTab(activeTab.id);
       }
       return;
     }
     const pages = Array.from(activeTab.selectedPages).sort((a, b) => a - b);
     const { deletePages } = await loadPdfOps();
     const newBytes = await deletePages(activeTab.bytes, pages);
-    await applyEdit(activeTab.id, newBytes);
+    await applyEdit(activeTab.id, newBytes, { remapPages: remapForDelete(pages) });
   };
 
   const handleRotate = async (delta: 90 | -90 | 180) => {
@@ -119,7 +139,9 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
         ? Array.from(activeTab.selectedPages)
         : [activeTab.currentPage];
     const { rotatePages } = await loadPdfOps();
-    const newBytes = await rotatePages(activeTab.bytes, targets, delta);
+    const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id, targets);
+    if (!src) return;
+    const newBytes = await rotatePages(src, targets, delta);
     await applyEdit(activeTab.id, newBytes);
   };
 
@@ -135,7 +157,7 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
     [order[pageNumber - 1], order[newIndex]] = [order[newIndex], order[pageNumber - 1]];
     const { reorderPages } = await loadPdfOps();
     const newBytes = await reorderPages(activeTab.bytes, order);
-    await applyEdit(activeTab.id, newBytes, { newCurrentPage: newIndex + 1 });
+    await applyEdit(activeTab.id, newBytes, { newCurrentPage: newIndex + 1, remapPages: remapForOrder(order) });
   };
 
   const applyPageLabel = async (pageNumber: number, prefix: string) => {
@@ -159,7 +181,7 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
     if (!activeTab.bytes) return;
     const { insertBlankPageAfter } = await loadPdfOps();
     const newBytes = await insertBlankPageAfter(activeTab.bytes, afterPage);
-    await applyEdit(activeTab.id, newBytes, { newCurrentPage: afterPage + 1 });
+    await applyEdit(activeTab.id, newBytes, { newCurrentPage: afterPage + 1, remapPages: remapForInsertAfter(afterPage) });
   };
 
   // V1.0105: the sidebar grows with the thumbnail zoom so 2× thumbs don't
@@ -368,6 +390,7 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
               );
               await applyEdit(activeTab.id, newBytes, {
                 newCurrentPage: newFirstMovedIndex + 1,
+                remapPages: remapForOrder(newOrder),
               });
             } catch (err) {
               console.error("reorder pages", err);
@@ -390,12 +413,28 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
             // when the user drops two or more PDFs at once.
             for (const p of pdfPaths) {
               const file = await window.weavepdf.readFile(p);
-              const newBytes = new Uint8Array(file.data);
+              // V1.0122: unlock owner-locked sources BEFORE merging. Once an
+              // encrypted PDF's streams are copied into the plain host, the
+              // host has no /Encrypt dict — nothing downstream can detect the
+              // damage, and the merged pages render blank. Skip a source we
+              // can't unlock rather than corrupt the open document.
+              const unlockResult = await unlockIfOwnerLocked(new Uint8Array(file.data));
+              if (!unlockResult.ok) {
+                showToast(
+                  unlockResult.reason === "qpdf-missing"
+                    ? `${file.name} is locked against editing — install qpdf (brew install qpdf) to merge it.`
+                    : `${file.name} is locked against editing and couldn't be unlocked — skipped.`,
+                  "warn",
+                );
+                continue;
+              }
+              const newBytes = unlockResult.bytes;
               const added = await countPages(newBytes);
               bytes = await insertAfter(bytes, newBytes, cursor);
               cursor += added;
             }
-            await applyEdit(activeTab.id, bytes);
+            // V1.0126: elements on pages after the drop point move down with them.
+            await applyEdit(activeTab.id, bytes, { remapPages: remapForInsertAfter(dropAt, cursor - dropAt) });
           } catch (err) {
             console.error("merge pdf", err);
             showToast("Couldn't add that PDF.", "warn");
@@ -449,7 +488,9 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                     onClick: async () => {
                       if (!activeTab.bytes) return;
                       const { rotatePages } = await loadPdfOps();
-                      const b = await rotatePages(activeTab.bytes, selection, -90);
+                      const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id, selection);
+                      if (!src) return;
+                      const b = await rotatePages(src, selection, -90);
                       await applyEdit(activeTab.id, b);
                     },
                   },
@@ -460,7 +501,9 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                     onClick: async () => {
                       if (!activeTab.bytes) return;
                       const { rotatePages } = await loadPdfOps();
-                      const b = await rotatePages(activeTab.bytes, selection, 90);
+                      const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id, selection);
+                      if (!src) return;
+                      const b = await rotatePages(src, selection, 90);
                       await applyEdit(activeTab.id, b);
                     },
                   },
@@ -470,7 +513,9 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                     onClick: async () => {
                       if (!activeTab.bytes) return;
                       const { rotatePages } = await loadPdfOps();
-                      const b = await rotatePages(activeTab.bytes, selection, 180);
+                      const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id, selection);
+                      if (!src) return;
+                      const b = await rotatePages(src, selection, 180);
                       await applyEdit(activeTab.id, b);
                     },
                   },
@@ -483,7 +528,7 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                       if (!activeTab.bytes) return;
                       const { duplicatePage } = await loadPdfOps();
                       const b = await duplicatePage(activeTab.bytes, pageNumber);
-                      await applyEdit(activeTab.id, b);
+                      await applyEdit(activeTab.id, b, { remapPages: remapForDuplicate(pageNumber) });
                     },
                   },
                   {
@@ -492,7 +537,9 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                     onClick: async () => {
                       if (!activeTab.bytes) return;
                       const { extractPages } = await loadPdfOps();
-                      const extracted = await extractPages(activeTab.bytes, selection);
+                      // V1.0126: include the page's editable elements.
+                      const src = (await useDocumentStore.getState().renderOutput(activeTab.id, { flat: true })) ?? activeTab.bytes;
+                      const extracted = await extractPages(src, selection);
                       const result = await window.weavepdf.saveFileDialog({
                         title: "Extract Pages",
                         suggestedName: activeTab.name.replace(/\.pdf$/i, "") + `-extract.pdf`,
@@ -523,7 +570,7 @@ export function Sidebar({ onRestoreRevision, onRestoreSnapshot }: Props) {
                       if (!activeTab.bytes) return;
                       const { deletePages } = await loadPdfOps();
                       const b = await deletePages(activeTab.bytes, selection);
-                      await applyEdit(activeTab.id, b);
+                      await applyEdit(activeTab.id, b, { remapPages: remapForDelete(selection) });
                     },
                   },
                 ]);
@@ -635,6 +682,19 @@ function SidebarIcon({
       {children}
     </button>
   );
+}
+
+/** V1.0134: decoded bitmaps for thumbnail painting, keyed by the image's
+ *  bytes (a new paste / crop is a new Uint8Array, so the cache can't go
+ *  stale; a GC'd edit drops its entry). */
+const thumbImageCache = new WeakMap<Uint8Array, Promise<ImageBitmap | null>>();
+function decodeThumbImage(e: PendingImageEdit): Promise<ImageBitmap | null> {
+  let p = thumbImageCache.get(e.bytes);
+  if (!p) {
+    p = createImageBitmap(bytesToBlob(e.bytes, e.mime)).catch(() => null);
+    thumbImageCache.set(e.bytes, p);
+  }
+  return p;
 }
 
 type ThumbProps = {
@@ -790,15 +850,19 @@ function Thumb({
     () => tab.pendingShapeEdits.filter((e) => e.page === pageNumber),
     [tab.pendingShapeEdits, pageNumber],
   );
-  const pendingCount = pendingText.length + pendingImage.length + pendingShape.length;
-  // Latest-values refs for the effect to read without re-firing on every
-  // pointer move.
-  const pendingTextRef = useRef(pendingText);
-  const pendingImageRef = useRef(pendingImage);
-  const pendingShapeRef = useRef(pendingShape);
-  pendingTextRef.current = pendingText;
-  pendingImageRef.current = pendingImage;
-  pendingShapeRef.current = pendingShape;
+  // V1.0134: two stages. (1) pdf.js renders the baked page into an OFFSCREEN
+  // canvas — only when the page bytes / zoom change (never per keystroke or
+  // pointer move: that was the V1.0095 freeze). (2) The visible thumbnail is
+  // re-composited from that offscreen canvas plus the page's pending
+  // elements whenever an element changes — a few drawImage/fillText calls,
+  // cheap enough to run on every drag move. The elements are painted for
+  // real (the pasted screenshot, the typed text, the drawn shapes) in the
+  // viewer's stacking order; the V1.0090 indigo placeholder rectangles are
+  // gone. Adam: "Why is the left sidebar not showing proper preview of
+  // pasted screenshot".
+  const baseRef = useRef<HTMLCanvasElement | null>(null);
+  const [baseVersion, setBaseVersion] = useState(0);
+  const [baseGeom, setBaseGeom] = useState<{ scale: number; pageHPt: number } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -812,12 +876,10 @@ function Thumb({
       const scale = target / baseViewport.width;
       const viewport = page.getViewport({ scale });
       const dpr = window.devicePixelRatio || 1;
-      const canvas = canvasRef.current;
-      if (!canvas) return;
-      canvas.width = Math.floor(viewport.width * dpr);
-      canvas.height = Math.floor(viewport.height * dpr);
-      setDims({ w: viewport.width, h: viewport.height });
-      const ctx = canvas.getContext("2d");
+      const off = document.createElement("canvas");
+      off.width = Math.floor(viewport.width * dpr);
+      off.height = Math.floor(viewport.height * dpr);
+      const ctx = off.getContext("2d");
       if (!ctx) return;
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
       task = page.render({ canvasContext: ctx, viewport });
@@ -827,58 +889,56 @@ function Thumb({
         /* cancelled */
       }
       if (cancelled) return;
-      // V1.0090: overlay pending edits as indicator rects. PDF-point
-      // coords scale by `scale` directly (since target=150 means CSS px
-      // = PDF-point × scale). Y flips because PDF origin is bottom-left.
-      const pageHPt = baseViewport.height;
-      // Subtle accent fill at low alpha so the thumbnail still reads as
-      // "the page". 30% alpha is enough to see at thumbnail scale.
-      ctx.fillStyle = "rgba(109, 94, 245, 0.30)"; // var(--color-accent) at 30%
-      ctx.strokeStyle = "rgba(109, 94, 245, 0.55)";
-      ctx.lineWidth = 0.5;
-      // V1.0095: read the latest arrays via refs (NOT via deps) so that
-      // every keystroke / drag pointer-move doesn't re-queue a pdf.js
-      // render task. Positions in the thumbnail are stale during a drag
-      // but snap when overlay count changes or version bumps.
-      for (const e of pendingTextRef.current) {
-        const w = (e.widthPt ?? Math.max(40, e.size * 6)) * scale;
-        const h = e.size * 1.2 * scale;
-        const x = e.xPt * scale;
-        const y = (pageHPt - e.yPt - e.size) * scale;
-        ctx.fillRect(x, y, w, h);
-        ctx.strokeRect(x, y, w, h);
-      }
-      for (const e of pendingImageRef.current) {
-        const w = e.widthPt * scale;
-        const h = e.heightPt * scale;
-        const x = e.xPt * scale;
-        const y = (pageHPt - e.yPt - e.heightPt) * scale;
-        ctx.fillRect(x, y, w, h);
-        ctx.strokeRect(x, y, w, h);
-      }
-      for (const e of pendingShapeRef.current) {
-        // Compute a bounding box per shape kind. Skip kinds we can't
-        // cheaply bound; the indicator is best-effort.
-        let bbox: { x: number; y: number; w: number; h: number } | null = null;
-        if ("widthPt" in e && "heightPt" in e && "xPt" in e && "yPt" in e) {
-          bbox = {
-            x: e.xPt * scale,
-            y: (pageHPt - e.yPt - e.heightPt) * scale,
-            w: e.widthPt * scale,
-            h: e.heightPt * scale,
-          };
-        }
-        if (bbox) {
-          ctx.fillRect(bbox.x, bbox.y, bbox.w, bbox.h);
-          ctx.strokeRect(bbox.x, bbox.y, bbox.w, bbox.h);
-        }
-      }
+      baseRef.current = off;
+      setDims({ w: viewport.width, h: viewport.height });
+      setBaseGeom({ scale, pageHPt: baseViewport.height });
+      setBaseVersion((v) => v + 1);
     })();
     return () => {
       cancelled = true;
       task?.cancel();
     };
-  }, [pdf, pageNumber, tab.version, pendingCount, thumbScale]);
+  }, [pdf, pageNumber, tab.version, thumbScale]);
+
+  useEffect(() => {
+    const base = baseRef.current;
+    const canvas = canvasRef.current;
+    if (!base || !canvas || !baseGeom) return;
+    let cancelled = false;
+    (async () => {
+      // Decode (cached) every image on this page before painting, so the
+      // composite is one synchronous pass.
+      const bitmaps = new Map<PendingImageEdit, ImageBitmap | null>();
+      await Promise.all(
+        pendingImage.map(async (e) => {
+          bitmaps.set(e, await decodeThumbImage(e));
+        }),
+      );
+      if (cancelled) return;
+      const dpr = window.devicePixelRatio || 1;
+      if (canvas.width !== base.width || canvas.height !== base.height) {
+        canvas.width = base.width;
+        canvas.height = base.height;
+      }
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return;
+      ctx.setTransform(1, 0, 0, 1, 0, 0);
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.drawImage(base, 0, 0);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      paintPendingOverlays(
+        ctx,
+        { text: pendingText, image: pendingImage, shape: pendingShape },
+        pageNumber,
+        baseGeom.scale,
+        baseGeom.pageHPt,
+        (e) => bitmaps.get(e) ?? null,
+      );
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [baseVersion, baseGeom, pendingText, pendingImage, pendingShape, pageNumber]);
 
   // V1.0045: the entire thumbnail is HTML5-draggable. Plain drag from anywhere
   // on the page card -> drag-out. No modifier, no dedicated handle, no per-app

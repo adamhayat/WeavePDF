@@ -2,7 +2,9 @@ import { forwardRef, useEffect, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
 import { pdfjsLib } from "../../lib/pdfjs";
 import { useUIStore } from "../../stores/ui";
+import { trimImageToInk } from "../../lib/trim-ink";
 import { useDocumentStore } from "../../stores/document";
+import { isDragIntentional } from "../../lib/drag-gate";
 import { TextPromptOverlay } from "./TextPromptOverlay";
 import { StickyPromptOverlay } from "./StickyPromptOverlay";
 import { PendingTextLayer } from "./PendingTextLayer";
@@ -314,9 +316,18 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
       } catch {
         return;
       }
-      const sigW = 180; // points
-      const sigH = sigW * (img.naturalHeight / img.naturalWidth);
-      const bytes = await dataUrlToBytes(dataUrl);
+      // V1.0126: crop to the ink so the signature starts AT the click and
+      // its box hugs the strokes, then size it like a real signature: at
+      // most 160pt wide and 45pt tall. Pre-V1.0126 the whole pad (margins
+      // included) was placed 180pt wide, so the ink sat well right of and
+      // below the click inside an oversized box.
+      const trimmed = trimImageToInk(img);
+      const srcW = trimmed?.width ?? img.naturalWidth;
+      const srcH = trimmed?.height ?? img.naturalHeight;
+      const fit = Math.min(160 / srcW, 45 / srcH);
+      const sigW = srcW * fit; // points
+      const sigH = srcH * fit;
+      const bytes = await dataUrlToBytes(trimmed?.dataUrl ?? dataUrl);
       // Place as a pending overlay so the user can drag, resize, and nudge
       // the signature before committing — same UX as pasted images.
       const newId = useDocumentStore.getState().addPendingImageEdit(activeTab.id, {
@@ -440,8 +451,9 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
     const rawStart = dragStart.current;
     dragStart.current = null;
     setDragBox(null);
-    // Ignore tiny accidental drags (single-click).
-    if (box.w < 4 || box.h < 4) return;
+    // Ignore tiny accidental drags (single-click). See drag-gate.ts — line-like
+    // tools are judged on drag LENGTH, area tools on both axes.
+    if (!isDragIntentional(tool, box)) return;
     // CSS → PDF points (Y flips).
     const region = {
       x: box.x / zoom,
@@ -1125,27 +1137,42 @@ export const PageCanvas = forwardRef<HTMLDivElement, Props>(function PageCanvas(
       )}
       {dims && (
         <>
-          <PendingTextLayer
-            pageNumber={pageNumber}
-            zoom={zoom}
-            pageHeightPx={dims.h}
-            pageWidthPt={pageSize?.w ?? 612}
-            pageHeightPt={pageSize?.h ?? 792}
-          />
-          <PendingImageLayer
-            pageNumber={pageNumber}
-            zoom={zoom}
-            pageHeightPx={dims.h}
-            pageWidthPt={pageSize?.w ?? 612}
-            pageHeightPt={pageSize?.h ?? 792}
-          />
-          <PendingShapeLayer
-            pageNumber={pageNumber}
-            zoom={zoom}
-            pageHeightPx={dims.h}
-            pageWidthPt={pageSize?.w ?? 612}
-            pageHeightPt={pageSize?.h ?? 792}
-          />
+          {/* V1.0125: ONE stacking context for every pending element on the
+              page. Inside it each text box / image / shape gets its layer
+              rank as z-index (lib/layers.ts), so they interleave in the
+              same order the bake draws them. Pre-V1.0125 they all sat at
+              z-20 and DOM order (text → images → shapes) decided, so a
+              whiteout covered every text box regardless of which came
+              first. This div is z-20 against its siblings exactly like the
+              elements were, and pointer-events:none so empty areas still
+              reach the interaction layer (each element sets auto itself). */}
+          <div
+            className="absolute inset-0 z-20"
+            style={{ pointerEvents: "none" }}
+            data-testid="pending-layer-stack"
+          >
+            <PendingTextLayer
+              pageNumber={pageNumber}
+              zoom={zoom}
+              pageHeightPx={dims.h}
+              pageWidthPt={pageSize?.w ?? 612}
+              pageHeightPt={pageSize?.h ?? 792}
+            />
+            <PendingImageLayer
+              pageNumber={pageNumber}
+              zoom={zoom}
+              pageHeightPx={dims.h}
+              pageWidthPt={pageSize?.w ?? 612}
+              pageHeightPt={pageSize?.h ?? 792}
+            />
+            <PendingShapeLayer
+              pageNumber={pageNumber}
+              zoom={zoom}
+              pageHeightPx={dims.h}
+              pageWidthPt={pageSize?.w ?? 612}
+              pageHeightPt={pageSize?.h ?? 792}
+            />
+          </div>
           <TextPromptOverlay
             pageNumber={pageNumber}
             zoom={zoom}

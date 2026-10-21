@@ -1,12 +1,21 @@
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
+import { remapForDelete } from "./lib/page-remap";
+import { pageStep } from "./lib/page-step";
+import { boxJustHandledShortcut } from "./lib/box-shortcut";
+import { compareFileNames, createOpenBatcher } from "./lib/tab-order";
+import { resolveOpenTarget } from "./lib/open-target";
 import { useHotkeys } from "react-hotkeys-hook";
 import { useTheme } from "./hooks/useTheme";
-import { rebasePendingEditSeq, useDocumentStore } from "./stores/document";
+import { rebasePendingEditSeq, takeLastUnsupportedChars, useDocumentStore, waitForTabIdle } from "./stores/document";
 import { useUIStore } from "./stores/ui";
 import { pdfjsLib, initPdfWorker } from "./lib/pdfjs";
 // pdf-ops is lazy-loaded at use sites so the pdf-lib chunk (~425 KB) doesn't
 // pull at boot. Each helper is awaited in its callback.
 const loadPdfOps = () => import("./lib/pdf-ops");
+import { restoreZ } from "./lib/layers";
+import { unlockIfOwnerLocked } from "./lib/unlock";
+import { flushActiveFormField } from "./lib/pending-field";
+import { requestCloseTab, setTabSaver } from "./lib/close-tab";
 // Components rendered on the critical-path of cold launch — kept as static
 // imports so they're in the initial bundle and parse during the first paint.
 import { Titlebar } from "./components/Titlebar/Titlebar";
@@ -95,6 +104,7 @@ const WelcomeModal = lazy(() =>
   import("./components/WelcomeModal/WelcomeModal").then((m) => ({ default: m.WelcomeModal })),
 );
 import { useDraftPersistence } from "./hooks/useDraftPersistence";
+import { installElementClipboard } from "./lib/element-clipboard-actions";
 import { bytesToBlob, u8ToAb } from "../shared/buffers";
 import type {
   DraftManifest,
@@ -110,6 +120,8 @@ type LoadedPayload = {
   name: string;
   path: string | null;
   sizeBytes: number;
+  /** V1.0133: the file's mtime at read time (real paths only). */
+  mtimeMs?: number;
   bytes: Uint8Array;
 };
 
@@ -284,7 +296,7 @@ export function App() {
   const selectAllPages = useDocumentStore((s) => s.selectAllPages);
   const clearSelection = useDocumentStore((s) => s.clearSelection);
   const markClean = useDocumentStore((s) => s.markClean);
-  const commitAllPending = useDocumentStore((s) => s.commitAllPending);
+  const renderOutput = useDocumentStore((s) => s.renderOutput);
   const addPendingTextEdit = useDocumentStore((s) => s.addPendingTextEdit);
   const addPendingImageEdit = useDocumentStore((s) => s.addPendingImageEdit);
   const toggleSidebar = useUIStore((s) => s.toggleSidebar);
@@ -462,7 +474,27 @@ export function App() {
         useUIStore.getState().showToast(`Couldn't restore ${m.originalName}.`, "warn");
         return;
       }
-      const bytes = new Uint8Array(seedAb);
+      let bytes = new Uint8Array(seedAb);
+      // V1.0122: drafts written before the open-boundary unlock existed can
+      // seed STILL-ENCRYPTED bytes into a tab — and a structural edit on
+      // those produces a corrupt, /Encrypt-less container the save-time
+      // defence can no longer detect. Unlock here, same as the open path.
+      let restoredUnlocked = false;
+      const unlockResult = await unlockIfOwnerLocked(bytes);
+      if (unlockResult.ok && unlockResult.unlocked) {
+        bytes = unlockResult.bytes;
+        restoredUnlocked = true;
+        useUIStore
+          .getState()
+          .showToast(`${m.originalName} was locked against editing — unlocked a working copy.`, "info");
+      } else if (!unlockResult.ok) {
+        useUIStore
+          .getState()
+          .showToast(
+            `${m.originalName} is locked against editing — install qpdf (brew install qpdf) to edit it.`,
+            "warn",
+          );
+      }
       let pdf;
       try {
         pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
@@ -474,7 +506,9 @@ export function App() {
 
       const tabId = addTab({
         name: m.originalName,
-        path: m.sourcePath,
+        // An unlocked working copy must never save in place over the
+        // still-encrypted original (same rule as the open path).
+        path: restoredUnlocked ? null : m.sourcePath,
         // Reuse the same draftKey so the autosave hook keeps writing to
         // the same slot instead of forking on UUID change.
         draftKey: m.draftKey,
@@ -566,12 +600,123 @@ export function App() {
         wasDecrypted = true;
         pdf = await pdfjsLib.getDocument({ data: bytes.slice() }).promise;
       }
+      // V1.0121: OWNER-LOCKED PDFs (encrypted, but with an EMPTY user password —
+      // the shape used by insurance / government / MTO forms like a CVOR
+      // certificate) open in pdf.js WITHOUT throwing, so the catch block above
+      // never runs and the tab kept the still-encrypted bytes. pdf-lib loads
+      // those with `ignoreEncryption` but never decrypts the content streams,
+      // so EVERY structural op (delete page, extract/print a range, rotate,
+      // reorder, crop, merge…) emitted a container full of undecryptable
+      // streams — pdf.js then rendered the result as a BLANK page
+      // ("FormatError: Unknown compression method in flate stream"). That is
+      // Adam's "I can't delete page 2 or print just page 1".
+      //
+      // V1.0118 patched only the SAVE path, which is one of N consumers of
+      // these bytes — the wrong layer. Decrypt ONCE here, at the open
+      // boundary, so every downstream op operates on clean bytes.
+      //
+      // Detection is `isPdfEncrypted`, not "did pdf.js refuse to open it" —
+      // the old condition could not be true for exactly the files that break.
+      if (!wasDecrypted) {
+        try {
+          const { isPdfEncrypted } = await loadPdfOps();
+          if (await isPdfEncrypted(bytes)) {
+            if (await window.weavepdf.qpdf.available()) {
+              const plain = new Uint8Array(
+                await window.weavepdf.qpdf.decrypt(toArrayBuffer(bytes), ""),
+              );
+              const reloaded = await pdfjsLib.getDocument({ data: plain.slice() }).promise;
+              void pdf.destroy();
+              bytes = plain;
+              pdf = reloaded;
+              // V1.0122: the tab now holds DECRYPTED bytes, so it must take
+              // the same route as the password-prompt branch above — path
+              // dropped, ⌘S → Save As. Without this, `addTab` kept the
+              // original path, saveInPlace stayed true, and the first ⌘S
+              // silently overwrote the owner-locked ORIGINAL with the
+              // unlocked copy — the exact overwrite the "working copy"
+              // toast promises doesn't happen.
+              wasDecrypted = true;
+              useUIStore
+                .getState()
+                .showToast(
+                  `${payload.name} was locked against editing — unlocked a working copy.`,
+                  "info",
+                );
+            } else {
+              // Without qpdf we cannot unlock it. Say so plainly rather than
+              // letting the user discover it as silently blank pages.
+              useUIStore
+                .getState()
+                .showToast(
+                  `${payload.name} is locked against editing — install qpdf (brew install qpdf) and reopen to edit it.`,
+                  "warn",
+                );
+            }
+          }
+        } catch (err) {
+          // A failed unlock must never block opening the document for viewing —
+          // but it must not be SILENT either: the tab keeps encrypted bytes,
+          // so structural edits would come out blank. Same warn toast as the
+          // qpdf-missing branch, so the two failure modes read the same.
+          console.error("open: owner-locked unlock failed", err);
+          useUIStore
+            .getState()
+            .showToast(
+              `${payload.name} is locked against editing and couldn't be unlocked — edits may not save correctly.`,
+              "warn",
+            );
+        }
+      }
+      // V1.0126: separate WeavePDF's editable elements from the page. A file
+      // saved by V1.0126+ tags every content stream it baked; strip those so
+      // the tab holds the CLEAN page and the elements come back as overlays
+      // only (below). Before this, the reopened overlays sat on top of their
+      // own baked copies — so deleting or moving one left the old copy burned
+      // in, and each save stacked another copy (406 → 922 streams on Adam's
+      // form). Older (v1/v2) files have no tags: only the stale metadata entry
+      // is dropped, and their elements restore over the baked page as before.
+      let meta: Awaited<ReturnType<Awaited<ReturnType<typeof loadPdfOps>>["extractWeaveMetadata"]>> = null;
+      try {
+        const ops = await loadPdfOps();
+        meta = await ops.extractWeaveMetadata(bytes);
+        // Another tool rotated / cropped / re-paged the file since WeavePDF
+        // saved it: the baked copies moved with their pages but the stored
+        // positions didn't. Keep the file exactly as it looks (flat).
+        if (meta && !(await ops.weavePagesMatch(bytes, meta))) meta = null;
+        if (meta) {
+          const base = await ops.stripWeaveBakes(bytes);
+          const elementCount = meta.textEdits.length + meta.imageEdits.length + meta.shapeEdits.length;
+          // A v3 file whose baked layer can't be found (a tool rewrote the
+          // content but kept our metadata) would show every element twice:
+          // keep it flat instead.
+          if (meta.version === 3 && elementCount > 0 && base.strippedStreams === 0) {
+            meta = null;
+          } else if (base.changed) {
+            const reloaded = await pdfjsLib.getDocument({ data: base.bytes.slice() }).promise;
+            void pdf.destroy();
+            bytes = base.bytes;
+            pdf = reloaded;
+          }
+        }
+      } catch (err) {
+        // Never block opening the document over the editable layer: fall back
+        // to the file exactly as saved (elements baked, not editable).
+        console.error("open: couldn't separate WeavePDF elements", err);
+        meta = null;
+      }
       const newTabId = addTab({
         name: payload.name,
         // Decrypted files drop the original path so ⌘S routes to Save-As —
         // prevents overwriting the encrypted original with an unencrypted copy.
         path: wasDecrypted ? null : payload.path,
         sizeBytes: bytes.byteLength,
+        // V1.0133: remember which version of the file this tab shows (a
+        // Finder reopen of the same path checks it against the disk).
+        disk:
+          !wasDecrypted && payload.path && payload.mtimeMs !== undefined
+            ? { mtimeMs: payload.mtimeMs, sizeBytes: payload.sizeBytes }
+            : null,
         bytes,
         pdf,
         numPages: pdf.numPages,
@@ -582,8 +727,7 @@ export function App() {
       // `whiteout` field covers the previously-baked content so the
       // editable overlay floats on top instead of stacking visually.
       try {
-        const { extractWeaveMetadata, detectWeaveCanaryWithoutMetadata } = await loadPdfOps();
-        const meta = await extractWeaveMetadata(bytes);
+        const { detectWeaveCanaryWithoutMetadata } = await loadPdfOps();
         if (!meta) {
           // V1.0091: Acrobat-strip detection. If our metadata is gone
           // but the /Keywords canary is still there, this file was
@@ -601,10 +745,16 @@ export function App() {
           }
         }
         if (meta) {
+          // V1.0125: reproduce the saved stacking order. Files from before
+          // V1.0125 have no `z` and were baked shapes → images → text, so
+          // `restoreZ` restores them in exactly that order — the screen
+          // then matches what the file actually shows.
+          const zs = restoreZ({ text: meta.textEdits, image: meta.imageEdits, shape: meta.shapeEdits });
           if (meta.textEdits.length > 0) {
             restorePendingTextEdits(
               newTabId,
-              meta.textEdits.map((e) => ({
+              meta.textEdits.map((e, i) => ({
+                z: zs.text[i],
                 page: e.page,
                 xPt: e.xPt,
                 yPt: e.yPt,
@@ -615,14 +765,17 @@ export function App() {
                 italic: e.italic,
                 align: e.align,
                 fontName: e.fontName,
+                color: e.color,
                 whiteout: e.whiteout,
+                formField: e.formField,
               })),
             );
           }
           if (meta.imageEdits.length > 0) {
             restorePendingImageEdits(
               newTabId,
-              meta.imageEdits.map((e) => ({
+              meta.imageEdits.map((e, i) => ({
+                z: zs.image[i],
                 page: e.page,
                 xPt: e.xPt,
                 yPt: e.yPt,
@@ -644,7 +797,10 @@ export function App() {
             );
           }
           if (meta.shapeEdits.length > 0) {
-            restorePendingShapeEdits(newTabId, meta.shapeEdits);
+            restorePendingShapeEdits(
+              newTabId,
+              meta.shapeEdits.map((e, i) => ({ ...e, z: zs.shape[i] })),
+            );
           }
           const n = meta.textEdits.length + meta.imageEdits.length + meta.shapeEdits.length;
           if (n > 0) {
@@ -728,7 +884,9 @@ export function App() {
       multi: true,
     });
     if (result.canceled) return;
-    for (const file of result.files) {
+    // V1.0129: open in name order (Finder's), not the order files were clicked.
+    const ordered = [...result.files].sort((x, y) => compareFileNames(x.path ?? x.name, y.path ?? y.name));
+    for (const file of ordered) {
       const bytes = new Uint8Array(file.data);
       const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
       try {
@@ -737,6 +895,7 @@ export function App() {
             name: file.name,
             path: file.path,
             sizeBytes: file.sizeBytes,
+            mtimeMs: file.mtimeMs,
             bytes,
           });
         } else if (DOC_EXTS.includes(ext as (typeof DOC_EXTS)[number])) {
@@ -803,18 +962,95 @@ export function App() {
   // the boolean to decide whether to proceed with the deferred close/quit.
   const saveTabById = useCallback(
     async (tabId: string, forceSaveAs: boolean): Promise<boolean> => {
-      const tab0 = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
+      let tab0 = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
       // Tab gone or empty — count as a no-op success so the close path proceeds.
       if (!tab0?.bytes) return true;
       // Bake any newly-edited floating elements into the PDF before writing
       // to disk. A freshly opened WeavePDF file can restore editable overlays
       // from metadata while staying clean; those bytes already contain the
       // baked visual content, so re-saving unchanged should not duplicate it.
-      if (tab0.dirty && tabHasPendingEdits(tab0)) {
-        await commitAllPending(tabId);
-      }
-      const refreshed = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
+      // V1.0117: wrap the whole save so ANY failure — the commit, the Save
+      // dialog not opening, or the write being refused — surfaces the real
+      // reason instead of rejecting into the `void saveCurrent(...)` call and
+      // vanishing ("nothing happens").
+      try {
+        // V1.0118: owner-locked PDFs (encrypted but opening with an EMPTY user
+        // password — common on insurance / government forms) can't be edited
+        // and saved by pdf-lib: it never decrypts the content streams, so the
+        // bake either throws or yields a file pdf.js rejects ("No password
+        // given"). Decrypt with qpdf (empty password) before baking so we
+        // write a clean, editable copy. (PDFs needing a real user password are
+        // already decrypted at open via the password prompt.)
+        //
+        // V1.0121: this unlock used to sit INSIDE the `tabHasPendingEdits`
+        // branch — i.e. it only ran when the document carried floating text /
+        // image / shape overlays. A STRUCTURAL edit (delete page, reorder,
+        // rotate, crop) sets `dirty` but adds no pending overlay, so the gate
+        // was false and an already-corrupted, still-encrypted byte stream was
+        // written straight over the user's original file. Encryption is a
+        // property of the BYTES, so the check belongs on `dirty` alone — the
+        // condition must be able to be true in the failure case, and it
+        // couldn't be. Open-time unlock (loadAsTab) means this now rarely
+        // fires; it is a defence for bytes that reach a tab STILL CARRYING an
+        // /Encrypt dict (draft/snapshot restore). It cannot catch a MERGE that
+        // copied undecryptable streams out of an encrypted source — the merged
+        // container has no /Encrypt dict, so isPdfEncrypted is false there;
+        // that case is handled at the merge boundary instead (unlock.ts).
+        // V1.0123: commit the form field the user is still typing in, and wait
+        // for any edit already running. Neither used to happen: ⌘S (the macOS
+        // menu accelerator) never blurs the caret, so the typed value lived in
+        // React state only and the file was written with the PREVIOUS value —
+        // then toasted "Saved." and marked the tab clean, while the screen kept
+        // showing the new text. `commitAllPending` below silently no-ops while
+        // another edit is in flight, which loses pending overlays the same way.
+        await flushActiveFormField();
+        if (!(await waitForTabIdle(tabId))) {
+          useUIStore
+            .getState()
+            .showToast("Still applying your last change — try saving again in a moment.", "warn");
+          return false;
+        }
+        // Re-read: the flush above may have replaced the tab's bytes.
+        const flushed = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
+        if (flushed?.bytes) tab0 = flushed;
+        if (!tab0?.bytes) return true;
+        if (tab0.dirty) {
+          const ops = await loadPdfOps();
+          if (await ops.isPdfEncrypted(tab0.bytes)) {
+            const decrypted = await window.weavepdf.qpdf.decrypt(toArrayBuffer(tab0.bytes), "");
+            await applyEdit(tabId, new Uint8Array(decrypted));
+            // V1.0122: applyEdit is not a reliable channel for a
+            // correctness-critical replacement — it silently no-ops when
+            // another edit is in flight and swallows its own failures. Re-read
+            // the tab and refuse to continue on still-encrypted bytes rather
+            // than bake garbage and write it out.
+            const after = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
+            if (!after?.bytes || (await ops.isPdfEncrypted(after.bytes))) {
+              useUIStore
+                .getState()
+                .showToast("Couldn't unlock this document to save it — try again in a moment.", "warn");
+              return false;
+            }
+            // The unlocked bytes are a working copy — never overwrite the
+            // still-encrypted original silently (same rule as the open path).
+            useDocumentStore.setState((s) => ({
+              tabs: s.tabs.map((t) => (t.id === tabId ? { ...t, saveInPlace: false } : t)),
+            }));
+          }
+        }
+        const refreshed = useDocumentStore.getState().tabs.find((t) => t.id === tabId);
       if (!refreshed?.bytes) return true;
+      // V1.0126: build the file from the clean page + the editable elements,
+      // fresh, every save — never bake into the tab. See renderOutput.
+      // What this file is built from — if the tab changes while the save is
+      // being written, markClean leaves it unsaved.
+      const savedState = {
+        bytes: refreshed.bytes,
+        text: refreshed.pendingTextEdits,
+        image: refreshed.pendingImageEdits,
+        shape: refreshed.pendingShapeEdits,
+      };
+      const outBytes = (await renderOutput(tabId)) ?? refreshed.bytes;
       let targetPath = refreshed.path;
       const mustPrompt = forceSaveAs || !targetPath || !refreshed.saveInPlace;
       if (mustPrompt) {
@@ -828,9 +1064,27 @@ export function App() {
         targetPath = result.path;
       }
       if (!targetPath) return false;
-      const savedBytes = toArrayBuffer(refreshed.bytes);
-      const result = await window.weavepdf.writeFile(targetPath, savedBytes);
-      if (result.ok) {
+      let writeResult = await window.weavepdf.writeFile(targetPath, toArrayBuffer(outBytes));
+      // V1.0116: a silent in-place save can fail when the original file sits in
+      // a read-only / permission-restricted spot, or at a path this session
+      // never blessed for writing. Rather than dead-end with an error, fall back
+      // to Save As so the user can always put their work somewhere writable —
+      // and the dialog re-blesses the chosen path, which also recovers a
+      // stale-bless case (e.g. the original overwritten via the picker).
+      if (!writeResult.ok && !mustPrompt) {
+        console.error("save: in-place write failed, offering Save As", writeResult.error);
+        useUIStore.getState().showToast("Couldn't update the original — choose where to save.", "warn");
+        const suggested = refreshed.name.replace(/\.[^.]+$/, "") + ".pdf";
+        const dlg = await window.weavepdf.saveFileDialog({
+          title: "Save As",
+          suggestedName: suggested,
+          extensions: ["pdf"],
+        });
+        if (dlg.canceled || !dlg.path) return false;
+        targetPath = dlg.path;
+        writeResult = await window.weavepdf.writeFile(targetPath, toArrayBuffer(outBytes));
+      }
+      if (writeResult.ok) {
         // V1.0036: clear the autosave draft slots BEFORE markClean, while
         // we still have the previous draftKey. The autosave hook would do
         // this on its next debounced flush after history clears, but the
@@ -851,18 +1105,54 @@ export function App() {
         // the user (worst case: that one save isn't in the rollback list).
         // Clone the buffer because writeFile may have transferred it.
         void window.weavepdf.snapshots
-          .save(targetPath, refreshed.bytes.slice().buffer as ArrayBuffer)
+          .save(targetPath, outBytes.slice().buffer as ArrayBuffer)
           .catch(() => {});
-        markClean(refreshed.id, targetPath);
+        markClean(refreshed.id, targetPath, savedState, {
+          mtimeMs: writeResult.mtimeMs,
+          sizeBytes: writeResult.sizeBytes,
+        });
+        // V1.0115: an opened file saves in place with no dialog, so without a
+        // confirmation the save is invisible — "I pressed Save and nothing
+        // happened." A quiet toast per BRAND ("Saved.") closes that gap.
+        // V1.0123: if the bake had to substitute characters no PDF standard
+        // font can draw, say so IN the save toast. A separate warn toast would
+        // be wiped instantly — the toast is single-slot and this "Saved." is
+        // right behind it.
+        const substituted = takeLastUnsupportedChars();
+        if (substituted.length > 0) {
+          useUIStore
+            .getState()
+            .showToast(
+              `Saved — but ${substituted.slice(0, 6).join(" ")} can't be drawn in a PDF font, so plain-text stand-ins were used.`,
+              "warn",
+            );
+        } else {
+          useUIStore.getState().showToast("Saved.");
+        }
         return true;
-      } else {
-        console.error("save", result.error);
-        useUIStore.getState().showToast("Couldn't save that file.", "warn");
+      }
+        // V1.0117: show the ACTUAL write error so we can finally see why a save
+        // is refused (permission / path-not-permitted / a locked file) instead
+        // of a generic message that hides the cause.
+        console.error("save", writeResult.error);
+        useUIStore.getState().showToast(`Couldn't save: ${writeResult.error ?? "unknown error"}`, "warn");
+        return false;
+      } catch (err) {
+        const msg = (err as Error)?.message ?? String(err);
+        console.error("save failed", err);
+        useUIStore.getState().showToast(`Couldn't save: ${msg}`, "warn");
         return false;
       }
     },
-    [markClean, commitAllPending],
+    [markClean, renderOutput, applyEdit],
   );
+
+  // V1.0123: hand the save routine to the tab-close flow so the "Save" button
+  // in the unsaved-changes prompt can actually save (see lib/close-tab.ts).
+  useEffect(() => {
+    setTabSaver((tabId) => saveTabById(tabId, false));
+    return () => setTabSaver(null);
+  }, [saveTabById]);
 
   const saveCurrent = useCallback(
     async (forceSaveAs: boolean) => {
@@ -901,15 +1191,17 @@ export function App() {
 
   const exportCombined = useCallback(async () => {
     if (tabs.length === 0) return;
-    // Export should match save/print output, so commit any floating overlays
-    // before merging tabs together.
-    for (const t of tabs) {
-      if (t.dirty && tabHasPendingEdits(t)) {
-        await commitAllPending(t.id);
-      }
-    }
+    // Export must match save/print output. V1.0126: render each tab's
+    // elements into a copy (renderOutput) instead of baking them into the
+    // open tabs — and regardless of `dirty`, since a clean tab reopened from
+    // a WeavePDF save holds its elements as overlays.
+    await flushActiveFormField();
     const freshTabs = useDocumentStore.getState().tabs;
-    const sources = freshTabs.filter((t) => t.bytes).map((t) => t.bytes!);
+    const sources: Uint8Array[] = [];
+    for (const t of freshTabs) {
+      if (!t.bytes) continue;
+      sources.push((await renderOutput(t.id)) ?? t.bytes);
+    }
     if (sources.length === 0) return;
     const { mergePdfs } = await loadPdfOps();
     const merged = sources.length === 1 ? sources[0] : await mergePdfs(sources);
@@ -924,7 +1216,7 @@ export function App() {
       console.error("export", write.error);
       useUIStore.getState().showToast("Couldn't export that file.", "warn");
     }
-  }, [tabs, commitAllPending]);
+  }, [tabs, renderOutput]);
 
   const printCurrent = useCallback(() => {
     // V1.0021: route to PrintPreviewModal instead of direct
@@ -944,14 +1236,16 @@ export function App() {
         `You can't delete every page. Close this document instead?\n\n(${activeTab.name})`,
       );
       if (confirmed) {
-        useDocumentStore.getState().closeTab(activeTab.id);
+        // V1.0126: through the unsaved-work prompt — this used to close the
+        // tab outright and lose every unsaved edit.
+        void requestCloseTab(activeTab.id);
       }
       return;
     }
     const pages = Array.from(activeTab.selectedPages).sort((a, b) => a - b);
     const { deletePages } = await loadPdfOps();
     const newBytes = await deletePages(activeTab.bytes, pages);
-    await applyEdit(activeTab.id, newBytes);
+    await applyEdit(activeTab.id, newBytes, { remapPages: remapForDelete(pages) });
   }, [activeTab, applyEdit]);
 
   const [encryptPrompt, setEncryptPrompt] = useState<{ name: string } | null>(null);
@@ -974,9 +1268,10 @@ export function App() {
     setEncryptBusy(true);
     setEncryptError(null);
     try {
-      await commitAllPending(activeTab.id);
+      await flushActiveFormField();
       const fresh = useDocumentStore.getState().tabs.find((t) => t.id === activeTab.id);
       if (!fresh?.bytes) return;
+      const outBytes = (await renderOutput(fresh.id)) ?? fresh.bytes;
       const result = await window.weavepdf.saveFileDialog({
         title: "Save encrypted PDF",
         suggestedName: fresh.name.replace(/\.pdf$/i, "") + "-encrypted.pdf",
@@ -986,7 +1281,7 @@ export function App() {
         setEncryptPrompt(null);
         return;
       }
-      const encrypted = await window.weavepdf.qpdf.encrypt(u8ToAb(fresh.bytes), password);
+      const encrypted = await window.weavepdf.qpdf.encrypt(u8ToAb(outBytes), password);
       const w = await window.weavepdf.writeFile(result.path, encrypted);
       if (!w.ok) {
         setEncryptError(w.error);
@@ -1002,9 +1297,10 @@ export function App() {
 
   const exportDocx = useCallback(async () => {
     if (!activeTab?.bytes) return;
-    await commitAllPending(activeTab.id);
+    await flushActiveFormField();
     const fresh = useDocumentStore.getState().tabs.find((t) => t.id === activeTab.id);
     if (!fresh?.bytes) return;
+    const outBytes = (await renderOutput(fresh.id)) ?? fresh.bytes;
     const result = await window.weavepdf.saveFileDialog({
       title: "Export as Word document",
       suggestedName: fresh.name.replace(/\.[^.]+$/, "") + ".docx",
@@ -1013,7 +1309,7 @@ export function App() {
     if (result.canceled) return;
     try {
       const { pdfToMarkdown } = await loadPdfOps();
-      const md = await pdfToMarkdown(fresh.bytes);
+      const md = await pdfToMarkdown(outBytes);
       // Strip markdown scaffolding — `##` / `###` become plain text. textutil
       // will paragraph-break on blank lines already, which is enough for an
       // editable Word doc out of pdf.js's text stream.
@@ -1031,13 +1327,14 @@ export function App() {
       console.error("word export", err);
       useUIStore.getState().showToast("Couldn't export to Word.", "warn");
     }
-  }, [activeTab, commitAllPending]);
+  }, [activeTab, renderOutput]);
 
   const exportMarkdown = useCallback(async () => {
     if (!activeTab?.bytes) return;
-    await commitAllPending(activeTab.id);
+    await flushActiveFormField();
     const fresh = useDocumentStore.getState().tabs.find((t) => t.id === activeTab.id);
     if (!fresh?.bytes) return;
+    const outBytes = (await renderOutput(fresh.id)) ?? fresh.bytes;
     const result = await window.weavepdf.saveFileDialog({
       title: "Export as Markdown",
       suggestedName: fresh.name.replace(/\.[^.]+$/, "") + ".md",
@@ -1046,7 +1343,7 @@ export function App() {
     if (result.canceled) return;
     try {
       const { pdfToMarkdown } = await loadPdfOps();
-      const md = await pdfToMarkdown(fresh.bytes);
+      const md = await pdfToMarkdown(outBytes);
       const ab = u8ToAb(new TextEncoder().encode(md));
       const w = await window.weavepdf.writeFile(result.path, ab);
       if (!w.ok) {
@@ -1057,7 +1354,7 @@ export function App() {
       console.error("markdown export", err);
       useUIStore.getState().showToast("Couldn't export to Markdown.", "warn");
     }
-  }, [activeTab, commitAllPending]);
+  }, [activeTab, renderOutput]);
 
   const rotateSelected = useCallback(
     async (delta: 90 | -90 | 180) => {
@@ -1075,6 +1372,7 @@ export function App() {
         const edit = tab?.pendingImageEdits.find((e) => e.id === ui.selectedPendingImageId);
         if (edit) {
           const next = (((edit.rotation ?? 0) + delta) % 360 + 360) % 360;
+          useDocumentStore.getState().pushUndoStep(activeTab.id); // V1.0126: undoable
           useDocumentStore.getState().updatePendingImageEdit(activeTab.id, edit.id, {
             rotation: next,
           });
@@ -1091,7 +1389,10 @@ export function App() {
           ? Array.from(activeTab.selectedPages)
           : [activeTab.currentPage];
       const { rotatePages } = await loadPdfOps();
-      const newBytes = await rotatePages(activeTab.bytes, targets, delta);
+      // V1.0126: elements on the rotated pages turn WITH the page.
+      const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id, targets);
+      if (!src) return;
+      const newBytes = await rotatePages(src, targets, delta);
       await applyEdit(activeTab.id, newBytes);
     },
     [activeTab, applyEdit],
@@ -1139,8 +1440,25 @@ export function App() {
     [setTool],
   );
 
+  // V1.0134: ⌘C / ⌘X / ⌘V on placed elements (text boxes, images, shapes).
+  // The Edit menu's Copy/Paste roles dispatch clipboard events; this listens
+  // to those, so the menu and the keys share one path.
+  useEffect(() => installElementClipboard(), []);
+
   useHotkeys("mod+k", (e) => {
     e.preventDefault();
+    // V1.0123: ⌘K used to open the palette unconditionally — including ON TOP
+    // of an already-open modal. Because the palette is z-50 and most modals are
+    // z-40, running a palette action from there mounted the new modal
+    // UNDERNEATH the one still on screen, so it looked like nothing happened
+    // (and the buried modal only appeared once the first was closed). Toggle
+    // instead, and stand down while another modal owns the screen — matching
+    // every other feature shortcut, which already respects this gate.
+    if (paletteOpen) {
+      closePalette();
+      return;
+    }
+    if (featureShortcutBlocked) return;
     openPalette();
   });
   useHotkeys("mod+/", (e) => {
@@ -1163,6 +1481,8 @@ export function App() {
   });
   useHotkeys("mod+e", (e) => {
     e.preventDefault();
+    // V1.0126: ⌘E is "center" on a selected text box.
+    if (boxJustHandledShortcut()) return;
     void exportCombined();
   });
   useHotkeys("mod+p", (e) => {
@@ -1231,6 +1551,8 @@ export function App() {
   }, undefined, [canRunFeatureShortcut, openHeaderFooter]);
   useHotkeys("mod+i", (e) => {
     if (!canRunFeatureShortcut(e)) return;
+    // V1.0126: ⌘I is "italic" on a selected text box.
+    if (boxJustHandledShortcut()) return;
     e.preventDefault();
     openMetadata();
   }, undefined, [canRunFeatureShortcut, openMetadata]);
@@ -1309,6 +1631,18 @@ export function App() {
     e.preventDefault();
     if (activeTab) openSearch();
   });
+  // V1.0126: a selection must point at an element that exists in THIS tab.
+  // Ids used to survive a tab switch or an undo that removed the element, and
+  // a stale id silently disabled ←/→ page turns and Backspace-deletes-pages
+  // and made Rotate say "This element can't be rotated" with nothing selected.
+  useEffect(() => {
+    const ui = useUIStore.getState();
+    const has = (list: { id: string }[] | undefined, id: string | null) => !!id && !!list?.some((e) => e.id === id);
+    if (ui.selectedPendingTextId && !has(activeTab?.pendingTextEdits, ui.selectedPendingTextId)) ui.setSelectedPendingText(null);
+    if (ui.selectedPendingImageId && !has(activeTab?.pendingImageEdits, ui.selectedPendingImageId)) ui.setSelectedPendingImage(null);
+    if (ui.selectedPendingShapeId && !has(activeTab?.pendingShapeEdits, ui.selectedPendingShapeId)) ui.setSelectedPendingShape(null);
+  }, [activeTab?.id, activeTab?.pendingTextEdits, activeTab?.pendingImageEdits, activeTab?.pendingShapeEdits]);
+
   useHotkeys("escape", () => {
     if (searchOpen) {
       closeSearch();
@@ -1316,8 +1650,10 @@ export function App() {
       clearSelection(activeTab.id);
     } else if (!featureShortcutBlocked) {
       // A modal/overlay owns the screen — don't reach past it to clear the
-      // active tool on the document underneath. (Modals that want Escape to
-      // dismiss them register their own keydown handler.)
+      // active tool on the document underneath. (Modals dismiss themselves via
+      // the shared useEscapeClose hook, which sees their busy guards and works
+      // even while a text field inside them has focus — this hotkey cannot,
+      // because react-hotkeys-hook ignores events targeting form elements.)
       setTool("none");
     }
   });
@@ -1329,7 +1665,8 @@ export function App() {
   });
   useHotkeys("mod+w", (e) => {
     e.preventDefault();
-    if (activeTab) useDocumentStore.getState().closeTab(activeTab.id);
+    // V1.0123: prompt when the tab has unsaved work (see lib/close-tab.ts).
+    if (activeTab) void requestCloseTab(activeTab.id);
   });
   useHotkeys("mod+1,mod+2,mod+3,mod+4,mod+5,mod+6,mod+7,mod+8,mod+9", (e) => {
     const n = Number(e.key);
@@ -1350,17 +1687,32 @@ export function App() {
     e.preventDefault();
     if (activeTab) setZoom(activeTab.id, 1);
   });
-  useHotkeys("arrowright,pagedown", () => {
+  // V1.0132: ↑/↓ step pages too. Before, only ←/→ were bound, so ↓ after
+  // clicking a thumbnail fell through to the browser and SCROLLED the sidebar
+  // instead of moving to the next page. preventDefault stops that native
+  // scroll (the sidebar and viewer follow the new page on their own).
+  const stepPage = useCallback(
+    (delta: 1 | -1) => {
+      const at = useDocumentStore.getState().activeTab();
+      if (!at) return;
+      const { page, moveSelection } = pageStep(at.currentPage, at.numPages, at.selectedPages.size, delta);
+      setCurrentPage(at.id, page);
+      if (moveSelection) useDocumentStore.getState().selectPage(at.id, page, "set");
+    },
+    [setCurrentPage],
+  );
+  const arrowPageKey = (e: KeyboardEvent, delta: 1 | -1) => {
+    if (!canRunFeatureShortcut(e)) return;
     const ui = useUIStore.getState();
-    // Yield to any selected pending overlay (image / text / shape).
+    // Yield to any selected pending overlay (image / text / shape) and to the
+    // crop box — those use the arrow keys to nudge.
     if (ui.selectedPendingImageId || ui.selectedPendingTextId || ui.selectedPendingShapeId) return;
-    if (activeTab) setCurrentPage(activeTab.id, activeTab.currentPage + 1);
-  });
-  useHotkeys("arrowleft,pageup", () => {
-    const ui = useUIStore.getState();
-    if (ui.selectedPendingImageId || ui.selectedPendingTextId || ui.selectedPendingShapeId) return;
-    if (activeTab) setCurrentPage(activeTab.id, activeTab.currentPage - 1);
-  });
+    if (ui.tool === "crop") return;
+    e.preventDefault();
+    stepPage(delta);
+  };
+  useHotkeys("arrowright,arrowdown,pagedown", (e) => arrowPageKey(e, 1));
+  useHotkeys("arrowleft,arrowup,pageup", (e) => arrowPageKey(e, -1));
   useHotkeys("backspace,delete", async () => {
     const el = document.activeElement as HTMLElement | null;
     if (el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)) return;
@@ -1377,28 +1729,42 @@ export function App() {
   );
 
   // File paths the OS hands us (double-click PDF, Open With, drag on Dock icon).
+  // V1.0129: Finder fires one event per selected file; they used to load
+  // concurrently, so tabs appeared in finish order (random). The batcher
+  // collects paths that arrive together, sorts them by name the way Finder
+  // lists them, and opens them one at a time — tab order = Finder order.
   useEffect(() => {
-    const dispose = window.weavepdf.onOpenFilePath(async (filePath) => {
+    const openOne = async (filePath: string) => {
       try {
-        // V1.0027: if this file is ALREADY open in a tab, switch to it
-        // instead of re-opening. Re-opening reloads the file from disk
-        // and triggers the autosave-restore prompt, which is annoying
-        // when the user just wanted to bring the existing tab forward.
-        const existing = useDocumentStore
-          .getState()
-          .tabs.find((t) => t.path === filePath);
-        if (existing) {
-          useDocumentStore.getState().setActiveTab(existing.id);
-          return;
-        }
         const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
         const file = await window.weavepdf.readFile(filePath);
         const bytes = new Uint8Array(file.data);
+        // V1.0027: if this file is ALREADY open in a tab, switch to it instead
+        // of opening a second copy. V1.0133: only when that tab shows the file
+        // as it is on disk NOW. Adam saved an edited PDF over the same name and
+        // reopened it from Finder — the old tab was brought forward and read as
+        // "it opens the last version". A stale clean tab is closed and the file
+        // loaded fresh; a stale DIRTY tab keeps its unsaved work and the file
+        // opens beside it.
+        const onDisk = { mtimeMs: file.mtimeMs, sizeBytes: file.sizeBytes };
+        const target = resolveOpenTarget(useDocumentStore.getState().tabs, filePath, onDisk);
+        if (target.action === "activate") {
+          useDocumentStore.getState().setActiveTab(target.tabId);
+          return;
+        }
+        if (target.action === "replace") {
+          useDocumentStore.getState().closeTab(target.tabId);
+        } else if (target.keptDirtyTabIds.length > 0) {
+          useUIStore
+            .getState()
+            .showToast(`${file.name} has changed on disk — your unsaved copy stays in its own tab.`, "info");
+        }
         if (ext === "pdf") {
           await loadAsTab({
             name: file.name,
             path: file.path,
             sizeBytes: file.sizeBytes,
+            mtimeMs: file.mtimeMs,
             bytes,
           });
         } else if (["png", "jpg", "jpeg", "heic", "heif"].includes(ext)) {
@@ -1422,9 +1788,23 @@ export function App() {
         console.error("open file", err);
         useUIStore.getState().showToast("Couldn't open that file.", "warn");
       }
+    };
+    const batcher = createOpenBatcher(openOne);
+    // V1.0130: if batching ever fails, open the file directly — an ordering
+    // nicety must never cost the open itself (V1.0129 shipped exactly that).
+    const dispose = window.weavepdf.onOpenFilePath((filePath) => {
+      try {
+        batcher.push(filePath);
+      } catch (err) {
+        console.error("open batcher", err);
+        void openOne(filePath);
+      }
     });
     window.weavepdf.notifyOpenFileListenerReady();
-    return dispose;
+    return () => {
+      dispose();
+      batcher.dispose();
+    };
   }, [loadAsTab]);
 
   // Bridge the macOS application menu clicks to renderer actions. Read fresh
@@ -1437,7 +1817,13 @@ export function App() {
         case "open": void openFile(); break;
         case "save": void saveCurrent(false); break;
         case "saveAs": void saveCurrent(true); break;
-        case "export": void exportCombined(); break;
+        // V1.0126: on a selected text box ⌘E = center and ⌘I = italic (handled
+        // by the box); the menu accelerator must not ALSO export / open
+        // Document Properties. A mouse click on these menu items still works.
+        case "export":
+          if (boxJustHandledShortcut()) break;
+          void exportCombined();
+          break;
         case "print": void printCurrent(); break;
         case "search": if (at) openSearch(); break;
         case "toggleSidebar": toggleSidebar(); break;
@@ -1452,20 +1838,53 @@ export function App() {
         case "draw": setTool("draw"); break;
         case "compress": openCompress(); break;
         case "watermark": openWatermark(); break;
-        case "metadata": openMetadata(); break;
+        case "metadata":
+          if (boxJustHandledShortcut()) break;
+          openMetadata();
+          break;
         case "extractPages": openExtract(); break;
         case "rotateLeft": rotateCommand(-90); break;
         case "rotateRight": rotateCommand(90); break;
         case "rotate180": rotateCommand(180); break;
-        case "deletePages": void deleteSelected(); break;
-        case "selectAllPages": if (at) selectAllPages(at.id); break;
-        case "undo": if (at) void undo(at.id); break;
-        case "redo": if (at) void useDocumentStore.getState().redo(at.id); break;
+        // V1.0123: these three are reachable from BARE-KEY menu accelerators
+        // (Backspace, →, ←; see buildAppMenu in main.ts). A native macOS menu
+        // accelerator fires no matter what has DOM focus, so while the user was
+        // typing in ANY text field — a Watermark/Metadata/password modal, the
+        // Add-Text prompt, the search box, a form field — Backspace could delete
+        // the selected PAGES and the arrow keys would jump pages instead of
+        // moving the caret. Ignore them whenever a text field owns the caret.
+        // (Harmless if Electron already suppresses the accelerator there: the
+        // guard simply never trips.) The ⌘-modified twins are unaffected.
+        case "deletePages":
+          if (isEditableShortcutTarget(null)) break;
+          void deleteSelected();
+          break;
+        // V1.0126: ⌘Z / ⇧⌘Z / ⌘A are native menu accelerators too, so they
+        // fire no matter what has focus. While typing in a text box, form field
+        // or dialog, ⌘Z undid the DOCUMENT's last action (a placed checkmark
+        // vanished) instead of the typing, and ⌘A selected every page instead
+        // of the text. Hand them to the focused field instead.
+        case "selectAllPages":
+          if (isEditableShortcutTarget(null)) { document.execCommand("selectAll"); break; }
+          if (at) selectAllPages(at.id);
+          break;
+        case "undo":
+          if (isEditableShortcutTarget(null)) { document.execCommand("undo"); break; }
+          if (at) void undo(at.id);
+          break;
+        case "redo":
+          if (isEditableShortcutTarget(null)) { document.execCommand("redo"); break; }
+          if (at) void useDocumentStore.getState().redo(at.id);
+          break;
         case "zoomIn": if (at) setZoom(at.id, at.zoom * 1.1); break;
         case "zoomOut": if (at) setZoom(at.id, at.zoom / 1.1); break;
         case "zoomReset": if (at) setZoom(at.id, 1); break;
-        case "nextPage": if (at) setCurrentPage(at.id, at.currentPage + 1); break;
-        case "prevPage": if (at) setCurrentPage(at.id, at.currentPage - 1); break;
+        case "nextPage":
+          if (at && !isEditableShortcutTarget(null)) stepPage(1);
+          break;
+        case "prevPage":
+          if (at && !isEditableShortcutTarget(null)) stepPage(-1);
+          break;
         case "palette": openPalette(); break;
         case "keyboardShortcuts": openShortcutHelp(); break;
         case "showWelcome": openWelcome(); break;
@@ -1482,11 +1901,12 @@ export function App() {
             window.weavepdf.window.close();
             break;
           }
-          state.closeTab(cur.id);
-          // After close, if no tabs remain, drop the window.
-          if (useDocumentStore.getState().tabs.length === 0) {
-            window.weavepdf.window.close();
-          }
+          void requestCloseTab(cur.id).then((closed) => {
+            // After close, if no tabs remain, drop the window.
+            if (closed && useDocumentStore.getState().tabs.length === 0) {
+              window.weavepdf.window.close();
+            }
+          });
           break;
         }
       }
@@ -1498,7 +1918,7 @@ export function App() {
   }, [
     openFile, saveCurrent, exportCombined, printCurrent, openSearch, toggleSidebar,
     setTool, openSignature, openCompress, rotateCommand, deleteSelected,
-    selectAllPages, undo, setZoom, setCurrentPage, openPalette, openShortcutHelp,
+    selectAllPages, undo, setZoom, setCurrentPage, stepPage, openPalette, openShortcutHelp,
     openWelcome, addBlankTab,
   ]);
 
@@ -1667,6 +2087,17 @@ export function App() {
               sizeBytes: pdfBytes.byteLength,
               bytes: pdfBytes,
             });
+          } else {
+            // V1.0123: an unsupported drop used to fall off the end of this
+            // chain in total silence — the user drags a .txt or .zip onto the
+            // window and nothing happens at all, with no way to tell whether
+            // the app is broken, still loading, or simply doesn't take it.
+            useUIStore
+              .getState()
+              .showToast(
+                `WeavePDF can't open ${ext ? "." + ext : "that"} files — drop a PDF, image, or Word document.`,
+                "warn",
+              );
           }
         } catch (err) {
           console.error("open file", err);
@@ -1736,7 +2167,7 @@ export function App() {
       { id: "metadata", label: "Document properties…", group: "Document", shortcut: "⌘I", disabled: !hasTab, keywords: ["info", "title", "author"], run: openMetadata },
       // View
       { id: "search", label: "Find in document…", group: "View", shortcut: "⌘F", disabled: !hasTab, run: openSearch },
-      { id: "toggle-sidebar", label: "Toggle sidebar", group: "View", shortcut: "⌘B", run: toggleSidebar },
+      { id: "toggle-sidebar", label: "Toggle sidebar", group: "View", shortcut: "⇧⌘B", run: toggleSidebar },
       { id: "view-single", label: "View · single page", group: "View", shortcut: "⌘⌥1", disabled: !hasTab, keywords: ["layout", "single"], run: () => setViewMode("single") },
       { id: "view-spread", label: "View · two-page spread", group: "View", shortcut: "⌘⌥2", disabled: !hasTab, keywords: ["spread", "facing", "book", "magazine"], run: () => setViewMode("spread") },
       { id: "view-cover", label: "View · cover + spread (book mode)", group: "View", shortcut: "⌘⌥3", disabled: !hasTab, keywords: ["book", "cover", "facing"], run: () => setViewMode("cover-spread") },

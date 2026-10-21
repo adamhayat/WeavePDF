@@ -18,6 +18,14 @@ import {
   PDFNumber,
   PDFString,
   PDFRef,
+  PDFStream,
+  PDFBool,
+  pushGraphicsState,
+  popGraphicsState,
+  setLineJoin,
+  setLineCap,
+  LineJoinStyle,
+  LineCapStyle,
 } from "pdf-lib";
 import type { PDFPage } from "pdf-lib";
 
@@ -94,9 +102,61 @@ function toUint8(bytes: Uint8Array): Uint8Array {
   return bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
 }
 
+/** V1.0126: one-pass baking. Every bake primitive is `load(bytes) → draw →
+ *  doc.save()`, so baking N elements parsed and re-serialised the whole PDF N
+ *  times — 52 elements on Adam's 440 KB form took ~8 s per ⌘S, long enough
+ *  that closing the window right after ⌘S hit "unsaved changes" because the
+ *  save hadn't finished. Inside `bakeInOnePass`, `load(token)` hands every
+ *  primitive the SAME live document and its `save()` just returns the token,
+ *  so the file is parsed once and written once. Only the primitives' own
+ *  load/save pattern is relied on — their drawing code is unchanged. */
+let batch: { token: Uint8Array; doc: PDFDocument } | null = null;
+
+let batchQueue: Promise<unknown> = Promise.resolve();
+
+export function bakeInOnePass(
+  base: Uint8Array,
+  draw: (token: Uint8Array) => Promise<void>,
+): Promise<Uint8Array> {
+  // One batch at a time: a Print Preview render and a ⌘S (or the close
+  // prompt's Save) can overlap, and the batch slot is module-global.
+  const run = batchQueue.then(() => bakeInOnePassNow(base, draw));
+  batchQueue = run.catch(() => undefined);
+  return run;
+}
+
+async function bakeInOnePassNow(
+  base: Uint8Array,
+  draw: (token: Uint8Array) => Promise<void>,
+): Promise<Uint8Array> {
+  const doc = await load(base);
+  const token = new Uint8Array(0);
+  const realSave = doc.save.bind(doc);
+  (doc as unknown as { save: () => Promise<Uint8Array> }).save = async () => token;
+  batch = { token, doc };
+  try {
+    await draw(token);
+  } finally {
+    batch = null;
+    (doc as unknown as { save: typeof realSave }).save = realSave;
+  }
+  return toUint8(await realSave());
+}
+
 /** Load without throwing on PDFs with invalid xrefs (common in the wild). */
 async function load(bytes: Uint8Array): Promise<PDFDocument> {
+  if (batch && bytes === batch.token) return batch.doc;
   return PDFDocument.load(bytes, { updateMetadata: false, ignoreEncryption: true });
+}
+
+/** V1.0118: true if the PDF is encrypted (e.g. an owner-locked insurance form).
+ *  pdf-lib can LOAD encrypted PDFs with ignoreEncryption but can't *edit+save*
+ *  them — it never decrypts the content streams, so a baked save comes out
+ *  unreadable (pdf.js then rejects it with "No password given"). The save path
+ *  uses this to decrypt via qpdf before baking. Never throws (ignoreEncryption). */
+export async function isPdfEncrypted(bytes: Uint8Array): Promise<boolean> {
+  const doc = await load(bytes);
+  return doc.isEncrypted;
 }
 
 /** Merge N source PDFs, in order, into a single output. */
@@ -160,20 +220,130 @@ export async function createBlankPdf(opts?: {
   return toUint8(await doc.save());
 }
 
-/** Remove the given 1-based page numbers. Silently ignores out-of-range. */
+/** V1.0121: drop pages by MUTATING the loaded document instead of copying the
+ *  survivors into a brand-new one.
+ *
+ *  `PDFDocument.create()` + `copyPages` builds an empty catalog and carries
+ *  over ONLY page content — so the old implementation silently discarded the
+ *  AcroForm (every filled-in form field), the outline/bookmarks, page labels
+ *  and the Info dict. Deleting one page of a filled insurance form threw away
+ *  the answers on every OTHER page, with no warning; `getFormFields` then
+ *  returned `[]` so the fields also stopped being editable.
+ *
+ *  Removing pages in place keeps the catalog intact, so everything that isn't
+ *  page content survives. Verified in tests/unit/page-ops-preservation.test.ts.
+ *  Same reasoning applies to `extractPages` and `reorderPages` below. */
 export async function deletePages(
   base: Uint8Array,
   pages1Based: number[],
 ): Promise<Uint8Array> {
-  const src = await load(base);
-  const keepIndexes = src
-    .getPageIndices()
-    .filter((i) => !pages1Based.includes(i + 1));
-  if (keepIndexes.length === 0) throw new Error("Cannot delete all pages");
-  const out = await PDFDocument.create();
-  const copied = await out.copyPages(src, keepIndexes);
-  for (const p of copied) out.addPage(p);
-  return toUint8(await out.save());
+  const doc = await load(base);
+  const count = doc.getPageCount();
+  const drop = [...new Set(pages1Based)]
+    .map((p) => p - 1)
+    .filter((i) => i >= 0 && i < count)
+    .sort((a, b) => b - a); // descending: earlier indices stay valid as we splice
+  if (drop.length >= count) throw new Error("Cannot delete all pages");
+  if (drop.length === 0) return toUint8(base);
+  // Capture the survivors' refs BEFORE removing: pdf-lib does NOT invalidate
+  // its page cache in `removePage`, so afterwards `getPageCount()` is correct
+  // while `getPages()` still hands back every original page. Reading the live
+  // set after the fact silently yields "nothing was removed".
+  const keepRefs = new Set(
+    doc
+      .getPages()
+      .filter((_p, i) => !drop.includes(i))
+      .map((p) => p.ref.toString()),
+  );
+  for (const i of drop) doc.removePage(i);
+  pruneOrphanFormFields(doc, keepRefs);
+  purgeUnreachableObjects(doc);
+  return toUint8(await doc.save());
+}
+
+/** pdf-lib's `removePage` only detaches the leaf from the page tree — the
+ *  page dict, its content streams and its images stay in the object table,
+ *  and `save()` serializes EVERY indirect object with no garbage collection.
+ *  Without this sweep, "Delete page" ships the deleted page's full content
+ *  in the saved file (recoverable by re-attaching the orphan — one
+ *  `pushLeafNode` call), and "Extract pages" embeds the content of every
+ *  NON-extracted page in the output it exists to share. Mark-and-sweep from
+ *  the trailer roots: anything unreachable can't be rendered by a conforming
+ *  reader, so dropping it changes no visible behaviour. */
+function purgeUnreachableObjects(doc: PDFDocument): void {
+  const ctx = doc.context;
+  const reachable = new Set<string>();
+  const queue: unknown[] = [
+    ctx.trailerInfo.Root,
+    ctx.trailerInfo.Info,
+    ctx.trailerInfo.Encrypt,
+    ctx.trailerInfo.ID,
+  ];
+  while (queue.length > 0) {
+    const v = queue.pop();
+    if (v instanceof PDFRef) {
+      const key = v.toString();
+      if (reachable.has(key)) continue;
+      reachable.add(key);
+      queue.push(ctx.lookup(v));
+    } else if (v instanceof PDFStream) {
+      // Check streams before dicts: a stream carries its dict alongside the data.
+      queue.push(v.dict);
+    } else if (v instanceof PDFDict) {
+      for (const [, value] of v.entries()) queue.push(value);
+    } else if (v instanceof PDFArray) {
+      for (let i = 0; i < v.size(); i++) queue.push(v.get(i));
+    }
+  }
+  const dead = ctx
+    .enumerateIndirectObjects()
+    .map(([ref]) => ref)
+    .filter((ref) => !reachable.has(ref.toString()));
+  for (const ref of dead) ctx.delete(ref);
+}
+
+/** Drop AcroForm fields whose widget annotations no longer live on any page.
+ *  `removePage` detaches the page but leaves the field in the catalog's
+ *  /Fields array, which would leave a filled value with nowhere to render.
+ *  `livePageRefs` must be collected BEFORE the removal (see above).
+ *  Best-effort: any failure leaves the form exactly as pdf-lib produced it,
+ *  which is still strictly better than the old wholesale loss. */
+function pruneOrphanFormFields(doc: PDFDocument, livePageRefs: Set<string>): void {
+  let form;
+  try {
+    form = doc.getForm();
+  } catch {
+    return; // no AcroForm — nothing to prune
+  }
+  for (const field of form.getFields()) {
+    try {
+      const widgets = field.acroField.getWidgets();
+      if (widgets.length === 0) continue;
+      const placement = widgets.map((w) => w.dict.get(PDFName.of("P")));
+      // /P is optional (ISO 32000 — the annot may only appear in a page's
+      // /Annots array), so a widget without it might sit on ANY page,
+      // including a surviving one. Treat every /P-less widget as potentially
+      // live: only when EVERY widget declares a page and NONE of those pages
+      // survive is the field provably orphaned. An extra invisible field is
+      // recoverable; deleting a field the user still needs is not.
+      if (placement.some((p) => p === undefined)) continue;
+      if (!placement.some((p) => p !== undefined && livePageRefs.has(p.toString()))) {
+        try {
+          form.removeField(field);
+        } catch {
+          // removeField also detaches widgets from their pages, and throws
+          // when the widget's page is already gone (the extract path removes
+          // every page before re-inserting the survivors). Unlink the field
+          // from the catalog's /Fields instead — that alone makes the field
+          // AND its /P-referenced orphan pages unreachable, and the
+          // purgeUnreachableObjects sweep collects the rest.
+          form.acroForm.removeField(field.acroField);
+        }
+      }
+    } catch {
+      // Unusual field shape (radio group, signature) — leave it in place.
+    }
+  }
 }
 
 /**
@@ -250,15 +420,22 @@ export async function reorderPages(
   base: Uint8Array,
   newOrder0Based: number[],
 ): Promise<Uint8Array> {
-  const src = await load(base);
-  const n = src.getPageCount();
+  const doc = await load(base);
+  const n = doc.getPageCount();
   if (newOrder0Based.length !== n) {
     throw new Error(`reorderPages: expected ${n} indices, got ${newOrder0Based.length}`);
   }
-  const out = await PDFDocument.create();
-  const copied = await out.copyPages(src, newOrder0Based);
-  for (const p of copied) out.addPage(p);
-  return toUint8(await out.save());
+  // V1.0121: reorder in place (see deletePages) so the AcroForm, outline,
+  // page labels and Info dict survive a drag-reorder in the thumbnail rail.
+  const pages = doc.getPages();
+  const desired = newOrder0Based.map((i) => {
+    const p = pages[i];
+    if (!p) throw new Error(`reorderPages: index ${i} out of range`);
+    return p;
+  });
+  for (let i = n - 1; i >= 0; i--) doc.removePage(i);
+  desired.forEach((p, i) => doc.insertPage(i, p));
+  return toUint8(await doc.save());
 }
 
 /**
@@ -358,7 +535,10 @@ export function matchStandardFont(
   italic: boolean,
 ): StandardFonts {
   const f = (family ?? "").toLowerCase();
-  if (f.includes("times") || f.includes("serif")) {
+  // V1.0126: "sans-serif" CONTAINS "serif" — pdf.js labels most spans with a
+  // generic family, so every Edit Text on a sans-serif font saved as Times.
+  const isSerif = (f.includes("times") || f.includes("serif")) && !f.includes("sans");
+  if (isSerif) {
     if (bold && italic) return StandardFonts.TimesRomanBoldItalic;
     if (bold) return StandardFonts.TimesRomanBold;
     if (italic) return StandardFonts.TimesRomanItalic;
@@ -382,6 +562,67 @@ export function matchStandardFont(
  *  can store it in the round-trip metadata — the next open uses it as the
  *  whiteout that covers the previously-baked content. */
 export type BakedBBox = { x: number; y: number; width: number; height: number };
+
+/** V1.0123: pdf-lib's StandardFonts are WinAnsi-encoded, and pdf-lib THROWS
+ *  on the first character WinAnsi can't represent. That throw propagated all
+ *  the way out of the save — so a single "→" pasted from an email made the
+ *  WHOLE document unsaveable ("Couldn't save: WinAnsi cannot encode …"),
+ *  while the on-screen overlay kept showing the text as if it were fine.
+ *
+ *  WinAnsi = ASCII + Latin-1 + a specific band of typographic characters in
+ *  0x80–0x9F (curly quotes, dashes, ellipsis, bullet, €, ™ …). Everything
+ *  else is unrepresentable in a standard font; embedding a Unicode font is
+ *  the real answer (tracked), but a save must never fail because of it. */
+const WINANSI_HIGH_BAND = new Set(
+  "€‚ƒ„…†‡ˆ‰Š‹ŒŽ‘’“”•–—˜™š›œžŸ".split(""),
+);
+
+/** Best-effort ASCII stand-ins so the common cases (arrows, math signs
+ *  pasted from the web) still read correctly instead of becoming "?". */
+const WINANSI_SUBSTITUTIONS: Record<string, string> = {
+  "→": "->", "←": "<-", "↔": "<->", "⇒": "=>", "⇐": "<=", "⇔": "<=>",
+  "≤": "<=", "≥": ">=", "≠": "!=", "≈": "~", "±": "+/-",
+  "∞": "inf", "√": "sqrt", "∑": "sum", "≡": "==",
+  "　": " ", " ": " ",
+};
+
+function isWinAnsiSafe(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  // V1.0126: only \n — pdf-lib's standard fonts THROW on \t and \r, so one
+  // pasted spreadsheet cell (tab) or Windows line ending (\r\n) made the whole
+  // document unsaveable. Those two are normalised before this check.
+  if (ch === "\n") return true;
+  if (cp >= 0x20 && cp <= 0x7e) return true; // ASCII printable
+  if (cp >= 0xa0 && cp <= 0xff) return true; // Latin-1 supplement
+  return WINANSI_HIGH_BAND.has(ch);
+}
+
+/** Replace everything a StandardFont can't encode. Returns the safe text plus
+ *  the distinct characters that had to be changed, so the caller can tell the
+ *  user what happened rather than silently altering their document. */
+export function sanitizeStandardFontText(
+  text: string,
+): { text: string; unsupported: string[] } {
+  const unsupported: string[] = [];
+  let out = "";
+  // V1.0126: layout characters, not content — normalise silently.
+  const normalised = text.replace(/\r\n?/g, "\n").replace(/\t/g, "    ");
+  for (const ch of normalised) {
+    if (isWinAnsiSafe(ch)) {
+      out += ch;
+      continue;
+    }
+    if (!unsupported.includes(ch)) unsupported.push(ch);
+    out += WINANSI_SUBSTITUTIONS[ch] ?? "?";
+  }
+  return { text: out, unsupported };
+}
+
+/** Distinct characters in `text` that a StandardFont cannot render. Lets the
+ *  renderer warn at commit time instead of at save time. */
+export function findUnsupportedStandardFontChars(text: string): string[] {
+  return sanitizeStandardFontText(text).unsupported;
+}
 
 export async function drawText(
   base: Uint8Array,
@@ -416,7 +657,11 @@ export async function drawText(
   const c = opts.color ?? { r: 0, g: 0, b: 0 };
   const t = pageBakeTransform(page);
   const p = t.point(opts.x, opts.y);
-  page.drawText(opts.text, {
+  // V1.0123: never let one unencodable character abort the whole save.
+  // V1.0126: single-line drawer — a line break (e.g. a pasted "\r") throws
+  // in pdf-lib's width measurement, so it becomes a space.
+  const safeText = sanitizeStandardFontText(opts.text).text.replace(/\n/g, " ");
+  page.drawText(safeText, {
     x: p.x,
     y: p.y,
     size: opts.size,
@@ -425,9 +670,9 @@ export async function drawText(
     // Keep glyphs upright on /Rotate 90/180/270 pages (no-op when rotation 0).
     rotate: degrees(t.rotation),
   });
-  const width = opts.text.length === 0
+  const width = safeText.length === 0
     ? 0
-    : font.widthOfTextAtSize(opts.text, opts.size);
+    : font.widthOfTextAtSize(safeText, opts.size);
   // V1.0104: bbox stays MediaBox-relative (no `+ origin`). It's stored in
   // WeavePDFEdits metadata as the next-open's whiteout; the whiteout baker
   // applies its own origin shift at draw time, so the saved value must
@@ -494,7 +739,9 @@ export async function drawWrappedText(
   // a forced newline or end of text) — justify skips those because the
   // last line of a paragraph stays left-aligned in every word processor.
   const lines: { text: string; isLastInPara: boolean }[] = [];
-  const paragraphs = opts.text.split("\n");
+  // V1.0123: sanitize BEFORE any width measurement — `widthOfTextAtSize`
+  // throws on unencodable characters just like `drawText` does.
+  const paragraphs = sanitizeStandardFontText(opts.text).text.split("\n");
   for (let p = 0; p < paragraphs.length; p++) {
     const rawLine = paragraphs[p];
     if (rawLine.length === 0) {
@@ -614,7 +861,17 @@ export const WEAVE_INFO_KEY = "WeavePDFEdits";
  *  shapes) so a file saved from WeavePDF reopens with its own elements
  *  selectable/editable again. */
 export type WeavePdfMetadata = {
-  version: 1 | 2;
+  /** 3 (V1.0126+): every content stream WeavePDF appended at save is tagged
+   *  `/WeavePDFBake` and stripped on reopen, so the elements come back as
+   *  editable overlays on the CLEAN page; `whiteout` on a text edit is only
+   *  the cover for ORIGINAL page content (Edit Text), never a cover for an
+   *  earlier bake. 1/2: bakes were stacked into the page, untagged, and a
+   *  text edit's `whiteout` covers its own previous bake. */
+  version: 1 | 2 | 3;
+  /** V1.0126 (v3): each page's /Rotate and CropBox [x, y, w, h] at save
+   *  time. A mismatch on reopen means another tool rotated / cropped /
+   *  re-paged the file, so the element layer is not peeled off. */
+  pages?: Array<{ rotate: number; box: number[] }>;
   textEdits: WeavePdfTextEdit[];
   imageEdits: WeavePdfImageEdit[];
   shapeEdits: WeavePdfShapeEdit[];
@@ -631,11 +888,19 @@ export type WeavePdfTextEdit = {
   italic?: boolean;
   align?: "left" | "center" | "right" | "justify";
   fontName?: string;
+  /** V1.0134: text colour, 0..1 RGB. Absent = black. */
+  color?: { r: number; g: number; b: number };
   /** Region the previous bake actually covered, in PDF coords. The next
    *  open uses this as the overlay's `whiteout` field so the baked text
    *  visible underneath gets covered while the editable overlay floats
    *  on top. */
-  whiteout: { x: number; y: number; width: number; height: number };
+  whiteout?: { x: number; y: number; width: number; height: number };
+  /** V1.0126: name of the form field this text replaces (cleared at save). */
+  formField?: string;
+  /** V1.0125: stacking order across ALL elements on the page (text, image,
+   *  shape). Absent in files saved before V1.0125 — those restore in their
+   *  old bake order (shapes → images → text). See lib/layers.ts. */
+  z?: number;
 };
 
 export type WeavePdfImageEdit = {
@@ -646,6 +911,8 @@ export type WeavePdfImageEdit = {
   heightPt: number;
   mime: "image/png" | "image/jpeg";
   dataBase64: string;
+  /** V1.0125: stacking order — see WeavePdfTextEdit.z. */
+  z?: number;
   /** V1.0091: full image format options now round-trip on save+reopen.
    *  Pre-V1.0091 these were stored on `PendingImageEdit` but stripped at
    *  serialization time, so a user who rotated/flipped/dimmed an image
@@ -670,7 +937,7 @@ export type WeavePdfImageEdit = {
   };
 };
 
-export type WeavePdfShapeEdit = { page: number } & (
+export type WeavePdfShapeEdit = { page: number; /** V1.0125: stacking order — see WeavePdfTextEdit.z. */ z?: number } & (
   | { kind: "rect"; xPt: number; yPt: number; widthPt: number; heightPt: number; color: { r: number; g: number; b: number }; thickness: number }
   | { kind: "ellipse"; xPt: number; yPt: number; widthPt: number; heightPt: number; color: { r: number; g: number; b: number }; thickness: number }
   | { kind: "line"; fromX: number; fromY: number; toX: number; toY: number; color: { r: number; g: number; b: number }; thickness: number }
@@ -759,6 +1026,218 @@ export async function detectWeaveCanaryWithoutMetadata(
   }
 }
 
+/** V1.0126: content-stream dict key marking a stream WeavePDF appended when
+ *  it baked its editable elements into a saved file. Non-standard keys in a
+ *  stream dict are legal and ignored by every other reader. */
+export const WEAVE_BAKE_KEY = "WeavePDFBake";
+/** V1.0126: page-dict key listing the resource names (fonts, images,
+ *  graphics states) a WeavePDF save added to that page, so a reopen can drop
+ *  them along with the streams. Without it, each save left another set of
+ *  embedded fonts/images behind (~22 KB per save on Adam's form). */
+export const WEAVE_BAKE_RES_KEY = "WeavePDFBakeRes";
+const RES_CATEGORIES = ["Font", "XObject", "ExtGState", "Pattern", "Shading", "ColorSpace"];
+
+function resourceNames(doc: PDFDocument, page: PDFPage): Map<string, Set<string>> {
+  const out = new Map<string, Set<string>>();
+  const res = page.node.Resources();
+  for (const cat of RES_CATEGORIES) {
+    const names = new Set<string>();
+    const sub = res?.lookup(PDFName.of(cat));
+    if (sub instanceof PDFDict) for (const k of sub.keys()) names.add(k.asString());
+    out.set(cat, names);
+  }
+  void doc;
+  return out;
+}
+
+/** Per page, the indirect refs of its /Contents streams — or null for a page
+ *  whose /Contents holds a direct (non-ref) stream, which we can't track. */
+function pageContentRefs(doc: PDFDocument): Array<Set<string> | null> {
+  return doc.getPages().map((page) => {
+    const raw = page.node.get(PDFName.of("Contents"));
+    if (raw === undefined) return new Set<string>();
+    if (raw instanceof PDFRef) return new Set([raw.toString()]);
+    if (raw instanceof PDFArray) {
+      const out = new Set<string>();
+      for (let i = 0; i < raw.size(); i++) {
+        const item = raw.get(i);
+        if (!(item instanceof PDFRef)) return null;
+        out.add(item.toString());
+      }
+      return out;
+    }
+    return null;
+  });
+}
+
+/**
+ * V1.0126: tag every content stream present in `baked` but not in `base` with
+ * `/WeavePDFBake`, so a later open can peel the elements back off the page.
+ * Returns null when any page can't be tracked (direct /Contents stream, page
+ * count changed): the caller then writes NO editable-element metadata, so the
+ * file simply reopens flat — never with each element doubled.
+ */
+export async function tagWeaveBakes(base: Uint8Array, baked: Uint8Array): Promise<Uint8Array | null> {
+  const baseDoc = await load(base);
+  const bakedDoc = await load(baked);
+  const before = pageContentRefs(baseDoc);
+  const basePages = baseDoc.getPages();
+  const pages = bakedDoc.getPages();
+  if (pages.length !== before.length) return null;
+  for (let i = 0; i < pages.length; i++) {
+    const known = before[i];
+    if (!known) return null;
+    const raw = pages[i].node.get(PDFName.of("Contents"));
+    const refs: PDFRef[] = [];
+    if (raw instanceof PDFRef) refs.push(raw);
+    else if (raw instanceof PDFArray) {
+      for (let k = 0; k < raw.size(); k++) {
+        const item = raw.get(k);
+        if (!(item instanceof PDFRef)) return null;
+        refs.push(item);
+      }
+    } else if (raw !== undefined) return null;
+    // Every base stream must still be there — a bake only ever ADDS streams.
+    // If one vanished (a redact rasterised the page), the page can't be
+    // peeled back, so don't pretend it can.
+    const present = new Set(refs.map((r) => r.toString()));
+    for (const k of known) if (!present.has(k)) return null;
+    for (const ref of refs) {
+      const stream = bakedDoc.context.lookup(ref);
+      if (!(stream instanceof PDFStream)) return null;
+      if (known.has(ref.toString())) {
+        // Page content of the clean page. A stale tag here can only have come
+        // in from outside (pages merged from another WeavePDF save); it is
+        // permanent page content now, so it must never be peeled off.
+        stream.dict.delete(PDFName.of(WEAVE_BAKE_KEY));
+        continue;
+      }
+      stream.dict.set(PDFName.of(WEAVE_BAKE_KEY), PDFBool.True);
+    }
+    // Record the resource names this save added to the page (see
+    // WEAVE_BAKE_RES_KEY). Names pdf-lib adds carry a random suffix, so they
+    // can't collide with the page's own resources.
+    const had = resourceNames(baseDoc, basePages[i]);
+    const now = resourceNames(bakedDoc, pages[i]);
+    const added = bakedDoc.context.obj({}) as PDFDict;
+    let any = false;
+    for (const cat of RES_CATEGORIES) {
+      const arr = PDFArray.withContext(bakedDoc.context);
+      for (const name of now.get(cat) ?? []) {
+        if (!had.get(cat)?.has(name)) arr.push(PDFName.of(name.replace(/^\//, "")));
+      }
+      if (arr.size() > 0) {
+        added.set(PDFName.of(cat), arr);
+        any = true;
+      }
+    }
+    if (any) pages[i].node.set(PDFName.of(WEAVE_BAKE_RES_KEY), added);
+    else pages[i].node.delete(PDFName.of(WEAVE_BAKE_RES_KEY));
+  }
+  return toUint8(await bakedDoc.save());
+}
+
+/**
+ * V1.0126: the inverse of a WeavePDF save. Removes every `/WeavePDFBake`
+ * content stream (the baked editable elements) and the `/WeavePDFEdits` Info
+ * entry, then sweeps the now-unreferenced objects. What's left is the page as
+ * it was before the elements were drawn; the caller restores the elements as
+ * overlays from the metadata it read first. `changed` is false when there was
+ * nothing to remove (a plain PDF).
+ */
+export async function stripWeaveBakes(bytes: Uint8Array): Promise<{ bytes: Uint8Array; changed: boolean; strippedStreams: number }> {
+  const doc = await load(bytes);
+  const ctx = doc.context;
+  let strippedStreams = 0;
+  let removedResources = false;
+  for (const page of doc.getPages()) {
+    const raw = page.node.get(PDFName.of("Contents"));
+    if (raw instanceof PDFArray) {
+      const kept = PDFArray.withContext(ctx);
+      let removed = 0;
+      for (let i = 0; i < raw.size(); i++) {
+        const item = raw.get(i);
+        const stream = item instanceof PDFRef ? ctx.lookup(item) : item;
+        if (stream instanceof PDFStream && stream.dict.get(PDFName.of(WEAVE_BAKE_KEY)) !== undefined) {
+          removed++;
+          continue;
+        }
+        kept.push(item);
+      }
+      if (removed > 0) {
+        page.node.set(PDFName.of("Contents"), kept);
+        strippedStreams += removed;
+      }
+    }
+    // Drop the resources that save added (fonts / images / states), so they
+    // become unreachable and the sweep below removes them.
+    const added = page.node.lookup(PDFName.of(WEAVE_BAKE_RES_KEY));
+    if (added instanceof PDFDict) {
+      const res = page.node.Resources();
+      for (const cat of RES_CATEGORIES) {
+        const names = added.lookup(PDFName.of(cat));
+        const sub = res?.lookup(PDFName.of(cat));
+        if (!(names instanceof PDFArray) || !(sub instanceof PDFDict)) continue;
+        for (let k = 0; k < names.size(); k++) {
+          const n = names.get(k);
+          if (n instanceof PDFName) sub.delete(n);
+        }
+      }
+      page.node.delete(PDFName.of(WEAVE_BAKE_RES_KEY));
+      removedResources = true;
+    }
+  }
+  let changed = strippedStreams > 0 || removedResources;
+  const trailer = ctx.trailerInfo as { Info?: PDFRef };
+  if (trailer.Info) {
+    const info = ctx.lookup(trailer.Info);
+    if (info instanceof PDFDict && info.get(PDFName.of(WEAVE_INFO_KEY)) !== undefined) {
+      info.delete(PDFName.of(WEAVE_INFO_KEY));
+      changed = true;
+    }
+    // V1.0126: drop the "saved by WeavePDF" canary along with the metadata
+    // it vouches for. Left behind, every file later written WITHOUT element
+    // metadata (an extract, a print range, a save with nothing left on it)
+    // reopened with a false "editable layer was stripped by another app".
+    if (info instanceof PDFDict) {
+      const kw = info.get(PDFName.of("Keywords"));
+      if (kw instanceof PDFString && kw.decodeText().includes(WEAVE_CANARY_PREFIX)) {
+        const rest = kw
+          .decodeText()
+          .split(/;\s*/)
+          .filter((part) => !part.startsWith(WEAVE_CANARY_PREFIX))
+          .join("; ");
+        if (rest) info.set(PDFName.of("Keywords"), PDFString.of(rest));
+        else info.delete(PDFName.of("Keywords"));
+        changed = true;
+      }
+    }
+  }
+  if (!changed) return { bytes, changed: false, strippedStreams: 0 };
+  purgeUnreachableObjects(doc);
+  return { bytes: toUint8(await doc.save()), changed: true, strippedStreams };
+}
+
+/** V1.0126: does the file still have the pages the element layer was saved
+ *  against? False when another tool rotated, cropped, added or removed
+ *  pages — the elements' coordinates no longer apply. Files without the
+ *  record (v1/v2) are trusted, as before. */
+export async function weavePagesMatch(bytes: Uint8Array, meta: WeavePdfMetadata): Promise<boolean> {
+  if (!meta.pages) return true;
+  const doc = await load(bytes);
+  const pages = doc.getPages();
+  if (pages.length !== meta.pages.length) return false;
+  return pages.every((p, i) => {
+    const want = meta.pages![i];
+    const b = p.getCropBox();
+    const have = [b.x, b.y, b.width, b.height];
+    return (
+      p.getRotation().angle % 360 === want.rotate % 360 &&
+      have.every((v, k) => Math.abs(v - (want.box[k] ?? NaN)) < 0.5)
+    );
+  });
+}
+
 /** Inverse of `embedWeaveMetadata`. Returns `null` if no metadata was
  *  stored (a plain PDF, or one saved by a different tool). Tolerant of
  *  malformed JSON — returns `null` rather than throwing. */
@@ -788,10 +1267,13 @@ export async function extractWeaveMetadata(
       imageEdits?: unknown;
       shapeEdits?: unknown;
     };
-    if (obj.version !== 1 && obj.version !== 2) return null;
+    if (obj.version !== 1 && obj.version !== 2 && obj.version !== 3) return null;
     if (!Array.isArray(obj.textEdits)) return null;
     return {
       version: obj.version,
+      pages: Array.isArray((obj as { pages?: unknown }).pages)
+        ? ((obj as { pages: Array<{ rotate: number; box: number[] }> }).pages)
+        : undefined,
       textEdits: obj.textEdits as WeavePdfTextEdit[],
       imageEdits: Array.isArray(obj.imageEdits) ? obj.imageEdits as WeavePdfImageEdit[] : [],
       shapeEdits: Array.isArray(obj.shapeEdits) ? obj.shapeEdits as WeavePdfShapeEdit[] : [],
@@ -1286,8 +1768,9 @@ export async function drawStickyNote(
       y: page.getHeight(),
     },
   );
-  // Text to the right of the marker.
-  const wrapped = wrapText(text, font, 10, 220);
+  // Text to the right of the marker. Sanitized before wrapping — `wrapText`
+  // measures with the font, which throws on unencodable characters (V1.0123).
+  const wrapped = wrapText(sanitizeStandardFontText(text).text, font, 10, 220);
   let y = pos.y + boxSize - 10;
   for (const line of wrapped) {
     page.drawText(line, {
@@ -1329,15 +1812,47 @@ export async function extractPages(
   base: Uint8Array,
   pages1Based: number[],
 ): Promise<Uint8Array> {
-  const src = await load(base);
-  const indexes = pages1Based
-    .map((p) => p - 1)
-    .filter((i) => i >= 0 && i < src.getPageCount());
-  if (indexes.length === 0) throw new Error("extractPages: no valid pages");
-  const out = await PDFDocument.create();
-  const copied = await out.copyPages(src, indexes);
-  for (const p of copied) out.addPage(p);
-  return toUint8(await out.save());
+  const doc = await load(base);
+  const count = doc.getPageCount();
+  // Keep the caller's order, and allow a page to be requested twice.
+  const wanted = pages1Based.map((p) => p - 1).filter((i) => i >= 0 && i < count);
+  if (wanted.length === 0) throw new Error("extractPages: no valid pages");
+  // V1.0121: express extraction as "remove the pages we don't want" so the
+  // catalog survives (see deletePages). Printing a page range goes through
+  // here, so the old copy-into-a-new-doc form silently dropped the AcroForm
+  // from every range print as well.
+  const pages = doc.getPages();
+  const desired = wanted.map((i) => pages[i]);
+  const keepRefs = new Set(desired.map((p) => p.ref.toString()));
+  for (let i = count - 1; i >= 0; i--) doc.removePage(i);
+  desired.forEach((p, i) => doc.insertPage(i, p));
+  pruneOrphanFormFields(doc, keepRefs);
+  // Without the sweep, the output silently carries the CONTENT of every
+  // page that was NOT extracted (extracting 1 page of a 500-page doc
+  // produced a file at 99.7% of the source size) — the opposite of what
+  // a share-one-page feature promises.
+  purgeUnreachableObjects(doc);
+  return toUint8(await doc.save());
+}
+
+/** Bake the current AcroForm field appearances into page content and drop
+ *  the form. PRINT-ONLY helper: fitToPaper / nUpPages / scaleToFitForPrint /
+ *  scalePageContent all rebuild the document via embedPdf, which carries page
+ *  content ONLY — a filled form fed to them prints with every answer missing.
+ *  Flattening first turns the values into page content those rebuilds
+ *  preserve. No-op for documents without fields; throws on exotic fields so
+ *  the caller can fall back to not rebuilding at all. */
+export async function flattenFormsForPrint(base: Uint8Array): Promise<Uint8Array> {
+  const doc = await load(base);
+  let form;
+  try {
+    form = doc.getForm();
+  } catch {
+    return toUint8(base); // no AcroForm
+  }
+  if (form.getFields().length === 0) return toUint8(base);
+  form.flatten();
+  return toUint8(await doc.save());
 }
 
 /** Set document metadata (title, author, subject, keywords). */
@@ -1408,13 +1923,20 @@ export async function drawPath(
       .slice(1)
       .map((p) => `L ${p.x} ${pageHeight - p.y}`)
       .join(" ");
+  // V1.0126: round joins + caps, like the on-screen stroke. pdf-lib's default
+  // (miter / butt) gave the saved ✓ a pointed spike at its corner and
+  // shorter ends. Wrapped in q/Q so the setting can't leak into later draws
+  // (one-pass baking shares one content stream).
+  page.pushOperators(pushGraphicsState(), setLineJoin(LineJoinStyle.Round), setLineCap(LineCapStyle.Round));
   page.drawSvgPath(d, {
     borderColor: rgb(c.r, c.g, c.b),
     borderWidth: opts.thickness ?? 1.5,
     borderOpacity: opts.opacity ?? 1,
+    borderLineCap: LineCapStyle.Round,
     x: 0,
     y: pageHeight,
   });
+  page.pushOperators(popGraphicsState());
   return toUint8(await doc.save());
 }
 
@@ -1487,7 +2009,7 @@ export async function pdfToMarkdown(bytes: Uint8Array): Promise<string> {
     }
     return chunks.join("\n").trim() + "\n";
   } finally {
-    void pdf.destroy();
+    try { await pdf.destroy(); } catch { /* ignore */ }
   }
 }
 
@@ -1545,7 +2067,7 @@ export async function replaceAllText(
       }
     }
   } finally {
-    void pdf.destroy();
+    try { await pdf.destroy(); } catch { /* ignore */ }
   }
 
   if (matches.length === 0) return { bytes: base, replaced: 0 };
@@ -1900,7 +2422,7 @@ export async function redactRegion(
     });
     return toUint8(await doc.save());
   } finally {
-    void pdfJsDoc.destroy();
+    try { await pdfJsDoc.destroy(); } catch { /* ignore */ }
   }
 }
 
@@ -2381,8 +2903,15 @@ async function nUpPagesVector(
   const { sheet, layout, cells, cellWidth, cellHeight, margin, gutter } = nUpGeometry(perSheet, opts, firstSize);
 
   const out = await PDFDocument.create();
-  const indices = srcPages.map((_, i) => i);
-  const embedded = await out.embedPdf(src, indices);
+  // V1.0128: embed each page's VISIBLE area (its CropBox, at its real
+  // origin). `embedPdf` uses pdf-lib's default box {0,0,w,h}, which ignores
+  // the box origin — a page whose box doesn't start at 0,0 (Canva-style y0
+  // offsets, or the Full-page trim) was tiled from the wrong region.
+  const boxes = srcPages.map((p) => {
+    const c = p.getCropBox();
+    return { left: c.x, bottom: c.y, right: c.x + c.width, top: c.y + c.height };
+  });
+  const embedded = await out.embedPages(srcPages, boxes);
 
   for (let start = 0; start < embedded.length; start += cells) {
     const sheetPage = out.addPage([sheet.width, sheet.height]);
@@ -2599,8 +3128,88 @@ export async function autoCropPages(
     }
     return toUint8(await doc.save());
   } finally {
-    void pdfJsDoc.destroy();
+    try { await pdfJsDoc.destroy(); } catch { /* ignore */ }
   }
+}
+
+/**
+ * V1.0128: "Full page" for 2/4/6/9 pages per sheet. Trims every page's
+ * white margins to ONE shared content box (union across pages — all tiles
+ * keep the same scale, so a sparse page 2 isn't blown up) by setting the
+ * Media/CropBox, so the n-up step that follows fills each tile with content.
+ * Vector — text stays sharp. Pages with /Rotate are left untouched (and if
+ * ANY page is rotated nothing is trimmed): the top-left→user-space mapping in
+ * print-trim.ts is only valid for unrotated pages, and printing untrimmed is
+ * the safe failure.
+ */
+export async function trimPagesToContentForPrint(
+  base: Uint8Array,
+  opts: { pad?: number; whiteThreshold?: number; rasterScale?: number } = {},
+): Promise<Uint8Array> {
+  const pad = opts.pad ?? 6;
+  const whiteThreshold = opts.whiteThreshold ?? 240;
+  const rasterScale = opts.rasterScale ?? 1.5;
+  const { unionViewBoxes, viewBoxToPdfBox } = await import("./print-trim");
+  const doc = await load(base);
+  const pages = doc.getPages();
+  if (pages.length === 0 || pages.some((p) => p.getRotation().angle % 360 !== 0)) return base;
+
+  const { pdfjsLib } = await import("./pdfjs");
+  const pdfJsDoc = await pdfjsLib.getDocument({ data: base.slice() }).promise;
+  const boxes: Array<{ x: number; y: number; w: number; h: number } | null> = [];
+  try {
+    for (let i = 1; i <= pdfJsDoc.numPages; i++) {
+      const page = await pdfJsDoc.getPage(i);
+      const vp = page.getViewport({ scale: rasterScale });
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.ceil(vp.width);
+      canvas.height = Math.ceil(vp.height);
+      const ctx = canvas.getContext("2d", { willReadFrequently: true });
+      if (!ctx) return base;
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+      await page.render({ canvasContext: ctx, viewport: vp }).promise;
+      const data = ctx.getImageData(0, 0, canvas.width, canvas.height).data;
+      let minX = canvas.width, minY = canvas.height, maxX = -1, maxY = -1;
+      for (let y = 0; y < canvas.height; y++) {
+        const row = y * canvas.width * 4;
+        for (let x = 0; x < canvas.width; x++) {
+          const k = row + x * 4;
+          if (data[k] < whiteThreshold || data[k + 1] < whiteThreshold || data[k + 2] < whiteThreshold) {
+            if (x < minX) minX = x;
+            if (x > maxX) maxX = x;
+            if (y < minY) minY = y;
+            if (y > maxY) maxY = y;
+          }
+        }
+      }
+      boxes.push(
+        maxX < 0
+          ? null
+          : {
+              x: minX / rasterScale - pad,
+              y: minY / rasterScale - pad,
+              w: (maxX - minX + 1) / rasterScale + pad * 2,
+              h: (maxY - minY + 1) / rasterScale + pad * 2,
+            },
+      );
+    }
+  } finally {
+    try { await pdfJsDoc.destroy(); } catch { /* ignore */ }
+  }
+
+  const union = unionViewBoxes(boxes);
+  if (!union) return base;
+  let changed = false;
+  for (const page of pages) {
+    const cb = page.getCropBox();
+    const box = viewBoxToPdfBox(union, cb);
+    if (!box) continue;
+    page.setMediaBox(box.x, box.y, box.width, box.height);
+    page.setCropBox(box.x, box.y, box.width, box.height);
+    changed = true;
+  }
+  return changed ? toUint8(await doc.save()) : base;
 }
 
 /**

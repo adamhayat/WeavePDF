@@ -1,7 +1,8 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { PDFDocumentProxy } from "../../lib/pdfjs";
 import { useDocumentStore } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
+import { clearActiveFieldFlusher, setActiveFieldFlusher } from "../../lib/pending-field";
 import type { FormFieldValue } from "../../lib/pdf-ops";
 
 const loadPdfOps = () => import("../../lib/pdf-ops");
@@ -122,6 +123,9 @@ export function AcroFormLayer({ pdf, pageNumber, zoom, pageHeightPt, editTextMod
       size: sizePt,
       text: widget.value,
       widthPt: Math.max(36, wPt - padX * 2),
+      // V1.0126: the save blanks this field so its old value can't show
+      // through on top in Preview / Acrobat.
+      formField: widget.name,
       // V1.0076: pad the whiteout by 2pt on all sides. pdf.js renders
       // the widget's appearance stream slightly larger than the widget
       // rect (anti-aliasing, descenders, italic shear), so a rect-tight
@@ -150,7 +154,19 @@ export function AcroFormLayer({ pdf, pageNumber, zoom, pageHeightPt, editTextMod
   // editing UI — same relative order as before, just above the drawing
   // layer.
   return (
-    <div className="absolute inset-0 z-[15]" data-testid="acroform-layer">
+    // V1.0120: the container is pointer-events-none so clicks in the GAPS
+    // between fields fall through to the z-10 interaction layer beneath. This
+    // full-page z-15 layer was otherwise swallowing every click-to-place
+    // gesture (signature, image, text, checkmark) on a form PDF — Adam opened
+    // the signature modal, clicked OK (which arms tool="signature"), then his
+    // placement click hit this layer instead of the interaction handler, so
+    // "nothing happens, can't place the signature." Each widget below sets
+    // pointer-events-auto, so a click ON a field still wins over an active
+    // drawing tool (preserving the V1.0076 "fields stay fillable" behaviour).
+    <div
+      className="pointer-events-none absolute inset-0 z-[15]"
+      data-testid="acroform-layer"
+    >
       {widgets.map((widget, index) => (
         // V1.0039: key MUST be stable across `applyEdit` re-renders. Earlier
         // we keyed on `${name}-${index}-${activeTab.version}` — version
@@ -197,6 +213,32 @@ function FieldWidget({
   const [value, setValue] = useState(widget.value);
   const [checked, setChecked] = useState(widget.checked || radioChecked);
   const [busy, setBusy] = useState(false);
+  // V1.0122: with a tool armed, a click near a field belongs to the TOOL
+  // (V1.0120 made gap clicks fall through for exactly that reason) — but the
+  // invisible "Aa ▸" pill juts ~20px above the field inside this
+  // pointer-events-auto wrapper, so a placement click aimed at that strip
+  // hijacked the click into an edit-text promotion instead. Suppress the
+  // pill entirely while any tool is armed; it returns when the tool is
+  // dropped (Esc / re-click).
+  const toolArmed = useUIStore((s) => s.tool !== "none");
+  // Refs so the flusher registered on focus always reads CURRENT values
+  // rather than the render-time closure's stale copies.
+  const valueRef = useRef(value);
+  const widgetValueRef = useRef(widget.value);
+  useEffect(() => {
+    valueRef.current = value;
+  }, [value]);
+  useEffect(() => {
+    widgetValueRef.current = widget.value;
+  }, [widget.value]);
+  // A widget can unmount while focused (page re-render after an edit) — leaving
+  // a stale flusher registered would commit into a dead component.
+  // V1.0126: clear only OUR flusher — the slot is shared with WeavePDF text
+  // boxes / prompts, and wiping theirs made ⌘S skip what they held.
+  const flusherRef = useRef<(() => Promise<void>) | null>(null);
+  useEffect(() => () => {
+    if (flusherRef.current) clearActiveFieldFlusher(flusherRef.current);
+  }, []);
   const [x1, y1, x2, y2] = widget.rect;
   const style = {
     left: x1 * zoom,
@@ -234,7 +276,7 @@ function FieldWidget({
           aria-label={`Edit "${widget.name}"`}
           data-testid="acroform-edit-text-target"
           data-field-name={widget.name}
-          className="absolute cursor-text rounded-[2px] border border-transparent transition-colors hover:border-[var(--color-accent)] hover:bg-[rgba(109,94,245,0.08)]"
+          className="pointer-events-auto absolute cursor-text rounded-[2px] border border-transparent transition-colors hover:border-[var(--color-accent)] hover:bg-[rgba(109,94,245,0.08)]"
           style={style}
           onPointerDown={(e) => {
             e.stopPropagation();
@@ -266,7 +308,7 @@ function FieldWidget({
     // tool mode and didn't realize Edit Text gives more options.
     return (
       <div
-        className="group absolute"
+        className="group pointer-events-auto absolute"
         style={style}
         data-acroform-text-field={widget.name}
       >
@@ -289,18 +331,40 @@ function FieldWidget({
           onContextMenu={(e) => e.stopPropagation()}
           onFocus={(e) => {
             e.currentTarget.style.color = "black";
+            // V1.0123: while this field has the caret, Save/Print must be able
+            // to commit it — they never blur, so without this the typed value
+            // is written to React state only and the file gets the OLD value.
+            const flush = async () => {
+              if (widget.readOnly) return;
+              if (valueRef.current === widgetValueRef.current) return;
+              await runCommit({ name: widget.name, kind: "text", value: valueRef.current });
+            };
+            flusherRef.current = flush;
+            setActiveFieldFlusher(flush);
           }}
           onChange={(e) => setValue(e.target.value)}
           onBlur={(e) => {
             e.currentTarget.style.color = "transparent";
+            if (flusherRef.current) clearActiveFieldFlusher(flusherRef.current);
+            flusherRef.current = null;
             if (value !== widget.value) {
               void runCommit({ name: widget.name, kind: "text", value });
             }
           }}
         />
-        {!widget.readOnly && (
+        {!widget.readOnly && !toolArmed && (
           <button
             type="button"
+            // V1.0119: keep the pill OUT of the keyboard tab order. It sits
+            // in the DOM right after the input, so without this, pressing
+            // Tab from a filled field focused this (opacity-0) pill instead
+            // of the next field — it took two Tabs to cross one field and
+            // the in-between stop was invisible, so Tab looked broken. The
+            // pill is a mouse-only discoverability affordance; tabIndex={-1}
+            // removes it from Tab/Shift+Tab while leaving it clickable.
+            // Adam: "I should be able to jump from one fillable text to the
+            // next by clicking tab. That doesn't work."
+            tabIndex={-1}
             // Mousedown rather than click — we need to grab the pill
             // BEFORE the input's blur fires (which would commit a
             // form-fill change and re-render via applyEdit, unmounting
@@ -330,7 +394,7 @@ function FieldWidget({
         aria-label={widget.name}
         data-testid="acroform-checkbox"
         type="checkbox"
-        className="absolute accent-[var(--color-accent)]"
+        className="pointer-events-auto absolute accent-[var(--color-accent)]"
         style={style}
         checked={checked}
         disabled={widget.readOnly || busy}
@@ -353,7 +417,7 @@ function FieldWidget({
         data-testid="acroform-radio"
         type="radio"
         name={widget.name}
-        className="absolute accent-[var(--color-accent)]"
+        className="pointer-events-auto absolute accent-[var(--color-accent)]"
         style={style}
         checked={checked}
         disabled={widget.readOnly || busy}
@@ -374,7 +438,7 @@ function FieldWidget({
     <select
       aria-label={widget.name}
       data-testid="acroform-dropdown"
-      className="absolute rounded-[2px] border border-transparent bg-white/70 px-1 text-[12px] text-black outline-none focus:border-[var(--color-accent)] focus:ring-1 focus:ring-[var(--color-accent)] disabled:opacity-60"
+      className="pointer-events-auto absolute rounded-[2px] border border-transparent bg-white/70 px-1 text-[12px] text-black outline-none focus:border-[var(--color-accent)] focus:ring-1 focus:ring-[var(--color-accent)] disabled:opacity-60"
       style={style}
       value={value}
       disabled={widget.readOnly || busy}

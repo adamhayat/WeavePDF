@@ -17,19 +17,39 @@ import { join, resolve } from "node:path";
 // installed, so the build doesn't break for someone who hasn't run the
 // setup script yet.
 function detectSigningIdentity(): string {
+  // V1.0121: this used to fall back to ad-hoc SILENTLY. An ad-hoc build gets a
+  // fresh CDHash every time, which is what re-arms the macOS Keychain
+  // "Always Allow" prompt on every update — so a silent fallback reintroduces
+  // the exact bug the stable identity exists to prevent, with no signal that
+  // it happened. Every branch below now says what it decided and why, and
+  // WEAVEPDF_REQUIRE_SIGNING=1 turns the fallback into a hard build failure
+  // (used by `npm run release`, where shipping ad-hoc is never right).
+  const strict = process.env.WEAVEPDF_REQUIRE_SIGNING === "1";
+  const bail = (why: string): string => {
+    const msg = `[signing] falling back to AD-HOC — ${why}. Every rebuild will re-prompt the macOS Keychain ("Always Allow"). Fix: bash scripts/setup-local-signing.sh`;
+    if (strict) throw new Error(msg);
+    console.warn(`⚠️  ${msg}`);
+    return "-";
+  };
   try {
     // No `-v` flag — self-signed certs report `CSSMERR_TP_NOT_TRUSTED` but
     // `codesign` itself accepts them (the strict filter is for Apple-CA
     // anchored identities like Developer ID).
     const out = execFileSync("security", ["find-identity", "-p", "codesigning"], {
       encoding: "utf8",
-      stdio: ["ignore", "pipe", "ignore"],
+      // stderr was "ignore" here, which threw away `security`'s own explanation
+      // whenever this failed — the reason the ad-hoc fallback was undebuggable.
+      stdio: ["ignore", "pipe", "pipe"],
     });
-    if (out.includes('"WeavePDF Local"')) return "WeavePDF Local";
-  } catch {
-    // `security` not available or no identities; treat as ad-hoc.
+    if (out.includes('"WeavePDF Local"')) {
+      console.log('[signing] using stable identity "WeavePDF Local"');
+      return "WeavePDF Local";
+    }
+    return bail(`"WeavePDF Local" not in the codesigning identity list (found ${out.trim().split("\n").length} lines)`);
+  } catch (err) {
+    if (strict && err instanceof Error && err.message.startsWith("[signing]")) throw err;
+    return bail(`\`security find-identity\` failed: ${(err as Error).message}`);
   }
-  return "-";
 }
 
 const SIGNING_IDENTITY = detectSigningIdentity();

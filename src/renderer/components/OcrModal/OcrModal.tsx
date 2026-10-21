@@ -3,6 +3,7 @@ import { X, ScanText, CheckCircle2 } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
 import { applyOcrTextLayer, type OcrPageResult } from "../../lib/pdf-ops";
 import { u8ToAb } from "../../../shared/buffers";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -79,6 +80,8 @@ export function OcrModal({ open, onClose }: Props) {
   };
 
   const busy = phase === "running";
+
+  useEscapeClose(open, onClose, !busy);
 
   return (
     <div

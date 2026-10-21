@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Search } from "lucide-react";
 import { cn } from "../../lib/cn";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 export type PaletteAction = {
   id: string;
@@ -44,6 +45,11 @@ export function CommandPalette({ open, onClose, actions }: Props) {
       requestAnimationFrame(() => inputRef.current?.focus());
     }
   }, [open]);
+
+  // V1.0123: Escape used to be handled ONLY inside the input's onKeyDown, so
+  // the moment focus left it (clicking a disabled row, the header, the
+  // scrollbar) Escape went dead and only an exact backdrop click would close.
+  useEscapeClose(open, onClose);
 
   useEffect(() => {
     if (filtered.length === 0) {

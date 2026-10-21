@@ -1,3 +1,5 @@
+import { requestCloseTab } from "../../lib/close-tab";
+import { remapForDelete } from "../../lib/page-remap";
 import {
   Type,
   FileEdit,
@@ -93,6 +95,7 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
       const edit = activeTab.pendingImageEdits.find((e) => e.id === ui.selectedPendingImageId);
       if (edit) {
         const next = (((edit.rotation ?? 0) + delta) % 360 + 360) % 360;
+        useDocumentStore.getState().pushUndoStep(activeTab.id); // V1.0126: undoable
         useDocumentStore.getState().updatePendingImageEdit(activeTab.id, edit.id, {
           rotation: next,
         });
@@ -107,7 +110,10 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
       ? Array.from(activeTab.selectedPages)
       : [activeTab.currentPage];
     const { rotatePages } = await loadPdfOps();
-    const newBytes = await rotatePages(activeTab.bytes, targets, delta);
+    // V1.0126: elements on the rotated pages turn WITH the page.
+    const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id, targets);
+    if (!src) return;
+    const newBytes = await rotatePages(src, targets, delta);
     await applyEdit(activeTab.id, newBytes);
   };
 
@@ -118,14 +124,16 @@ export function Toolstrip({ onSave, onExport, onPrint }: Props) {
         `You can't delete every page. Close this document instead?\n\n(${activeTab.name})`,
       );
       if (confirmed) {
-        useDocumentStore.getState().closeTab(activeTab.id);
+        // V1.0126: through the unsaved-work prompt — this used to close the
+        // tab outright and lose every unsaved edit.
+        void requestCloseTab(activeTab.id);
       }
       return;
     }
     const pages = Array.from(activeTab.selectedPages).sort((a, b) => a - b);
     const { deletePages } = await loadPdfOps();
     const newBytes = await deletePages(activeTab.bytes, pages);
-    await applyEdit(activeTab.id, newBytes);
+    await applyEdit(activeTab.id, newBytes, { remapPages: remapForDelete(pages) });
   };
 
   const targetLabel = hasSelection

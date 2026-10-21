@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { useUIStore } from "../../stores/ui";
 import { useDocumentStore } from "../../stores/document";
+import { clearActiveFieldFlusher, setActiveFieldFlusher } from "../../lib/pending-field";
 
 type Props = {
   pageNumber: number;
@@ -19,20 +20,54 @@ export function StickyPromptOverlay({ pageNumber, zoom, pageHeightPx }: Props) {
   const [value, setValue] = useState("");
   const [busy, setBusy] = useState(false);
 
+  // V1.0126: keep a typed note when the user clicks elsewhere or saves,
+  // instead of throwing it away (Escape still discards on purpose).
+  type Draft = { tabId: string; page: number; xPt: number; yPt: number; text: string };
+  const draftRef = useRef<Draft | null>(null);
+  const keepDraft = () => {
+    const d = draftRef.current;
+    draftRef.current = null;
+    if (!d || !d.text.trim()) return;
+    useDocumentStore.getState().addPendingShapeEdit(d.tabId, {
+      kind: "sticky", page: d.page, xPt: d.xPt, yPt: d.yPt - 16, text: d.text.trim(),
+    });
+  };
+
   useEffect(() => {
+    keepDraft();
     if (prompt?.page === pageNumber) {
       setValue("");
       requestAnimationFrame(() => inputRef.current?.focus());
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prompt?.page, prompt?.xPt, prompt?.yPt, pageNumber]);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => () => keepDraft(), []);
+
+  const promptOpenHere = prompt?.page === pageNumber;
+  useEffect(() => {
+    if (!promptOpenHere) return;
+    const flush = async () => {
+      keepDraft();
+      useUIStore.getState().setStickyPrompt(null);
+    };
+    setActiveFieldFlusher(flush);
+    return () => clearActiveFieldFlusher(flush);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [promptOpenHere, prompt?.xPt, prompt?.yPt]);
 
   if (!prompt || prompt.page !== pageNumber) return null;
 
   const leftPx = prompt.xPt * zoom;
   // yPt is the top of the intended note; in PDF coords.
   const topPx = pageHeightPx - prompt.yPt * zoom;
+  draftRef.current = activeTab && !busy
+    ? { tabId: activeTab.id, page: prompt.page, xPt: prompt.xPt, yPt: prompt.yPt, text: value }
+    : null;
 
   const commit = async () => {
+    draftRef.current = null;
     if (!activeTab) {
       setStickyPrompt(null);
       return;
@@ -79,6 +114,7 @@ export function StickyPromptOverlay({ pageNumber, zoom, pageHeightPx }: Props) {
             void commit();
           } else if (e.key === "Escape") {
             e.preventDefault();
+            draftRef.current = null;
             setStickyPrompt(null);
             setTool("none");
           }

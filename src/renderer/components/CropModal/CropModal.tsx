@@ -20,7 +20,11 @@ export function CropModal({ open, onClose }: Props) {
     if (!activeTab.bytes) return;
     setBusy(true);
     try {
-      const newBytes = await cropPages(activeTab.bytes, { top, bottom, left, right });
+      // V1.0126: elements are flattened first so they stay where they are
+      // on the page instead of shifting with the new page origin.
+      const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id);
+      if (!src) return;
+      const newBytes = await cropPages(src, { top, bottom, left, right });
       await applyEdit(activeTab.id, newBytes);
       onClose();
     } finally {

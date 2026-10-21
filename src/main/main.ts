@@ -22,6 +22,7 @@ import {
   type WriteFileResult,
 } from "../shared/ipc";
 import { u8ToAb } from "../shared/buffers";
+import { parseCupsDefaultPageSize } from "../shared/cups-media";
 import forge from "node-forge";
 import { SignPdf } from "@signpdf/signpdf";
 import { P12Signer } from "@signpdf/signer-p12";
@@ -955,6 +956,7 @@ async function readOpenedFile(filePath: string): Promise<OpenedFile> {
     path: filePath,
     name: basename(filePath),
     sizeBytes: stats.size,
+    mtimeMs: stats.mtimeMs,
     data: u8ToAb(buffer),
   };
 }
@@ -971,6 +973,29 @@ function registerIpc(): void {
     if (!win) return;
     const safe = names.filter((n): n is string => typeof n === "string").slice(0, 200);
     dirtyTabsByWindowId.set(win.id, safe);
+  });
+
+  // V1.0123: the same three-way prompt the window-close / quit paths use, but
+  // for ONE tab. Closing a single tab (⌘W, the tab ✕, "Close Other Tabs") used
+  // to call closeTab() straight away, so a placed-but-unbaked signature, a
+  // drawn shape, typed text or a deleted page vanished with no warning — the
+  // one destructive action in the app that never asked.
+  ipcMain.handle(IpcChannel.ConfirmCloseTab, async (e, name: unknown) => {
+    const win = BrowserWindow.fromWebContents(e.sender);
+    const label = typeof name === "string" && name.trim() ? name : "This document";
+    const opts = {
+      type: "warning" as const,
+      message: `“${label}” has unsaved changes.`,
+      detail: "Save your changes before closing this tab?",
+      buttons: ["Save", "Cancel", "Don't Save"],
+      cancelId: 1,
+      defaultId: 0,
+      noLink: true,
+    };
+    const { response } = win
+      ? await dialog.showMessageBox(win, opts)
+      : await dialog.showMessageBox(opts);
+    return response === 0 ? "save" : response === 2 ? "discard" : "cancel";
   });
 
   // V1.0053: renderer reports the outcome of a Save-All triggered by an
@@ -1066,7 +1091,8 @@ function registerIpc(): void {
       try {
         assertBlessed(filePath);
         await writeFile(filePath, Buffer.from(bytes));
-        return { ok: true };
+        const stats = await stat(filePath);
+        return { ok: true, mtimeMs: stats.mtimeMs, sizeBytes: stats.size };
       } catch (err) {
         return { ok: false, error: String((err as Error)?.message ?? err) };
       }
@@ -1190,6 +1216,31 @@ group.wait()
   // sync getPrinters() API. Returns the same fields macOS exposes via CUPS:
   // name (CUPS device id, used as deviceName in print() options), displayName
   // (user-friendly), isDefault (one printer at a time), status (CUPS bitmask).
+  /** `lpoptions -p <name> -l` → the printer's default PageSize. Never throws;
+   *  null on any failure (the dialog then falls back to Letter). */
+  const readPrinterDefaultPaper = (name: string) =>
+    new Promise<ReturnType<typeof parseCupsDefaultPageSize>>((resolve) => {
+      try {
+        const child = spawn("/usr/bin/lpoptions", ["-p", name, "-l"]);
+        let out = "";
+        const timer = setTimeout(() => {
+          child.kill();
+          resolve(null);
+        }, 3000);
+        child.stdout.on("data", (d) => (out += String(d)));
+        child.on("error", () => {
+          clearTimeout(timer);
+          resolve(null);
+        });
+        child.on("close", () => {
+          clearTimeout(timer);
+          resolve(parseCupsDefaultPageSize(out));
+        });
+      } catch {
+        resolve(null);
+      }
+    });
+
   ipcMain.handle(IpcChannel.ListPrinters, async (e) => {
     const win = BrowserWindow.fromWebContents(e.sender);
     if (!win) return [];
@@ -1203,11 +1254,15 @@ group.wait()
         isDefault?: boolean;
         status?: number;
       }>;
-      return list.map((p) => ({
+      // V1.0127: each printer's default paper (what's in its tray), so the
+      // dialog lays the sheet out on that paper instead of the document's.
+      const media = await Promise.all(list.map((p) => readPrinterDefaultPaper(p.name)));
+      return list.map((p, i) => ({
         name: p.name,
         displayName: p.displayName || p.name,
         isDefault: !!p.isDefault,
         status: typeof p.status === "number" ? p.status : 0,
+        defaultPaper: media[i] ?? undefined,
       }));
     } catch {
       return [];
@@ -1273,9 +1328,25 @@ group.wait()
       } else {
         args.push("-o", "sides=one-sided");
       }
+      // V1.0121: tell CUPS which sheet to use. Without this the driver falls
+      // back to its default tray regardless of the Paper dropdown, so an A4 or
+      // Legal job was rescaled/clipped onto Letter (and vice versa).
+      // Restricted to a known-good allowlist because this string reaches an
+      // argv for /usr/bin/lp.
+      if (options.media && /^[A-Za-z0-9_-]{1,32}$/.test(options.media)) {
+        args.push("-o", `media=${options.media}`);
+      }
       // Landscape. `-o landscape` is the canonical CUPS shorthand
       // (equivalent to `orientation-requested=4`).
+      // V1.0121 asked whether this double-applies the rotation the renderer
+      // already bakes into the page boxes. Settled by a real print
+      // (2026-10-13, Brother HL-2240, 2-up landscape): the sheet came out
+      // correctly oriented — no double rotation. Keep it.
       if (options.landscape) args.push("-o", "landscape");
+      // V1.0127: the renderer already laid the job out at the exact sheet size
+      // shown in the preview — forbid the driver from rescaling it, so the
+      // printout matches the preview 1:1.
+      args.push("-o", "print-scaling=none");
       // Color → mono. Most CUPS drivers respect `ColorModel=Gray`. When
       // `color` is true (the default), don't pass anything — driver
       // default kicks in.

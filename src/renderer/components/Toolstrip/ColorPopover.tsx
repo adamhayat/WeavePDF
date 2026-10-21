@@ -1,4 +1,5 @@
 import { useUIStore } from "../../stores/ui";
+import { useDocumentStore } from "../../stores/document";
 import { cn } from "../../lib/cn";
 
 type Swatch = { r: number; g: number; b: number; label: string };
@@ -26,13 +27,41 @@ const PRESETS: Preset[] = [
   { label: "Blue note", color: { r: 0.15, g: 0.45, b: 0.85 }, stroke: 1.5 },
 ];
 
+/** Shape kinds that actually carry colour + thickness. Highlight / whiteout /
+ *  redact / sticky have fixed appearances, so a recolour must skip them. */
+const RECOLOURABLE = new Set(["rect", "ellipse", "line", "arrow", "freehand"]);
+
 export function ColorPopover() {
   const tool = useUIStore((s) => s.tool);
   const annotationColor = useUIStore((s) => s.annotationColor);
-  const setAnnotationColor = useUIStore((s) => s.setAnnotationColor);
+  const setAnnotationColorRaw = useUIStore((s) => s.setAnnotationColor);
   const strokeWidth = useUIStore((s) => s.strokeWidth);
-  const setStrokeWidth = useUIStore((s) => s.setStrokeWidth);
+  const setStrokeWidthRaw = useUIStore((s) => s.setStrokeWidth);
   const recentColors = useUIStore((s) => s.recentColors);
+
+  // V1.0123: these controls used to set the default for the NEXT shape only,
+  // so a shape's colour was frozen the moment you drew it — picking a new
+  // colour with the shape still selected appeared to do nothing, and the only
+  // way to fix a wrong colour was delete-and-redraw. Now they also restyle the
+  // selected shape, which is what every other annotation tool does.
+  const selectedShapeId = useUIStore((s) => s.selectedPendingShapeId);
+  const activeTabId = useDocumentStore((s) => s.activeTab()?.id ?? null);
+  const shapeKind = useDocumentStore(
+    (s) =>
+      s.activeTab()?.pendingShapeEdits.find((e) => e.id === selectedShapeId)?.kind ?? null,
+  );
+  const updateShape = useDocumentStore((s) => s.updatePendingShapeEdit);
+  const canRestyle =
+    activeTabId != null && selectedShapeId != null && shapeKind != null && RECOLOURABLE.has(shapeKind);
+
+  const setAnnotationColor = (c: { r: number; g: number; b: number }) => {
+    setAnnotationColorRaw(c);
+    if (canRestyle) updateShape(activeTabId, selectedShapeId, { color: c });
+  };
+  const setStrokeWidth = (w: number) => {
+    setStrokeWidthRaw(w);
+    if (canRestyle) updateShape(activeTabId, selectedShapeId, { thickness: w });
+  };
 
   // Only show when a tool that respects colour is active.
   const relevant =
@@ -66,7 +95,14 @@ export function ColorPopover() {
               "h-5 w-5 rounded-full border-2 transition-transform",
               active
                 ? "border-[var(--color-accent)] scale-110"
-                : "border-transparent hover:scale-110",
+                : // V1.0123: an unselected swatch used to carry a TRANSPARENT
+                  // border, which made the near-black "Ink" dot invisible
+                  // against the dark-mode toolbar — once the user picked Red or
+                  // Blue there was no visible target to click to get back to
+                  // black. A subtle panel-border ring keeps every swatch
+                  // findable in both themes without competing with the accent
+                  // ring that marks the active one.
+                  "border-[var(--panel-border-strong)] hover:scale-110",
             )}
             style={{
               background: `rgb(${s.r * 255},${s.g * 255},${s.b * 255})`,

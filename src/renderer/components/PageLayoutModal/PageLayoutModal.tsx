@@ -12,6 +12,7 @@ import {
   type PaperSize,
 } from "../../lib/pdf-ops";
 import { cn, formatBytes } from "../../lib/cn";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -72,33 +73,37 @@ export function PageLayoutModal({ open, onClose }: Props) {
     setBusy(true);
     setResult(null);
     try {
+      // V1.0126: these re-lay-out whole pages, so the editable elements are
+      // flattened first and travel with their page.
+      const src = await useDocumentStore.getState().prepareGeometryEdit(activeTab.id);
+      if (!src) return;
       let out: Uint8Array;
       switch (tab) {
         case "nup":
-          out = await nUpPages(activeTab.bytes, nupPerSheet, {
+          out = await nUpPages(src, nupPerSheet, {
             paper: nupPaper,
             orientation: nupOrientation,
             addBorders: nupAddBorders,
           });
           break;
         case "crop":
-          out = await autoCropPages(activeTab.bytes, {
+          out = await autoCropPages(src, {
             uniform: cropUniform,
             padding: cropPadding,
             whiteThreshold: cropThreshold,
           });
           break;
         case "fit":
-          out = await fitToPaper(activeTab.bytes, fitPaper, {
+          out = await fitToPaper(src, fitPaper, {
             mode: fitMode,
             orientation: fitOrientation,
           });
           break;
         case "booklet":
-          out = await bookletImpose(activeTab.bytes, { paper: bookletPaper });
+          out = await bookletImpose(src, { paper: bookletPaper });
           break;
         case "split":
-          out = await splitDoubleSpread(activeTab.bytes, { direction: splitDir });
+          out = await splitDoubleSpread(src, { direction: splitDir });
           break;
       }
       const before = activeTab.sizeBytes;
@@ -113,6 +118,8 @@ export function PageLayoutModal({ open, onClose }: Props) {
       setBusy(false);
     }
   };
+
+  useEscapeClose(open, onClose);
 
   return (
     <div

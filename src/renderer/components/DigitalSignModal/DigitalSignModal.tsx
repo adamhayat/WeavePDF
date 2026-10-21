@@ -3,6 +3,7 @@ import { X, ShieldCheck, Trash2, Loader2 } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
 import type { DigitalCertInfo } from "../../../shared/ipc";
 import { u8ToAb } from "../../../shared/buffers";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -96,6 +97,8 @@ export function DigitalSignModal({ open, onClose }: Props) {
       setPhase("hasCert");
     }
   };
+
+  useEscapeClose(open, onClose, phase !== "signing" && phase !== "generating");
 
   return (
     <div

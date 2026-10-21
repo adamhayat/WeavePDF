@@ -2,7 +2,13 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { X, Edit2, Minus, Plus, Bold, Italic, AlignLeft, AlignCenter, AlignRight, AlignJustify, Link as LinkIcon } from "lucide-react";
 import { useDocumentStore, type PendingTextEdit } from "../../stores/document";
 import { useUIStore } from "../../stores/ui";
+import { arrangeMenuItems, usePageBuried, usePageLayerRanks } from "./layering";
+import { clearActiveFieldFlusher, setActiveFieldFlusher } from "../../lib/pending-field";
+import { markBoxShortcut } from "../../lib/box-shortcut";
+import { overlayFontFamily } from "../../lib/overlay-font";
 import { resolveCrossPageTopLeft } from "../../lib/cross-page-drag";
+import { beginGroupMove, endGroupMove, followGroupMove } from "../../lib/group-move";
+import { rgbCss, TEXT_COLOR_SWATCHES } from "../../lib/text-color";
 
 const MIN_WRAP_TEXT_WIDTH_PT = 120;
 
@@ -23,6 +29,8 @@ type Props = {
 export function PendingTextLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt, pageHeightPt }: Props) {
   const activeTab = useDocumentStore((s) => s.activeTab());
   const marginsEnabled = useUIStore((s) => s.marginsEnabled);
+  const ranks = usePageLayerRanks(pageNumber);
+  const buried = usePageBuried(pageNumber);
   if (!activeTab) return null;
 
   const edits = activeTab.pendingTextEdits.filter((e) => e.page === pageNumber);
@@ -36,6 +44,7 @@ export function PendingTextLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt, 
           edit={edit}
           zoom={zoom}
           pageHeightPx={pageHeightPx}
+          layer={ranks.get(edit.id) ?? 1}
         />
       ))}
       {edits.map((edit) => (
@@ -48,6 +57,8 @@ export function PendingTextLayer({ pageNumber, zoom, pageHeightPx, pageWidthPt, 
           pageWidthPt={pageWidthPt}
           pageHeightPt={pageHeightPt}
           marginsEnabled={marginsEnabled}
+          layer={ranks.get(edit.id) ?? 1}
+          buried={buried.has(edit.id)}
         />
       ))}
     </>
@@ -58,17 +69,23 @@ function PendingTextWhiteout({
   edit,
   zoom,
   pageHeightPx,
+  layer,
 }: {
   edit: PendingTextEdit;
   zoom: number;
   pageHeightPx: number;
+  layer: number;
 }) {
   if (!edit.whiteout) return null;
+  // V1.0125: same z as its text box, and earlier in the DOM, so it sits
+  // directly beneath its own text — exactly where the bake draws it.
   return (
     <div
-      className="pointer-events-none absolute z-[19] bg-white"
+      className="pointer-events-none absolute bg-white"
       data-testid="pending-text-whiteout"
+      data-layer={layer}
       style={{
+        zIndex: layer,
         left: edit.whiteout.x * zoom,
         top: pageHeightPx - (edit.whiteout.y + edit.whiteout.height) * zoom,
         width: edit.whiteout.width * zoom,
@@ -91,6 +108,10 @@ type PendingTextProps = {
   pageWidthPt: number;
   pageHeightPt: number;
   marginsEnabled: boolean;
+  /** V1.0125: stacking rank on the page (CSS z-index) — see layering.ts. */
+  layer: number;
+  /** V1.0125: hidden under a whiteout/redact above it — takes no clicks. */
+  buried: boolean;
 };
 
 function PendingText({
@@ -101,16 +122,23 @@ function PendingText({
   pageWidthPt,
   pageHeightPt,
   marginsEnabled,
+  layer,
+  buried,
 }: PendingTextProps) {
   const updatePendingTextEdit = useDocumentStore((s) => s.updatePendingTextEdit);
   const removePendingTextEdit = useDocumentStore((s) => s.removePendingTextEdit);
   const pushUndoStep = useDocumentStore((s) => s.pushUndoStep);
-  const selected = useUIStore((s) => s.selectedPendingTextId === edit.id);
+  // V1.0134: selected = the primary OR a member of a shift-click group.
+  const selected = useUIStore((s) => s.selectedPendingTextId === edit.id || s.groupSelectedIds.includes(edit.id));
+  const textColorCss = rgbCss(edit.color);
   const setSelectedId = useUIStore((s) => s.setSelectedPendingText);
   const shouldEditNow = useUIStore((s) => s.editingPendingTextId === edit.id);
   const setEditingId = useUIStore((s) => s.setEditingPendingText);
   const [isEditing, setIsEditing] = useState(false);
   const [draftText, setDraftText] = useState(edit.text);
+  // V1.0134: while the frame handle is being dragged, the dashed frame shows
+  // the width being set; at rest it hugs the text (see the frame below).
+  const [frameDragWidthPt, setFrameDragWidthPt] = useState<number | null>(null);
   // V1.0062: textarea when the text has a `widthPt` (multi-line wrap mode),
   // input when it doesn't (single-line Edit-Text replacement).
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
@@ -243,6 +271,10 @@ function PendingText({
   // clamp at mount so the user doesn't have to drag every restored
   // overlay. Idempotent: if coords are already inside, no-op.
   useEffect(() => {
+    // V1.0126: an Edit-Text replacement (it carries a `whiteout`) must stay
+    // exactly over the text it replaces — near a page edge the clamp pushed
+    // it inside the margin while its white box stayed put.
+    if (edit.whiteout) return;
     const m = marginsEnabled ? 36 : 0;
     const MIN_W = 36;
     const clampedX = Math.max(m, Math.min(pageWidthPt - m - MIN_W, edit.xPt));
@@ -282,6 +314,7 @@ function PendingText({
     if (!s) return;
     s.cleanup?.();
     s.active = false;
+    endGroupMove(s.dragEditId);
     dragState.current = null;
     if (pointerId != null && captureTarget) {
       try {
@@ -316,6 +349,7 @@ function PendingText({
         const yMin = m - edit.size + s.heightPt;
         const yPt = Math.max(yMin, Math.min(yMax, s.startYPt - dy));
         updatePendingTextEdit(tabId, s.dragEditId, { xPt, yPt });
+        followGroupMove(s.dragEditId, { x: xPt, y: yPt });
         return;
       }
 
@@ -327,6 +361,9 @@ function PendingText({
       if (target.page !== s.currentPage && edit.whiteout && !s.detachedWhiteout) {
         addPendingShapeEdit(tabId, {
           kind: "whiteout",
+          // V1.0125: keep the detached whiteout at the text's old layer, not
+          // on top of everything else left on the page.
+          z: edit.z ?? edit.createdAt,
           page: s.currentPage,
           xPt: edit.whiteout.x,
           yPt: edit.whiteout.y,
@@ -338,6 +375,7 @@ function PendingText({
       }
       s.currentPage = target.page;
       updatePendingTextEdit(tabId, s.dragEditId, patch);
+      followGroupMove(s.dragEditId, { x: patch.xPt ?? edit.xPt, y: patch.yPt ?? edit.yPt });
     },
     [
       zoom,
@@ -356,6 +394,13 @@ function PendingText({
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (isEditing) return;
       if (e.button !== 0) return;
+      // V1.0134: shift-click adds this box to (or drops it from) the
+      // multi-selection instead of starting a drag.
+      if (e.shiftKey && !e.altKey) {
+        e.stopPropagation();
+        useUIStore.getState().toggleGroupSelect("text", edit.id);
+        return;
+      }
       // V1.0070: snapshot before the drag so the entire move is one
       // undo step (intermediate pointermove updates don't snapshot).
       pushUndoStep(tabId);
@@ -364,8 +409,9 @@ function PendingText({
       // so the drag moves the CLONE and the original stays put. Mac
       // convention (Finder, Pages, Sketch, Figma).
       if (e.altKey) {
-        const { id: _unused, ...rest } = edit;
-        void _unused;
+        // V1.0125: the clone is a NEW element — it gets its own (top) layer.
+        const { id: _unused, createdAt: _c, z: _z, ...rest } = edit;
+        void _unused; void _c; void _z;
         dragEditId = addPendingTextEdit(tabId, rest);
         setSelectedId(dragEditId);
       } else {
@@ -402,6 +448,8 @@ function PendingText({
         },
       };
       target.setPointerCapture(e.pointerId);
+      // V1.0134: the other members of a multi-selection follow this drag.
+      if (!e.altKey) beginGroupMove(tabId, dragEditId);
       e.stopPropagation();
     },
     [
@@ -482,6 +530,7 @@ function PendingText({
         Math.min(s.maxWidthPt, targetWidthPt),
       );
       updatePendingTextEdit(tabId, edit.id, { widthPt: nextWidth });
+      setFrameDragWidthPt(nextWidth);
     },
     [updatePendingTextEdit, tabId, edit.id, zoom],
   );
@@ -489,6 +538,7 @@ function PendingText({
     (e: React.PointerEvent<HTMLDivElement>) => {
       if (!resizeState.current) return;
       resizeState.current.active = false;
+      setFrameDragWidthPt(null);
       try {
         (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
       } catch {
@@ -568,7 +618,35 @@ function PendingText({
     [],
   );
 
+  // V1.0126: ⌘S / ⌘P while this box is still being edited. The caret never
+  // leaves the textarea, so commitEdit (on blur) hadn't run and the save
+  // wrote the box's OLD text; the later blur then marked the tab unsaved
+  // again ("why do I get this prompt after ⌘S?"). Register as the active
+  // flusher so save/print commit the typed text first.
+  const draftRef = useRef(draftText);
+  draftRef.current = draftText;
+  useEffect(() => {
+    if (!isEditing) return;
+    const flush = async () => {
+      const store = useDocumentStore.getState();
+      // An emptied box is removed (as its blur would) — not saved with its
+      // OLD text.
+      if (draftRef.current.trim() === "") store.removePendingTextEdit(tabId, edit.id);
+      else store.updatePendingTextEdit(tabId, edit.id, { text: draftRef.current });
+    };
+    setActiveFieldFlusher(flush);
+    return () => clearActiveFieldFlusher(flush);
+  }, [isEditing, tabId, edit.id]);
+
   const commitEdit = useCallback(() => {
+    // V1.0126: a box emptied of all text used to linger as an invisible
+    // element that kept the tab "unsaved" forever. Remove it instead.
+    if (draftText.trim() === "") {
+      setIsEditing(false);
+      removePendingTextEdit(tabId, edit.id);
+      setSelectedId(null);
+      return;
+    }
     updatePendingTextEdit(tabId, edit.id, { text: draftText });
     setIsEditing(false);
     // V1.0075: do NOT clear selection here. Pre-V1.0075 a textarea blur
@@ -577,14 +655,14 @@ function PendingText({
     // unmounted the format bar before the user's click could complete.
     // Selection now persists across commit; the user explicitly clears
     // it by clicking the background or pressing Escape.
-  }, [draftText, edit.id, tabId, updatePendingTextEdit]);
+  }, [draftText, edit.id, tabId, updatePendingTextEdit, removePendingTextEdit, setSelectedId]);
 
   // Keyboard: arrow nudge, font-size step, delete, escape — when selected and not editing.
   useEffect(() => {
     if (!selected || isEditing) return;
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
-      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) {
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.tagName === "SELECT" || target.isContentEditable)) {
         return;
       }
       // V1.0057: ⌘B / ⌘I toggle bold / italic on the selected text. Sidebar
@@ -594,12 +672,16 @@ function PendingText({
         if (e.key === "b" || e.key === "B") {
           e.preventDefault();
           pushUndoStep(tabId);
+          e.stopPropagation(); // V1.0126: don't ALSO run an app shortcut
+          markBoxShortcut();
           updatePendingTextEdit(tabId, edit.id, { bold: !edit.bold });
           return;
         }
         if (e.key === "i" || e.key === "I") {
           e.preventDefault();
           pushUndoStep(tabId);
+          e.stopPropagation(); // V1.0126: ⌘I also opened Document Properties
+          markBoxShortcut();
           updatePendingTextEdit(tabId, edit.id, { italic: !edit.italic });
           return;
         }
@@ -612,6 +694,8 @@ function PendingText({
         const v = alignKey[e.key];
         if (v != null) {
           e.preventDefault();
+          e.stopPropagation(); // V1.0126: ⌘E also ran Export Combined PDF
+          markBoxShortcut();
           pushUndoStep(tabId);
           updatePendingTextEdit(tabId, edit.id, { align: v });
           return;
@@ -694,6 +778,10 @@ function PendingText({
       screenX: screenX ?? pageRect.left + (xPt + widthPt / 2) * zoom,
       screenY: screenY ?? pageRect.top + (pageHeightPt - yPt) * zoom + 8,
       suggestedUrl: selectedUrl,
+      // V1.0134: applying the link colours the box link-blue when the whole
+      // text is the link.
+      textEditId: edit.id,
+      coversWholeText: start === 0 && end === text.length,
     });
   }, [edit, pageHeightPt, zoom]);
 
@@ -742,6 +830,8 @@ function PendingText({
       { kind: "separator" },
       { kind: "item", label: "Add link…", onClick: () => openLinkForText(e.clientX, e.clientY) },
       { kind: "separator" },
+      ...arrangeMenuItems(tabId, edit.id),
+      { kind: "separator" },
       {
         kind: "item",
         label: "Delete",
@@ -756,10 +846,14 @@ function PendingText({
 
   return (
     <div
-      className="absolute z-20 select-none"
+      className="absolute select-none"
+      data-layer={layer}
+      data-buried={buried || undefined}
       style={{
         left: leftPx,
         top: topPx,
+        zIndex: layer,
+        pointerEvents: buried ? "none" : "auto",
         cursor: isEditing ? "text" : "move",
         // V1.0069: outer line-box adds ~2 px of baseline descent space
         // below the inline-block wrapper, extending the outer div's
@@ -792,11 +886,23 @@ function PendingText({
           the text wrapper underneath; only the SE handle takes pointer
           events. Drag the handle → resize the FRAME (widthPt), not the
           font size. Two distinct controls for two distinct things. */}
+      {/* V1.0134: at rest the frame HUGS the text (right: 0 — the outer div is
+          exactly the wrapper's size). The stored widthPt is still the wrap
+          boundary, but a frame drawn out to it reached the page edge for every
+          new box ("why is the text element showing a box outside of the right
+          side"). While the width handle is dragged the frame shows the width
+          being set, so the gesture stays visible. The handle sits mid-right
+          (not the corner, which the font-size handle owns). */}
       {selected && effectiveWidthPt != null && !isEditing && (
         <div
           className="pointer-events-none absolute border border-dashed border-[var(--color-accent)]/60"
-          style={{ top: 0, left: 0, bottom: 0, width: effectiveWidthPt * zoom }}
+          style={
+            frameDragWidthPt != null
+              ? { top: 0, left: 0, bottom: 0, width: frameDragWidthPt * zoom }
+              : { top: 0, left: 0, bottom: 0, right: 0 }
+          }
           data-pending-frame="text"
+          data-frame-mode={frameDragWidthPt != null ? "resizing" : "hug"}
         >
           <div
             role="button"
@@ -806,8 +912,8 @@ function PendingText({
             onPointerDown={onResizePointerDown}
             onPointerMove={onResizePointerMove}
             onPointerUp={onResizePointerUp}
-            className="pointer-events-auto absolute -bottom-1.5 -right-1.5 h-3 w-3 cursor-ew-resize rounded-sm border border-white bg-[var(--color-accent)] shadow-sm"
-            data-handle="frame-se"
+            className="pointer-events-auto absolute -right-1.5 top-1/2 h-4 w-2 -translate-y-1/2 cursor-ew-resize rounded-sm border border-white bg-[var(--color-accent)] shadow-sm"
+            data-handle="frame-e"
           />
         </div>
       )}
@@ -928,6 +1034,13 @@ function PendingText({
           >
             <LinkIcon className="h-2.5 w-2.5" strokeWidth={2} />
           </button>
+          <TextColorControl
+            color={edit.color}
+            onPick={(c) => {
+              pushUndoStep(tabId);
+              updatePendingTextEdit(tabId, edit.id, { color: c });
+            }}
+          />
           {effectiveWidthPt != null && (
             <>
               <div className="mx-0.5 h-3 w-px bg-[var(--panel-border)]" />
@@ -1006,11 +1119,11 @@ function PendingText({
               }}
               rows={1}
               data-testid="pending-text-input"
-              className="block resize-none overflow-hidden rounded-[2px] border border-[var(--color-accent)]/70 bg-transparent px-1 py-0.5 text-[#0b0b0e] caret-[var(--color-accent)] shadow-[0_0_0_1px_rgba(59,76,202,0.12)] focus:border-[var(--color-accent)] focus:outline-none"
+              className="block resize-none overflow-hidden rounded-[2px] border border-[var(--color-accent)]/70 bg-transparent px-1 py-0.5 caret-[var(--color-accent)] shadow-[0_0_0_1px_rgba(59,76,202,0.12)] focus:border-[var(--color-accent)] focus:outline-none"
               style={{
                 fontSize: edit.size * zoom,
                 lineHeight: 1.2,
-                fontFamily: "Helvetica, sans-serif",
+                fontFamily: overlayFontFamily(edit.fontName),
                 fontWeight: edit.bold ? 700 : 400,
                 fontStyle: edit.italic ? "italic" : "normal",
                 width: effectiveWidthPt * zoom,
@@ -1019,6 +1132,7 @@ function PendingText({
                 // 1.2-line-height rows is enough to type a short paragraph
                 // comfortably; the useLayoutEffect above grows it further
                 // whenever scrollHeight > current height.
+                color: textColorCss,
                 minHeight: `${edit.size * zoom * 1.2 * 4}px`,
                 wordBreak: "break-word",
                 overflowWrap: "break-word",
@@ -1046,12 +1160,13 @@ function PendingText({
                 }
               }}
               data-testid="pending-text-input"
-              className="block rounded-[2px] border border-[var(--color-accent)]/70 bg-transparent px-1 py-0.5 text-[#0b0b0e] caret-[var(--color-accent)] shadow-[0_0_0_1px_rgba(59,76,202,0.12)] focus:border-[var(--color-accent)] focus:outline-none"
+              className="block rounded-[2px] border border-[var(--color-accent)]/70 bg-transparent px-1 py-0.5 caret-[var(--color-accent)] shadow-[0_0_0_1px_rgba(59,76,202,0.12)] focus:border-[var(--color-accent)] focus:outline-none"
               style={{
                 fontSize: edit.size * zoom,
-                fontFamily: "Helvetica, sans-serif",
+                fontFamily: overlayFontFamily(edit.fontName),
                 fontWeight: edit.bold ? 700 : 400,
                 fontStyle: edit.italic ? "italic" : "normal",
+                color: textColorCss,
                 width: Math.max(120, draftText.length * edit.size * zoom * 0.55),
               }}
             />
@@ -1075,13 +1190,13 @@ function PendingText({
             // `drawWrappedText` uses for vertical line spacing at commit
             // time, so the on-screen wrap mirrors what gets baked.
             lineHeight: effectiveWidthPt != null ? 1.2 : 1,
-            fontFamily: "Helvetica, sans-serif",
+            fontFamily: overlayFontFamily(edit.fontName),
             // V1.0057: bold / italic toggled via ⌘B / ⌘I + the B/I buttons.
             // Mirrors how pdf-lib's matchStandardFont will pick the variant
             // at commit time (e.g. Helvetica → Helvetica-BoldOblique).
             fontWeight: edit.bold ? 700 : 400,
             fontStyle: edit.italic ? "italic" : "normal",
-            color: "#0b0b0e",
+            color: textColorCss,
             // V1.0068: wrapper hugs the rendered text — inline-block sizes
             // to the longest wrapped line; maxWidth enforces the wrap
             // boundary. V1.0069: a useLayoutEffect below measures the
@@ -1140,7 +1255,7 @@ function PendingText({
           {/* V1.0071: INNER SE handle — scales font size proportionally.
               Visually distinct from the outer frame handle: smaller
               (h-2.5 w-2.5), no white border, sits flush at the wrapper's
-              bottom-right corner. The OUTER handle (data-handle="frame-se")
+              bottom-right corner. The OUTER width handle (data-handle="frame-e", mid-right since V1.0134)
               is the larger blue square outside the wrap area; this one
               hugs the text. */}
           {selected && (
@@ -1218,5 +1333,91 @@ function FontSizeInput({
       title="Type a font size (6–144)"
       data-testid="font-size-input"
     />
+  );
+}
+
+/** V1.0134: text colour — a swatch in the bar opens a row of presets plus the
+ *  system colour picker. Adam: "I also don't see font color options." */
+function TextColorControl({
+  color,
+  onPick,
+}: {
+  color: { r: number; g: number; b: number } | undefined;
+  onPick: (c: { r: number; g: number; b: number } | undefined) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const current = rgbCss(color);
+  const hex = (c: { r: number; g: number; b: number } | undefined) => {
+    const v = c ?? { r: 0.043, g: 0.043, b: 0.055 };
+    const h = (n: number) => Math.round(Math.max(0, Math.min(1, n)) * 255).toString(16).padStart(2, "0");
+    return `#${h(v.r)}${h(v.g)}${h(v.b)}`;
+  };
+  const fromHex = (s: string) => {
+    const m = /^#?([0-9a-f]{6})$/i.exec(s);
+    if (!m) return undefined;
+    const n = Number.parseInt(m[1], 16);
+    return { r: ((n >> 16) & 255) / 255, g: ((n >> 8) & 255) / 255, b: (n & 255) / 255 };
+  };
+  const stop = (e: React.SyntheticEvent) => {
+    e.stopPropagation();
+    e.preventDefault();
+  };
+  return (
+    <div className="relative flex items-center" onPointerDown={(e) => e.stopPropagation()}>
+      <button
+        type="button"
+        onPointerDown={stop}
+        onMouseDown={stop}
+        onClick={(e) => {
+          e.stopPropagation();
+          setOpen((o) => !o);
+        }}
+        className="flex h-3 w-3 items-center justify-center"
+        aria-label="Text colour"
+        title="Text colour"
+        data-testid="format-bar-color"
+        aria-expanded={open}
+      >
+        <span className="block h-2.5 w-2.5 rounded-full ring-1 ring-black/20" style={{ background: current }} />
+      </button>
+      {open && (
+        <div
+          className="absolute left-0 top-4 z-50 flex items-center gap-1 rounded bg-[var(--panel-bg-raised)] p-1 shadow-md"
+          data-testid="text-color-popover"
+          onPointerDown={(e) => e.stopPropagation()}
+        >
+          {TEXT_COLOR_SWATCHES.map((sw) => (
+            <button
+              key={sw.label}
+              type="button"
+              onPointerDown={stop}
+              onMouseDown={stop}
+              onClick={(e) => {
+                e.stopPropagation();
+                onPick(sw.rgb);
+                setOpen(false);
+              }}
+              className="h-3.5 w-3.5 rounded-full ring-1 ring-black/15 hover:ring-[var(--color-accent)]"
+              style={{ background: rgbCss(sw.rgb) }}
+              aria-label={sw.label}
+              title={sw.label}
+              data-color={sw.label}
+            />
+          ))}
+          <input
+            type="color"
+            value={hex(color)}
+            onChange={(e) => {
+              const c = fromHex(e.target.value);
+              if (c) onPick(c);
+            }}
+            className="h-3.5 w-4 cursor-pointer border-0 bg-transparent p-0"
+            aria-label="Custom text colour"
+            title="Custom colour"
+            data-testid="text-color-custom"
+          />
+        </div>
+      )}
+    </div>
   );
 }

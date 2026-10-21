@@ -2,6 +2,7 @@ import { useEffect, useLayoutEffect, useRef, useState } from "react";
 import { Check, X } from "lucide-react";
 import { useUIStore } from "../../stores/ui";
 import { useDocumentStore } from "../../stores/document";
+import { clearActiveFieldFlusher, setActiveFieldFlusher } from "../../lib/pending-field";
 
 const MIN_WRAP_TEXT_WIDTH_PT = 120;
 
@@ -22,12 +23,48 @@ export function TextPromptOverlay({ pageNumber, zoom, pageHeightPx }: Props) {
   const [value, setValue] = useState("");
   const [size, setSize] = useState(14);
 
+  // V1.0126: what's typed into the open box, so it can be KEPT when the user
+  // clicks somewhere else (or saves) instead of pressing Enter. Before, a
+  // click elsewhere opened a fresh box and everything typed was thrown away.
+  // Escape / ✕ still discard on purpose.
+  type Draft = { tabId: string; page: number; x: number; y: number; size: number; text: string; widthPt: number };
+  const draftRef = useRef<Draft | null>(null);
+  const keepDraft = () => {
+    const d = draftRef.current;
+    draftRef.current = null;
+    if (!d || !d.text.trim()) return;
+    useDocumentStore.getState().addPendingTextEdit(d.tabId, {
+      page: d.page, xPt: d.x, yPt: d.y, size: d.size, text: d.text, widthPt: d.widthPt,
+    });
+  };
+
   useEffect(() => {
+    // The prompt moved, closed or switched page: keep what was typed.
+    keepDraft();
     if (prompt?.page === pageNumber) {
       setValue("");
       requestAnimationFrame(() => inputRef.current?.focus());
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [prompt?.page, prompt?.x, prompt?.y, pageNumber]);
+
+  // Keep what was typed if the box unmounts (tab switch, tool change).
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => () => keepDraft(), []);
+
+  // ⌘S / ⌘P while the box is open: include the typed text.
+  const promptOpenHere = prompt?.page === pageNumber;
+  useEffect(() => {
+    if (!promptOpenHere) return;
+    const flush = async () => {
+      // Keep it AND close the box, or Enter afterwards would add it twice.
+      keepDraft();
+      useUIStore.getState().setTextPrompt(null);
+    };
+    setActiveFieldFlusher(flush);
+    return () => clearActiveFieldFlusher(flush);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [promptOpenHere, prompt?.x, prompt?.y]);
 
   useLayoutEffect(() => {
     const el = inputRef.current;
@@ -42,8 +79,17 @@ export function TextPromptOverlay({ pageNumber, zoom, pageHeightPx }: Props) {
   const topPx = pageHeightPx - prompt.y * zoom;
   const inputTop = topPx - size * zoom * 1.2;
   const widthPt = Math.max(MIN_WRAP_TEXT_WIDTH_PT, prompt.widthPt ?? MIN_WRAP_TEXT_WIDTH_PT);
+  draftRef.current = activeTab
+    ? { tabId: activeTab.id, page: prompt.page, x: prompt.x, y: prompt.y, size, text: value, widthPt }
+    : null;
+
+  const cancel = () => {
+    draftRef.current = null;
+    setTextPrompt(null);
+  };
 
   const commit = () => {
+    draftRef.current = null;
     if (!activeTab || !value.trim()) {
       setTextPrompt(null);
       return;
@@ -80,7 +126,7 @@ export function TextPromptOverlay({ pageNumber, zoom, pageHeightPx }: Props) {
             commit();
           } else if (e.key === "Escape") {
             e.preventDefault();
-            setTextPrompt(null);
+            cancel();
           }
         }}
         placeholder="Type text…"
@@ -135,7 +181,7 @@ export function TextPromptOverlay({ pageNumber, zoom, pageHeightPx }: Props) {
           onPointerDown={(e) => e.stopPropagation()}
           onClick={(e) => {
             e.stopPropagation();
-            setTextPrompt(null);
+            cancel();
           }}
           className="flex h-3 w-3 items-center justify-center rounded-sm text-[var(--muted)] hover:bg-[var(--hover-bg)] hover:text-[var(--app-fg)]"
           aria-label="Cancel"

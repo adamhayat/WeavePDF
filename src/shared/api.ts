@@ -31,6 +31,9 @@ export interface WeavePDFApi {
   /** V1.0026: publish the current list of dirty tab names to main so the
    *  close / before-quit handler can show an "unsaved changes" dialog. */
   notifyDirtyTabs: (names: string[]) => void;
+  /** V1.0123: ask the user what to do about ONE dirty tab being closed.
+   *  Resolves "save" | "cancel" | "discard". */
+  confirmCloseTab: (name: string) => Promise<"save" | "cancel" | "discard">;
   /** V1.0053: main fires this when the user clicks "Save" in the
    *  unsaved-changes dialog. The renderer should save every dirty tab
    *  (Save-As as needed for path-less tabs) and call notifySaveAllComplete

@@ -1,3 +1,5 @@
+![version](https://img.shields.io/badge/version-1.0.135-blue) ![updated](https://img.shields.io/badge/updated-2026--10--21-lightgrey)
+
 # WeavePDF
 
 A local-first PDF editor for macOS. No cloud, no account, no subscription.

@@ -3,6 +3,7 @@ import { X, Sparkles, FileText, MessageSquare, PencilLine, Copy, CheckCheck } fr
 import { useDocumentStore } from "../../stores/document";
 import { pdfToMarkdown } from "../../lib/pdf-ops";
 import { cn } from "../../lib/cn";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -93,6 +94,8 @@ export function AiModal({ open, onClose }: Props) {
       /* no-op */
     }
   };
+
+  useEscapeClose(open, onClose, !busy);
 
   return (
     <div

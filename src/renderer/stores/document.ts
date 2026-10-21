@@ -1,9 +1,15 @@
 import { create } from "zustand";
+import { activeAfterClose, moveId } from "../lib/tab-order";
+import type { DiskStamp } from "../lib/open-target";
 import { pdfjsLib, type PDFDocumentProxy } from "../lib/pdfjs";
 // V1.0064: read marginsEnabled to compute the effective baked widthPt for
 // each Add Text overlay during commit. Cross-store import is intentional —
 // commit decisions depend on the user's current toggle state.
 import { useUIStore } from "./ui";
+import { computeLayerMove, effectiveZ, type LayerOp } from "../lib/layers";
+import { bakeLayers } from "../lib/bake-layers";
+import { isNoopPatch } from "../lib/noop-patch";
+import { marksAfterSave, pickStep, pushMark, pushStep, type UndoMark } from "../lib/undo-order";
 // Lazy-loaded so the pdf-lib chunk (~425 KB) doesn't pull at boot. The store
 // itself is created at module-load (which Vite imports eagerly), but every
 // pdf-ops function is only invoked from a commit* action that runs after
@@ -45,6 +51,9 @@ function capHistory(snapshots: Uint8Array[]): Uint8Array[] {
 export type PendingTextEdit = {
   id: string;
   createdAt?: number;
+  /** V1.0125: stacking order shared by the viewer and the bake — see
+   *  lib/layers.ts. Defaults to `createdAt` (newest on top). */
+  z?: number;
   page: number;
   xPt: number;
   yPt: number;
@@ -70,6 +79,15 @@ export type PendingTextEdit = {
    * offset at commit. Default left. Only meaningful for `widthPt`-bearing
    * text — single-line Edit Text replacements ignore it. */
   align?: "left" | "center" | "right" | "justify";
+  /** V1.0134: text colour (0..1 RGB). Undefined = black. Set by the colour
+   *  control in the text bar and by Add link (link blue). Rendered on screen,
+   *  baked at save, round-tripped through the WeavePDFEdits metadata. */
+  color?: RGB;
+  /** V1.0126: set when this box REPLACES a fillable form field's value
+   *  (Edit Text / "Aa ▸" on a field). The save clears that field, otherwise
+   *  every other viewer draws the field's old value ON TOP of this text
+   *  (form fields always paint above page content). */
+  formField?: string;
 };
 
 /**
@@ -79,6 +97,8 @@ export type PendingTextEdit = {
 export type PendingImageEdit = {
   id: string;
   createdAt?: number;
+  /** V1.0125: stacking order — see lib/layers.ts. */
+  z?: number;
   page: number;
   xPt: number;
   yPt: number;
@@ -127,7 +147,7 @@ export type PendingRedoEntry =
   | { kind: "image"; edit: PendingImageEdit }
   | { kind: "shape"; edit: PendingShapeEdit };
 
-export type PendingShapeEdit = { id: string; createdAt?: number; page: number } & (
+export type PendingShapeEdit = { id: string; createdAt?: number; /** V1.0125: stacking order — see lib/layers.ts. */ z?: number; page: number } & (
   | { kind: "rect"; xPt: number; yPt: number; widthPt: number; heightPt: number; color: RGB; thickness: number }
   | { kind: "ellipse"; xPt: number; yPt: number; widthPt: number; heightPt: number; color: RGB; thickness: number }
   | { kind: "line"; fromX: number; fromY: number; toX: number; toY: number; color: RGB; thickness: number }
@@ -153,6 +173,11 @@ export type DocumentTab = {
   // present so every tab the user touches gets autosaved.
   draftKey: string;
   sizeBytes: number;
+  /** V1.0133: mtime + size of the file at `path` as this tab last read or
+   *  wrote it. A Finder open of that path reuses this tab only while the
+   *  file still carries this stamp; otherwise the tab is stale and the file
+   *  is loaded fresh. null for path-less tabs and unknown vintages. */
+  disk: DiskStamp | null;
   bytes: Uint8Array | null;
   pdf: PDFDocumentProxy | null;
   numPages: number;
@@ -181,6 +206,14 @@ export type DocumentTab = {
    *  over from there). */
   pendingHistory: PendingSnapshot[];
   pendingFuture: PendingSnapshot[];
+  /** V1.0126: ONE undo timeline across `history` (bytes) and
+   *  `pendingHistory` (elements) — see lib/undo-order.ts. */
+  undoOrder: UndoMark[];
+  redoOrder: UndoMark[];
+  /** V1.0126: `undoOrder.length` at the last open/save, or null once that
+   *  state can no longer be reached by undo/redo. Undo/redo use it to know
+   *  whether the tab is back to exactly what's on disk. */
+  cleanDepth: number | null;
   // Monotonic counter incremented whenever the PDF bytes change — components
   // key renders off this so stale canvas state doesn't leak across edits.
   version: number;
@@ -211,6 +244,8 @@ type AddTabInput = {
    *  autosave keeps writing to the same slot instead of forking. */
   draftKey?: string;
   sizeBytes: number;
+  /** V1.0133: on-disk stamp of the bytes being loaded (real paths only). */
+  disk?: DiskStamp | null;
   bytes: Uint8Array;
   pdf: PDFDocumentProxy;
   numPages: number;
@@ -230,6 +265,8 @@ type DocumentStore = {
   closeTab: (id: string) => void;
   closeOtherTabs: (keepId: string) => void;
   closeTabsToRight: (id: string) => void;
+  /** V1.0129: move a tab to a new position in the strip. */
+  moveTab: (id: string, toIndex: number) => void;
   setActiveTab: (id: string) => void;
   setCurrentPage: (id: string, page: number) => void;
   setZoom: (id: string, zoom: number) => void;
@@ -241,10 +278,33 @@ type DocumentStore = {
   clearSelection: (id: string) => void;
 
   // Edits
-  applyEdit: (id: string, newBytes: Uint8Array, opts?: { newCurrentPage?: number; signed?: boolean }) => Promise<void>;
+  applyEdit: (
+    id: string,
+    newBytes: Uint8Array,
+    opts?: {
+      newCurrentPage?: number;
+      signed?: boolean;
+      /** V1.0126: for page-ORDER operations (delete / reorder / duplicate /
+       *  insert): where each old page's editable elements go. Return [] to
+       *  drop them (page deleted), several pages to copy them (duplicate).
+       *  Without it, elements stayed on their old page NUMBER, so deleting
+       *  page 1 moved page 2's elements onto page 3's content. */
+      remapPages?: (oldPage: number) => number[];
+    },
+  ) => Promise<void>;
   undo: (id: string) => Promise<void>;
   redo: (id: string) => Promise<void>;
-  markClean: (id: string, pathIfSaved: string) => void;
+  /** `savedState`: the bytes + element arrays the written file was built
+   *  from. If the tab changed since (an edit during the save), it stays
+   *  unsaved. */
+  markClean: (
+    id: string,
+    pathIfSaved: string,
+    savedState?: { bytes: Uint8Array | null; text: PendingTextEdit[]; image: PendingImageEdit[]; shape: PendingShapeEdit[] },
+    /** V1.0133: the stamp of the file just written, so a Finder reopen of
+     *  that path knows this tab shows the current file. */
+    disk?: DiskStamp | null,
+  ) => void;
   /** V1.0070: snapshot the current pending-edit state into the undo
    *  stack. Call at the START of any user-initiated mutation
    *  (drag start, property toggle, text content commit, alignment
@@ -281,8 +341,27 @@ type DocumentStore = {
   commitAllPendingShapeEdits: (id: string) => Promise<void>;
   restorePendingShapeEdits: (id: string, edits: DistributiveOmit<PendingShapeEdit, "id">[]) => void;
 
-  // Commit text + image + shape edits together (save/export/print path).
-  commitAllPending: (id: string) => Promise<void>;
+  /** V1.0126: flatten the editable elements permanently into the page and
+   *  clear them (crop / digital signature / find-and-replace only). */
+  commitAllPending: (id: string, pages?: number[]) => Promise<void>;
+  /** V1.0126: the bytes Save / Export / Print should write — clean page +
+   *  every editable element baked in their layer order, with the element
+   *  layer tagged + described so a reopen gets them back as overlays. Does
+   *  NOT modify the tab. Returns the plain bytes when nothing is pending. */
+  renderOutput: (id: string, opts?: { flat?: boolean }) => Promise<Uint8Array | null>;
+  /** V1.0126: call BEFORE a page-GEOMETRY operation (rotate, crop, n-up,
+   *  booklet, split, fit, auto-crop). If any editable element sits on one of
+   *  `pages` (default: any page), flatten them into the page first so they
+   *  turn / scale / move WITH it — elements are positioned in the page's
+   *  display space, which these operations redefine. Returns the bytes the
+   *  operation should start from. */
+  prepareGeometryEdit: (id: string, pages?: number[]) => Promise<Uint8Array | null>;
+
+  /** V1.0125: Arrange — change an element's place in the page's stacking
+   *  order (Bring to Front / Forward, Send Backward / to Back). The same
+   *  order drives the viewer AND the saved file (lib/layers.ts). One undo
+   *  step. No-op when the element is already at that end. */
+  moveLayer: (tabId: string, editId: string, op: LayerOp) => void;
 
   /** V1.0057: snap a pending text or image to the page's print margins or
    *  center. Async because page width/height come from `tab.pdf.getPage(n)`.
@@ -326,6 +405,34 @@ async function loadPdf(bytes: Uint8Array): Promise<PDFDocumentProxy> {
 const inFlight = new Set<string>();
 let pendingEditSeq = 0;
 
+/** V1.0123: wait for a tab's in-flight edit to finish. `applyEdit` and
+ *  `commitAllPending` both SILENTLY return when the tab is busy, so a save
+ *  landing on top of a still-running edit (a form-field commit, say) would
+ *  skip the bake, write the pre-edit bytes and still toast "Saved.".
+ *  Callers that must not be skipped await this first. Returns false if the
+ *  edit is still running after `timeoutMs` so the caller can refuse rather
+ *  than write stale bytes. */
+/** V1.0123: characters the last text bake had to substitute (see
+ *  `sanitizeStandardFontText`). Read-and-clear, so the SAVE can report them in
+ *  its own toast — toasting from inside the bake loses the message, because
+ *  the toast is single-slot and "Saved." lands moments later. */
+let lastUnsupportedChars: string[] = [];
+
+export function takeLastUnsupportedChars(): string[] {
+  const out = lastUnsupportedChars;
+  lastUnsupportedChars = [];
+  return out;
+}
+
+export async function waitForTabIdle(id: string, timeoutMs = 10_000): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (inFlight.has(id)) {
+    if (Date.now() > deadline) return false;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return true;
+}
+
 function nextPendingEditOrder(): number {
   pendingEditSeq += 1;
   return pendingEditSeq;
@@ -346,10 +453,11 @@ function bytesToBase64(bytes: Uint8Array): string {
 function shapeForMetadata(
   edit: PendingShapeEdit,
 ): import("../lib/pdf-ops").WeavePdfShapeEdit {
-  const { id: _id, createdAt: _createdAt, ...rest } = edit;
+  const { id: _id, createdAt: _createdAt, z: _z, ...rest } = edit;
   void _id;
   void _createdAt;
-  return rest as import("../lib/pdf-ops").WeavePdfShapeEdit;
+  void _z;
+  return { ...rest, z: effectiveZ(edit) } as import("../lib/pdf-ops").WeavePdfShapeEdit;
 }
 
 /**
@@ -376,19 +484,133 @@ function hasPendingEdits(tab: DocumentTab): boolean {
   );
 }
 
-function latestPendingEdit(tab: DocumentTab): { kind: "text" | "image" | "shape"; id: string } | null {
-  const candidates: Array<{ kind: "text" | "image" | "shape"; id: string; order: number }> = [];
-  tab.pendingTextEdits.forEach((e, index) =>
-    candidates.push({ kind: "text", id: e.id, order: e.createdAt ?? index }),
-  );
-  tab.pendingImageEdits.forEach((e, index) =>
-    candidates.push({ kind: "image", id: e.id, order: e.createdAt ?? index }),
-  );
-  tab.pendingShapeEdits.forEach((e, index) =>
-    candidates.push({ kind: "shape", id: e.id, order: e.createdAt ?? index }),
-  );
-  candidates.sort((a, b) => b.order - a.order);
-  return candidates[0] ?? null;
+
+/** V1.0126: undoOrder + cleanDepth after recording one more step. */
+function stepFields(t: DocumentTab, mark: UndoMark): { undoOrder: UndoMark[]; cleanDepth: number | null } {
+  const r = pushStep(t.undoOrder, t.cleanDepth, mark);
+  return { undoOrder: r.order, cleanDepth: r.cleanDepth };
+}
+
+/** V1.0126: move every editable element with its page after a page-order
+ *  operation. Elements on a deleted page go; a duplicated page's elements are
+ *  copied (fresh ids, on top of that page). */
+function remapPendingPages(
+  t: DocumentTab,
+  remap: (oldPage: number) => number[],
+): { text: PendingTextEdit[]; image: PendingImageEdit[]; shape: PendingShapeEdit[] } {
+  const move = <T extends { id: string; page: number; z?: number; createdAt?: number }>(list: T[]): T[] =>
+    list.flatMap((e) =>
+      remap(e.page).map((page, i) => {
+        if (i === 0) return { ...e, page };
+        const seq = nextPendingEditOrder();
+        return { ...e, page, id: crypto.randomUUID(), createdAt: seq, z: seq };
+      }),
+    );
+  return { text: move(t.pendingTextEdits), image: move(t.pendingImageEdits), shape: move(t.pendingShapeEdits) };
+}
+
+
+/** V1.0126: bake a tab's editable elements onto its clean page bytes.
+ *  `editable: true` (Save/Export/Print) also tags the baked streams and writes
+ *  the element metadata so a reopen peels them back off as overlays;
+ *  `editable: false` (flatten) writes plain bytes. A redaction rasterises the
+ *  page, which can't be peeled back, so a document with a pending redact is
+ *  always written flat — it then reopens exactly as it looks, never doubled. */
+async function buildOutputBytes(
+  tab: DocumentTab,
+  opts: { editable: boolean; pages?: number[] },
+): Promise<{ bytes: Uint8Array; editable: boolean; baked: Set<string> }> {
+  const base = tab.bytes!;
+  // Reset first, so a later save never reports characters from an earlier
+  // print/export bake.
+  lastUnsupportedChars = [];
+  if (!hasPendingEdits(tab)) return { bytes: base, editable: false, baked: new Set() };
+  const ops = await loadPdfOps();
+
+  // V1.0123: characters no PDF standard font can draw are substituted at
+  // bake time (they used to abort the entire save). Record them for the
+  // SAVE's toast.
+  lastUnsupportedChars = [
+    ...new Set(
+      [...tab.pendingTextEdits, ...tab.pendingShapeEdits.filter((s) => s.kind === "sticky")]
+        .flatMap((e) => ops.findUnsupportedStandardFontChars((e as { text?: string }).text ?? "")),
+    ),
+  ];
+
+  const { PDFDocument } = await import("pdf-lib");
+  const probe = await PDFDocument.load(base, { ignoreEncryption: true });
+  // V1.0126: only elements on pages that exist (an element stranded past
+  // the last page used to make every save throw) and, for a partial flatten,
+  // only the requested pages.
+  const pageCount = probe.getPageCount();
+  const keep = (e: { page: number }) =>
+    e.page >= 1 && e.page <= pageCount && (!opts.pages || opts.pages.includes(e.page));
+  const textEdits = tab.pendingTextEdits.filter(keep).sort((a, b) => a.page - b.page);
+  const imageEdits = tab.pendingImageEdits.filter(keep).sort((a, b) => a.page - b.page);
+  const shapeEdits = tab.pendingShapeEdits.filter(keep).sort((a, b) => a.page - b.page);
+  const bakedIds = new Set([...textEdits, ...imageEdits, ...shapeEdits].map((e) => e.id));
+  // V1.0126: blank the form fields these text boxes replace, BEFORE baking, so
+  // the tag diff below is taken against the same starting page.
+  const replacedFields = [...new Set(textEdits.map((e) => e.formField).filter((n): n is string => !!n))];
+  const startBytes = replacedFields.length > 0
+    ? await ops.setFormFields(base, replacedFields.map((name) => ({ name, kind: "text" as const, value: "" })))
+    : base;
+  // V1.0125: ONE draw order, shared with the viewer (lib/layers.ts).
+  const baked = await bakeLayers(ops, startBytes, { text: textEdits, image: imageEdits, shape: shapeEdits }, {
+    pageWidth: (page) => probe.getPage(page - 1).getWidth(),
+    marginsEnabled: useUIStore.getState().marginsEnabled,
+  });
+  if (!opts.editable || shapeEdits.some((e) => e.kind === "redact")) {
+    return { bytes: baked.bytes, editable: false, baked: bakedIds };
+  }
+  const tagged = await ops.tagWeaveBakes(startBytes, baked.bytes);
+  if (!tagged) return { bytes: baked.bytes, editable: false, baked: bakedIds };
+  const bytes = await ops.embedWeaveMetadata(tagged, {
+    version: 3,
+    // V1.0126: page geometry at save time. If another tool rotates, crops or
+    // re-pages the file, a reopen sees the mismatch and opens it flat instead
+    // of restoring elements at stale positions.
+    pages: probe.getPages().map((p) => {
+      const b = p.getCropBox();
+      return { rotate: p.getRotation().angle, box: [b.x, b.y, b.width, b.height] };
+    }),
+    textEdits: textEdits.map((e) => ({
+      page: e.page,
+      xPt: e.xPt,
+      yPt: e.yPt,
+      size: e.size,
+      text: e.text,
+      widthPt: e.widthPt,
+      bold: e.bold,
+      italic: e.italic,
+      align: e.align,
+      fontName: e.fontName,
+      color: e.color,
+      // V1.0126: the cover for ORIGINAL page content only (Edit Text). The
+      // old v2 schema stored the bake's own bbox here because bakes stacked.
+      whiteout: e.whiteout,
+      formField: e.formField,
+      z: effectiveZ(e),
+    })),
+    imageEdits: imageEdits.map((e) => ({
+      page: e.page,
+      xPt: e.xPt,
+      yPt: e.yPt,
+      widthPt: e.widthPt,
+      heightPt: e.heightPt,
+      mime: e.mime,
+      dataBase64: bytesToBase64(e.bytes),
+      z: effectiveZ(e),
+      rotation: e.rotation,
+      opacity: e.opacity,
+      flipH: e.flipH,
+      flipV: e.flipV,
+      border: e.border,
+      dropShadow: e.dropShadow,
+    })),
+    shapeEdits: shapeEdits.map(shapeForMetadata),
+  });
+  return { bytes, editable: true, baked: bakedIds };
 }
 
 export const useDocumentStore = create<DocumentStore>((set, get) => ({
@@ -417,6 +639,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       saveInPlace: init.saveInPlace ?? !!init.path,
       draftKey: init.draftKey ?? init.path ?? `weavepdf-virtual://${id}`,
       sizeBytes: init.sizeBytes,
+      disk: init.path ? (init.disk ?? null) : null,
       bytes: init.bytes,
       pdf: init.pdf,
       numPages: init.numPages,
@@ -433,6 +656,9 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       pendingRedoStack: [],
       pendingHistory: [],
       pendingFuture: [],
+      undoOrder: [],
+      redoOrder: [],
+      cleanDepth: 0,
       version: 0,
     };
     // If the previously-active tab was a blank one (created via ⌘T but never
@@ -457,6 +683,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       saveInPlace: false,
       draftKey: `weavepdf-virtual://${id}`,
       sizeBytes: 0,
+      disk: null,
       bytes: null,
       pdf: null,
       numPages: 0,
@@ -473,6 +700,9 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       pendingRedoStack: [],
       pendingHistory: [],
       pendingFuture: [],
+      undoOrder: [],
+      redoOrder: [],
+      cleanDepth: 0,
       version: 0,
     };
     set((s) => ({ tabs: [...s.tabs, tab], activeTabId: id }));
@@ -484,11 +714,8 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       const tab = s.tabs.find((t) => t.id === id);
       void tab?.pdf?.destroy();
       const nextTabs = s.tabs.filter((t) => t.id !== id);
-      const nextActive =
-        s.activeTabId === id
-          ? (nextTabs[nextTabs.length - 1]?.id ?? null)
-          : s.activeTabId;
-      return { tabs: nextTabs, activeTabId: nextActive };
+      // V1.0131: closing the active tab selects the FIRST tab (was the last).
+      return { tabs: nextTabs, activeTabId: activeAfterClose(nextTabs, s.activeTabId) };
     });
   },
 
@@ -506,13 +733,15 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       if (idx < 0) return s;
       for (let i = idx + 1; i < s.tabs.length; i++) void s.tabs[i].pdf?.destroy();
       const nextTabs = s.tabs.slice(0, idx + 1);
-      const activeStillOpen = nextTabs.some((t) => t.id === s.activeTabId);
-      return {
-        tabs: nextTabs,
-        activeTabId: activeStillOpen ? s.activeTabId : (nextTabs[nextTabs.length - 1]?.id ?? null),
-      };
+      return { tabs: nextTabs, activeTabId: activeAfterClose(nextTabs, s.activeTabId) };
     });
   },
+
+  moveTab: (id, toIndex) =>
+    set((s) => {
+      const next = moveId(s.tabs, id, toIndex);
+      return next === s.tabs ? s : { tabs: next };
+    }),
 
   setActiveTab: (id) => set({ activeTabId: id }),
 
@@ -596,8 +825,24 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
         tabs: s.tabs.map((t) => {
           if (t.id !== id) return t;
           const nextHistory = [...t.history, prevBytes];
+          const remap = opts?.remapPages;
+          const moved = remap ? remapPendingPages(t, remap) : null;
           return {
             ...t,
+            ...(moved
+              ? {
+                  pendingTextEdits: moved.text,
+                  pendingImageEdits: moved.image,
+                  pendingShapeEdits: moved.shape,
+                  pendingHistory: [
+                    ...t.pendingHistory,
+                    { text: t.pendingTextEdits, image: t.pendingImageEdits, shape: t.pendingShapeEdits },
+                  ].slice(-30),
+                  pendingFuture: [],
+                }
+              : {}),
+            ...stepFields(t, moved ? "both" : "bytes"),
+            redoOrder: [],
             bytes: newBytes,
             pdf: newPdf,
             numPages: newPdf.numPages,
@@ -642,7 +887,9 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
           last.image === t.pendingImageEdits &&
           last.shape === t.pendingShapeEdits
         ) {
-          return t;
+          // V1.0126: no new snapshot needed, but this IS a new action — the
+          // redo future must still go, or ⇧⌘Z replays a stale page change.
+          return { ...t, pendingFuture: [], redoStack: [], redoOrder: [] };
         }
         const snap: PendingSnapshot = {
           text: t.pendingTextEdits,
@@ -652,8 +899,11 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
         return {
           ...t,
           pendingHistory: [...t.pendingHistory, snap].slice(-30),
-          // Any new step invalidates the redo future.
+          // Any new step invalidates the redo future — element AND page.
           pendingFuture: [],
+          redoStack: [],
+          ...stepFields(t, "pending"),
+          redoOrder: [],
         };
       }),
     }));
@@ -661,114 +911,72 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
 
   undo: async (id) => {
     if (inFlight.has(id)) return;
-    // V1.0070: snapshot-based undo runs first — restores pending state
-    // to the most recent snapshot pushed by `pushUndoStep`. Pre-V1.0070
-    // a single ⌘Z deleted the entire pending edit, losing all the
-    // intermediate property changes (size, bold, drag, etc.); the
-    // snapshot stack steps back one user action at a time.
-    const snapTab = get().tabs.find((t) => t.id === id);
-    if (snapTab && snapTab.pendingHistory.length > 0) {
-      set((s) => ({
-        tabs: s.tabs.map((t) => {
-          if (t.id !== id) return t;
-          const snap = t.pendingHistory[t.pendingHistory.length - 1];
-          const currentSnap: PendingSnapshot = {
-            text: t.pendingTextEdits,
-            image: t.pendingImageEdits,
-            shape: t.pendingShapeEdits,
-          };
-          const restoredAny =
-            snap.text.length + snap.image.length + snap.shape.length > 0;
-          return {
-            ...t,
-            pendingTextEdits: snap.text,
-            pendingImageEdits: snap.image,
-            pendingShapeEdits: snap.shape,
-            pendingHistory: t.pendingHistory.slice(0, -1),
-            pendingFuture: [...t.pendingFuture, currentSnap].slice(-30),
-            dirty: t.history.length > 0 || restoredAny,
-          };
-        }),
-      }));
-      return;
-    }
-    const pendingTab = get().tabs.find((t) => t.id === id);
-    const pending = pendingTab ? latestPendingEdit(pendingTab) : null;
-    if (pendingTab && pending) {
-      set((s) => ({
-        tabs: s.tabs.map((t) => {
-          if (t.id !== id) return t;
-          // V1.0057: capture the removed pending edit so redo can restore
-          // it. Without this, undoing a pending overlay deleted it
-          // permanently — the "elements disappear" data-loss bug.
-          let redoEntry: PendingRedoEntry | null = null;
-          let pendingTextEdits = t.pendingTextEdits;
-          let pendingImageEdits = t.pendingImageEdits;
-          let pendingShapeEdits = t.pendingShapeEdits;
-          if (pending.kind === "text") {
-            const found = t.pendingTextEdits.find((e) => e.id === pending.id);
-            if (found) redoEntry = { kind: "text", edit: found };
-            pendingTextEdits = t.pendingTextEdits.filter((e) => e.id !== pending.id);
-          } else if (pending.kind === "image") {
-            const found = t.pendingImageEdits.find((e) => e.id === pending.id);
-            if (found) redoEntry = { kind: "image", edit: found };
-            pendingImageEdits = t.pendingImageEdits.filter((e) => e.id !== pending.id);
-          } else {
-            const found = t.pendingShapeEdits.find((e) => e.id === pending.id);
-            if (found) redoEntry = { kind: "shape", edit: found };
-            pendingShapeEdits = t.pendingShapeEdits.filter((e) => e.id !== pending.id);
-          }
-          const next = {
-            ...t,
-            pendingTextEdits,
-            pendingImageEdits,
-            pendingShapeEdits,
-          };
-          return {
-            ...next,
-            pendingRedoStack: redoEntry
-              ? [...t.pendingRedoStack, redoEntry].slice(-20)
-              : t.pendingRedoStack,
-            dirty: t.history.length > 0 || hasPendingEdits(next),
-          };
-        }),
-      }));
-      return;
-    }
+    // V1.0126: undo the most RECENT step, whichever kind it was (see
+    // lib/undo-order.ts). Pre-V1.0126 element changes were always undone
+    // before page changes, and with no element history left ⌘Z deleted the
+    // newest element outright — so after reopening a saved file, ⌘Z deleted
+    // your saved elements one by one.
+    const tab = get().tabs.find((t) => t.id === id);
+    if (!tab) return;
+    const step = pickStep(tab.undoOrder, tab.pendingHistory.length > 0, tab.history.length > 0);
+    if (!step) return;
+    const doPending = step.mark !== "bytes";
+    const doBytes = step.mark !== "pending";
     inFlight.add(id);
     try {
-      const current = get().tabs.find((t) => t.id === id);
-      if (!current || current.history.length === 0 || !current.bytes) return;
-      const prevBytes = current.history[current.history.length - 1];
-      const undoneBytes = current.bytes;
-      const newPdf = await loadPdf(prevBytes);
-      void current.pdf?.destroy();
+      let prevBytes: Uint8Array | null = null;
+      let newPdf: PDFDocumentProxy | null = null;
+      if (doBytes && tab.bytes) {
+        prevBytes = tab.history[tab.history.length - 1];
+        newPdf = await loadPdf(prevBytes);
+        void tab.pdf?.destroy();
+      }
       set((s) => ({
         tabs: s.tabs.map((t) => {
           if (t.id !== id) return t;
-          const nextHistory = t.history.slice(0, -1);
-          return {
+          // Skipped stale marks mean we can't vouch that this equals the
+          // saved state any more.
+          const skipped = t.undoOrder.length - 1 > step.rest.length;
+          const cleanDepth = skipped ? null : t.cleanDepth;
+          let next: DocumentTab = {
             ...t,
-            bytes: prevBytes,
-            pdf: newPdf,
-            numPages: newPdf.numPages,
-            sizeBytes: prevBytes.byteLength,
-            currentPage: Math.min(t.currentPage, newPdf.numPages),
-            selectedPages: new Set(),
-            history: nextHistory,
-            // Push the state we just undid onto the redo stack.
-            redoStack: capHistory([...t.redoStack, undoneBytes]),
-            // Still dirty only if earlier edits remain to undo.
-            dirty:
-              nextHistory.length > 0 ||
-              t.pendingTextEdits.length > 0 ||
-              t.pendingImageEdits.length > 0 ||
-              t.pendingShapeEdits.length > 0,
-            // Stepping through history can't be trusted to preserve a valid
-            // signature — under-claim rather than show a broken one as signed.
-            signed: false,
-            version: t.version + 1,
+            undoOrder: step.rest,
+            redoOrder: pushMark(t.redoOrder, step.mark),
+            cleanDepth,
+            dirty: step.rest.length !== cleanDepth,
           };
+          if (doPending) {
+            const snap = t.pendingHistory[t.pendingHistory.length - 1];
+            next = {
+              ...next,
+              pendingTextEdits: snap.text,
+              pendingImageEdits: snap.image,
+              pendingShapeEdits: snap.shape,
+              pendingHistory: t.pendingHistory.slice(0, -1),
+              pendingFuture: [
+                ...t.pendingFuture,
+                { text: t.pendingTextEdits, image: t.pendingImageEdits, shape: t.pendingShapeEdits },
+              ].slice(-30),
+            };
+          }
+          if (doBytes && prevBytes && newPdf && t.bytes) {
+            next = {
+              ...next,
+              bytes: prevBytes,
+              pdf: newPdf,
+              numPages: newPdf.numPages,
+              sizeBytes: prevBytes.byteLength,
+              currentPage: Math.min(t.currentPage, newPdf.numPages),
+              selectedPages: new Set(),
+              history: t.history.slice(0, -1),
+              redoStack: capHistory([...t.redoStack, t.bytes]),
+              // Stepping through history can't be trusted to preserve a
+              // valid signature — under-claim rather than show a broken one.
+              signed: false,
+              version: t.version + 1,
+            };
+          }
+          return next;
         }),
       }));
     } catch (err) {
@@ -781,85 +989,71 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
 
   redo: async (id) => {
     if (inFlight.has(id)) return;
-    // V1.0070: snapshot-based redo runs first.
-    const snapTab = get().tabs.find((t) => t.id === id);
-    if (snapTab && snapTab.pendingFuture.length > 0) {
-      set((s) => ({
-        tabs: s.tabs.map((t) => {
-          if (t.id !== id) return t;
-          const snap = t.pendingFuture[t.pendingFuture.length - 1];
-          const currentSnap: PendingSnapshot = {
-            text: t.pendingTextEdits,
-            image: t.pendingImageEdits,
-            shape: t.pendingShapeEdits,
-          };
-          return {
-            ...t,
-            pendingTextEdits: snap.text,
-            pendingImageEdits: snap.image,
-            pendingShapeEdits: snap.shape,
-            pendingHistory: [...t.pendingHistory, currentSnap].slice(-30),
-            pendingFuture: t.pendingFuture.slice(0, -1),
-            dirty: true,
-          };
-        }),
-      }));
-      return;
-    }
-    // V1.0057: pending-edits redo runs ahead of committed-bytes redo.
-    // Mirrors the undo precedence (pending edits get popped first there
-    // too) so the user can step back through their action history in
-    // reverse order.
-    const current = get().tabs.find((t) => t.id === id);
-    if (current && current.pendingRedoStack.length > 0) {
-      const entry = current.pendingRedoStack[current.pendingRedoStack.length - 1];
-      set((s) => ({
-        tabs: s.tabs.map((t) => {
-          if (t.id !== id) return t;
-          const next = { ...t };
-          if (entry.kind === "text") {
-            next.pendingTextEdits = [...t.pendingTextEdits, entry.edit];
-          } else if (entry.kind === "image") {
-            next.pendingImageEdits = [...t.pendingImageEdits, entry.edit];
-          } else {
-            next.pendingShapeEdits = [...t.pendingShapeEdits, entry.edit];
-          }
-          return {
-            ...next,
-            pendingRedoStack: t.pendingRedoStack.slice(0, -1),
-            dirty: true,
-          };
-        }),
-      }));
-      return;
-    }
+    const tab = get().tabs.find((t) => t.id === id);
+    if (!tab) return;
+    const step = pickStep(tab.redoOrder, tab.pendingFuture.length > 0, tab.redoStack.length > 0);
+    if (!step) return;
+    const doPending = step.mark !== "bytes";
+    const doBytes = step.mark !== "pending";
     inFlight.add(id);
     try {
-      const current = get().tabs.find((t) => t.id === id);
-      if (!current || current.redoStack.length === 0 || !current.bytes) return;
-      const nextBytes = current.redoStack[current.redoStack.length - 1];
-      const redoneFrom = current.bytes;
-      const newPdf = await loadPdf(nextBytes);
-      void current.pdf?.destroy();
+      let nextBytes: Uint8Array | null = null;
+      let newPdf: PDFDocumentProxy | null = null;
+      if (doBytes && tab.bytes) {
+        nextBytes = tab.redoStack[tab.redoStack.length - 1];
+        newPdf = await loadPdf(nextBytes);
+        void tab.pdf?.destroy();
+      }
       set((s) => ({
         tabs: s.tabs.map((t) => {
           if (t.id !== id) return t;
-          return {
+          const pushed = pushStep(t.undoOrder, t.cleanDepth, step.mark);
+          // A redo is not a new branch — don't let pushStep invalidate the
+          // save point for being "below" it; only the cap shift applies.
+          const skipped = t.redoOrder.length - 1 > step.rest.length;
+          const cleanDepth = skipped
+            ? null
+            : t.cleanDepth === null
+              ? null
+              : t.cleanDepth - (t.undoOrder.length + 1 - pushed.order.length);
+          const undoOrder = pushed.order;
+          let next: DocumentTab = {
             ...t,
-            bytes: nextBytes,
-            pdf: newPdf,
-            numPages: newPdf.numPages,
-            sizeBytes: nextBytes.byteLength,
-            currentPage: Math.min(t.currentPage, newPdf.numPages),
-            selectedPages: new Set(),
-            // The state we were at goes back onto the history stack so the
-            // next ⌘Z returns to it.
-            history: capHistory([...t.history, redoneFrom]),
-            redoStack: t.redoStack.slice(0, -1),
-            dirty: true,
-            signed: false,
-            version: t.version + 1,
+            undoOrder,
+            redoOrder: step.rest,
+            cleanDepth,
+            dirty: undoOrder.length !== cleanDepth,
           };
+          if (doPending) {
+            const snap = t.pendingFuture[t.pendingFuture.length - 1];
+            next = {
+              ...next,
+              pendingTextEdits: snap.text,
+              pendingImageEdits: snap.image,
+              pendingShapeEdits: snap.shape,
+              pendingHistory: [
+                ...t.pendingHistory,
+                { text: t.pendingTextEdits, image: t.pendingImageEdits, shape: t.pendingShapeEdits },
+              ].slice(-30),
+              pendingFuture: t.pendingFuture.slice(0, -1),
+            };
+          }
+          if (doBytes && nextBytes && newPdf && t.bytes) {
+            next = {
+              ...next,
+              bytes: nextBytes,
+              pdf: newPdf,
+              numPages: newPdf.numPages,
+              sizeBytes: nextBytes.byteLength,
+              currentPage: Math.min(t.currentPage, newPdf.numPages),
+              selectedPages: new Set(),
+              history: capHistory([...t.history, t.bytes]),
+              redoStack: t.redoStack.slice(0, -1),
+              signed: false,
+              version: t.version + 1,
+            };
+          }
+          return next;
         }),
       }));
     } catch (err) {
@@ -870,14 +1064,27 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
     }
   },
 
-  markClean: (id, pathIfSaved) =>
+  markClean: (id, pathIfSaved, savedState, disk) =>
     set((s) => ({
-      tabs: s.tabs.map((t) =>
-        t.id === id
-          ? {
+      tabs: s.tabs.map((t) => {
+        if (t.id !== id) return t;
+        // V1.0126: anything changed WHILE the save was being written (a drag,
+        // typing) isn't in the file — keep the tab unsaved.
+        const changedDuringSave =
+          !!savedState &&
+          (savedState.bytes !== t.bytes ||
+            savedState.text !== t.pendingTextEdits ||
+            savedState.image !== t.pendingImageEdits ||
+            savedState.shape !== t.pendingShapeEdits);
+        const kept = marksAfterSave(t.undoOrder);
+        return {
               ...t,
-              dirty: false,
+              dirty: changedDuringSave,
               path: pathIfSaved,
+              // V1.0133: what is on disk at `path` now. Unknown (older write
+              // results) → null, which a later Finder open treats as stale
+              // and refreshes rather than trusts.
+              disk: disk ?? null,
               saveInPlace: true,
               name: pathIfSaved.split("/").pop() ?? t.name,
               // Re-key autosave to the saved path so subsequent autosaves
@@ -890,9 +1097,16 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
               history: [],
               redoStack: [],
               pendingRedoStack: [],
-            }
-          : t,
-      ),
+              // V1.0126: page history is gone, so only element steps taken
+              // since the last page change stay undoable (marksAfterSave);
+              // redo is cleared; the save point is "here".
+              undoOrder: kept,
+              pendingHistory: kept.length > 0 ? t.pendingHistory.slice(-kept.length) : [],
+              redoOrder: [],
+              pendingFuture: [],
+              cleanDepth: changedDuringSave ? null : kept.length,
+            };
+      }),
     })),
 
   addPendingTextEdit: (id, edit) => {
@@ -905,7 +1119,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
         t.id === id
           ? {
               ...t,
-              pendingTextEdits: [...t.pendingTextEdits, { id: editId, createdAt, ...edit }],
+              pendingTextEdits: [...t.pendingTextEdits, { id: editId, createdAt, z: createdAt, ...edit }],
               // V1.0057: any new edit invalidates the pending-redo stack
               // (you took a different branch — the un-undone overlays are
               // no longer the next step forward).
@@ -919,7 +1133,13 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
     return editId;
   },
 
-  updatePendingTextEdit: (id, editId, patch) =>
+  updatePendingTextEdit: (id, editId, patch) => {
+    // V1.0126: a patch that changes nothing must not mark the tab unsaved.
+    // Committing a text box you only clicked into (or that ⌘S already
+    // flushed) used to set dirty=true, so closing right after a save asked
+    // "Save your changes?" for changes that didn't exist.
+    const cur = get().tabs.find((t) => t.id === id)?.pendingTextEdits.find((e) => e.id === editId);
+    if (!cur || isNoopPatch(cur as unknown as Record<string, unknown>, patch as Record<string, unknown>)) return;
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.id === id
@@ -934,7 +1154,8 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             }
           : t,
       ),
-    })),
+    }));
+  },
 
   removePendingTextEdit: (id, editId) => {
     // V1.0070: snapshot BEFORE removing so ⌘Z restores the edit.
@@ -943,13 +1164,11 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       tabs: s.tabs.map((t) => {
         if (t.id !== id) return t;
         const pendingTextEdits = t.pendingTextEdits.filter((e) => e.id !== editId);
-        // If there are no more pending edits AND no applied history, the
-        // tab is back to its loaded state — drop the dirty flag.
-        const stillDirty =
-          t.history.length > 0 ||
-          pendingTextEdits.length > 0 ||
-          t.pendingImageEdits.length > 0 ||
-          t.pendingShapeEdits.length > 0;
+        // V1.0126: removing an element is a change. The old "back to its
+        // loaded state" guess (no history, no elements) was wrong once
+        // elements are restored from the file or survive a save — deleting
+        // the last one showed the tab as saved while the file still had it.
+        const stillDirty = true;
         return { ...t, pendingTextEdits, pendingFuture: [], dirty: stillDirty };
       }),
     }));
@@ -966,6 +1185,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
           ...e,
           id: crypto.randomUUID(),
           createdAt: nextPendingEditOrder(),
+          z: e.z,
         }));
         return {
           ...t,
@@ -985,6 +1205,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
           ...e,
           id: crypto.randomUUID(),
           createdAt: nextPendingEditOrder(),
+          z: e.z,
         }));
         return {
           ...t,
@@ -1001,8 +1222,27 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       const tab = get().tabs.find((t) => t.id === id);
       if (!tab?.bytes || tab.pendingTextEdits.length === 0) return;
       let bytes: Uint8Array = tab.bytes;
-      const { whiteoutRegion, drawText, drawWrappedText, embedWeaveMetadata } =
-        await loadPdfOps();
+      const {
+        whiteoutRegion,
+        drawText,
+        drawWrappedText,
+        embedWeaveMetadata,
+        findUnsupportedStandardFontChars,
+      } = await loadPdfOps();
+      // V1.0123: PDF standard fonts are WinAnsi — arrows, emoji and non-Latin
+      // scripts can't be drawn with them. They used to abort the entire save
+      // ("Couldn't save: WinAnsi cannot encode …"); now they're substituted at
+      // bake time, so say so instead of silently altering the user's words.
+      const unsupported = [
+        ...new Set(
+          tab.pendingTextEdits.flatMap((e) => findUnsupportedStandardFontChars(e.text)),
+        ),
+      ];
+      // Don't toast here: the save that triggered this bake shows "Saved."
+      // milliseconds later, and the toast is single-slot — the warning would be
+      // wiped before it could be read. Hand it to the caller instead, which
+      // folds it into the one toast the user actually sees.
+      lastUnsupportedChars = unsupported;
       const PAGE_MARGIN = 36;
       const marginsEnabled = useUIStore.getState().marginsEnabled;
       const { PDFDocument } = await import("pdf-lib");
@@ -1040,6 +1280,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             bold: e.bold,
             italic: e.italic,
             align: e.align,
+            color: e.color,
           });
           bytes = r.bytes;
           baked = r.bbox;
@@ -1052,6 +1293,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             font: e.fontName as Parameters<typeof drawText>[2]["font"],
             bold: e.bold,
             italic: e.italic,
+            color: e.color,
           });
           bytes = r.bytes;
           baked = r.bbox;
@@ -1068,6 +1310,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             italic: e.italic,
             align: e.align,
             fontName: e.fontName,
+            color: e.color,
             whiteout: baked,
           });
         }
@@ -1118,7 +1361,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
         t.id === id
           ? {
               ...t,
-              pendingImageEdits: [...t.pendingImageEdits, { id: editId, createdAt, ...edit }],
+              pendingImageEdits: [...t.pendingImageEdits, { id: editId, createdAt, z: createdAt, ...edit }],
               pendingRedoStack: [],
               pendingFuture: [],
               dirty: true,
@@ -1129,7 +1372,13 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
     return editId;
   },
 
-  updatePendingImageEdit: (id, editId, patch) =>
+  updatePendingImageEdit: (id, editId, patch) => {
+    // V1.0126: a patch that changes nothing must not mark the tab unsaved.
+    // Committing a text box you only clicked into (or that ⌘S already
+    // flushed) used to set dirty=true, so closing right after a save asked
+    // "Save your changes?" for changes that didn't exist.
+    const cur = get().tabs.find((t) => t.id === id)?.pendingImageEdits.find((e) => e.id === editId);
+    if (!cur || isNoopPatch(cur as unknown as Record<string, unknown>, patch as Record<string, unknown>)) return;
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.id === id
@@ -1145,7 +1394,8 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             }
           : t,
       ),
-    })),
+    }));
+  },
 
   removePendingImageEdit: (id, editId) => {
     get().pushUndoStep(id);
@@ -1153,11 +1403,8 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       tabs: s.tabs.map((t) => {
         if (t.id !== id) return t;
         const pendingImageEdits = t.pendingImageEdits.filter((e) => e.id !== editId);
-        const stillDirty =
-          t.history.length > 0 ||
-          pendingImageEdits.length > 0 ||
-          t.pendingTextEdits.length > 0 ||
-          t.pendingShapeEdits.length > 0;
+        // V1.0126: removing an element is a change (see removePendingTextEdit).
+        const stillDirty = true;
         return { ...t, pendingImageEdits, pendingFuture: [], dirty: stillDirty };
       }),
     }));
@@ -1172,7 +1419,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
         t.id === id
           ? {
               ...t,
-              pendingShapeEdits: [...t.pendingShapeEdits, { id: editId, createdAt, ...edit } as PendingShapeEdit],
+              pendingShapeEdits: [...t.pendingShapeEdits, { id: editId, createdAt, z: createdAt, ...edit } as PendingShapeEdit],
               pendingRedoStack: [],
               pendingFuture: [],
               dirty: true,
@@ -1183,7 +1430,13 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
     return editId;
   },
 
-  updatePendingShapeEdit: (id, editId, patch) =>
+  updatePendingShapeEdit: (id, editId, patch) => {
+    // V1.0126: a patch that changes nothing must not mark the tab unsaved.
+    // Committing a text box you only clicked into (or that ⌘S already
+    // flushed) used to set dirty=true, so closing right after a save asked
+    // "Save your changes?" for changes that didn't exist.
+    const cur = get().tabs.find((t) => t.id === id)?.pendingShapeEdits.find((e) => e.id === editId);
+    if (!cur || isNoopPatch(cur as unknown as Record<string, unknown>, patch as Record<string, unknown>)) return;
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.id === id
@@ -1197,7 +1450,8 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             }
           : t,
       ),
-    })),
+    }));
+  },
 
   removePendingShapeEdit: (id, editId) => {
     get().pushUndoStep(id);
@@ -1205,11 +1459,8 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
       tabs: s.tabs.map((t) => {
         if (t.id !== id) return t;
         const pendingShapeEdits = t.pendingShapeEdits.filter((e) => e.id !== editId);
-        const stillDirty =
-          t.history.length > 0 ||
-          pendingShapeEdits.length > 0 ||
-          t.pendingTextEdits.length > 0 ||
-          t.pendingImageEdits.length > 0;
+        // V1.0126: removing an element is a change (see removePendingTextEdit).
+        const stillDirty = true;
         return { ...t, pendingShapeEdits, pendingFuture: [], dirty: stillDirty };
       }),
     }));
@@ -1224,6 +1475,7 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
           ...e,
           id: crypto.randomUUID(),
           createdAt: nextPendingEditOrder(),
+          z: e.z,
         })) as PendingShapeEdit[];
         return {
           ...t,
@@ -1365,182 +1617,63 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
     }
   },
 
-  commitAllPending: async (id) => {
+  prepareGeometryEdit: async (id, pages) => {
+    await waitForTabIdle(id);
+    const tab = get().tabs.find((t) => t.id === id);
+    if (!tab?.bytes) return null;
+    const hit = (e: { page: number }) => !pages || pages.includes(e.page);
+    if (tab.pendingTextEdits.some(hit) || tab.pendingImageEdits.some(hit) || tab.pendingShapeEdits.some(hit)) {
+      // Only the affected pages' elements — rotating page 5 must not make a
+      // signature on page 1 permanent.
+      await get().commitAllPending(id, pages);
+    }
+    return get().tabs.find((t) => t.id === id)?.bytes ?? null;
+  },
+
+  renderOutput: async (id, opts) => {
+    // V1.0126: the bytes a Save / Export / Print writes. Built FRESH from the
+    // tab's clean page bytes + its editable elements, every time, without
+    // touching the tab. Pre-V1.0126 Save baked the elements INTO tab.bytes
+    // and kept them as overlays too, so every later save drew them again on
+    // top: deleting or moving an element left its old copy burned into the
+    // page, the file grew each save (Adam's form: 406 → 922 content
+    // streams), and merely opening Print Preview marked the tab unsaved.
+    await waitForTabIdle(id);
+    const tab = get().tabs.find((t) => t.id === id);
+    if (!tab?.bytes) return null;
+    // `flat`: page extracts / merges / print — the editable-element metadata
+    // describes the WHOLE document's page numbers, so it must not travel
+    // into a file with different pages.
+    // V1.0126 (was in the old save path): baking re-serialises the PDF, which
+    // breaks a digital signature. Say so and stop claiming it's signed.
+    if (tab.signed && hasPendingEdits(tab)) {
+      useUIStore.getState().showToast(
+        "Saving these edits invalidated the document's digital signature.",
+        "warn",
+      );
+      set((s) => ({ tabs: s.tabs.map((t) => (t.id === id ? { ...t, signed: false } : t)) }));
+    }
+    const out = await buildOutputBytes(tab, { editable: !opts?.flat });
+    return out.bytes;
+  },
+
+  commitAllPending: async (id, pages) => {
+    // V1.0126: FLATTEN — burn the editable elements into the page for good
+    // and drop them as overlays. Only for operations that rewrite the page
+    // itself (crop, digital signature, find-and-replace), where floating
+    // elements would otherwise land in the wrong place or be left out.
+    // Save / Export / Print use `renderOutput` instead and never flatten.
     if (inFlight.has(id)) return;
     inFlight.add(id);
     try {
       const tab = get().tabs.find((t) => t.id === id);
-      if (!tab?.bytes || !hasPendingEdits(tab) || !tab.dirty) return;
-
-      let bytes: Uint8Array = tab.bytes;
+      if (!tab?.bytes || !hasPendingEdits(tab)) return;
       const prevBytes = tab.bytes;
-      const {
-        drawRect,
-        drawCircle,
-        drawLine,
-        drawArrow,
-        drawPath,
-        drawHighlight,
-        whiteoutRegion,
-        redactRegion,
-        drawStickyNote,
-        placeImage,
-        drawText,
-        drawWrappedText,
-        embedWeaveMetadata,
-      } = await loadPdfOps();
-
-      const { PDFDocument } = await import("pdf-lib");
-      const probe = await PDFDocument.load(bytes, { ignoreEncryption: true });
-      const shapeEdits = [...tab.pendingShapeEdits].sort((a, b) => a.page - b.page);
-      const imageEdits = [...tab.pendingImageEdits].sort((a, b) => a.page - b.page);
-      const textEdits = [...tab.pendingTextEdits].sort((a, b) => a.page - b.page);
-
-      // Order matters: shapes first (backgrounds), images second, text on top
-      // so whiteouts for Edit-Text don't cover pending annotations.
-      for (const e of shapeEdits) {
-        switch (e.kind) {
-          case "rect":
-            bytes = await drawRect(bytes, e.page, { x: e.xPt, y: e.yPt, width: e.widthPt, height: e.heightPt }, { color: e.color, thickness: e.thickness });
-            break;
-          case "ellipse":
-            bytes = await drawCircle(bytes, e.page, { x: e.xPt, y: e.yPt, width: e.widthPt, height: e.heightPt }, { color: e.color, thickness: e.thickness });
-            break;
-          case "line":
-            bytes = await drawLine(bytes, e.page, { x: e.fromX, y: e.fromY }, { x: e.toX, y: e.toY }, { color: e.color, thickness: e.thickness });
-            break;
-          case "arrow":
-            bytes = await drawArrow(bytes, e.page, { x: e.fromX, y: e.fromY }, { x: e.toX, y: e.toY }, { color: e.color, thickness: e.thickness });
-            break;
-          case "freehand":
-            bytes = await drawPath(bytes, e.page, e.points, { color: e.color, thickness: e.thickness });
-            break;
-          case "highlight":
-            bytes = await drawHighlight(bytes, e.page, { x: e.xPt, y: e.yPt, width: e.widthPt, height: e.heightPt });
-            break;
-          case "whiteout":
-            bytes = await whiteoutRegion(bytes, e.page, { x: e.xPt, y: e.yPt, width: e.widthPt, height: e.heightPt });
-            break;
-          case "redact":
-            bytes = await redactRegion(bytes, e.page, { x: e.xPt, y: e.yPt, width: e.widthPt, height: e.heightPt });
-            break;
-          case "sticky":
-            bytes = await drawStickyNote(bytes, e.page, { x: e.xPt, y: e.yPt }, e.text);
-            break;
-        }
-      }
-
-      for (const e of imageEdits) {
-        const imageBytes = (e.flipH || e.flipV)
-          ? await (await loadPdfOps()).flipImageBytes(e.bytes, e.mime, { flipH: e.flipH, flipV: e.flipV })
-          : e.bytes;
-        const imageMime: "image/png" | "image/jpeg" = (e.flipH || e.flipV) ? "image/png" : e.mime;
-        bytes = await placeImage(bytes, e.page, imageBytes, imageMime, {
-          x: e.xPt,
-          y: e.yPt,
-          width: e.widthPt,
-          height: e.heightPt,
-        }, {
-          rotation: e.rotation,
-          opacity: e.opacity,
-          border: e.border,
-          dropShadow: e.dropShadow,
-        });
-      }
-
-      const PAGE_MARGIN = 36;
-      const marginsEnabled = useUIStore.getState().marginsEnabled;
-      const persistedTextEdits: import("../lib/pdf-ops").WeavePdfTextEdit[] = [];
-      const retainedTextEdits: PendingTextEdit[] = [];
-      for (const e of textEdits) {
-        if (e.whiteout) {
-          bytes = await whiteoutRegion(bytes, e.page, e.whiteout);
-        }
-        const pageW = probe.getPage(e.page - 1).getWidth();
-        const rightBound = marginsEnabled ? pageW - PAGE_MARGIN : pageW;
-        const maxAllowed = Math.max(36, rightBound - e.xPt);
-        const minWrapWidth = e.whiteout != null
-          ? 36
-          : Math.min(MIN_WRAP_TEXT_WIDTH_PT, maxAllowed);
-        const effectiveWidth = e.whiteout != null
-          ? e.widthPt ?? null
-          : e.widthPt != null
-            ? Math.max(minWrapWidth, Math.min(e.widthPt, maxAllowed))
-            : maxAllowed;
-        let baked: import("../lib/pdf-ops").BakedBBox | null = null;
-        if (effectiveWidth != null) {
-          const r = await drawWrappedText(bytes, e.page, {
-            x: e.xPt,
-            y: e.yPt,
-            widthPt: effectiveWidth,
-            size: e.size,
-            text: e.text,
-            font: e.fontName as Parameters<typeof drawText>[2]["font"],
-            bold: e.bold,
-            italic: e.italic,
-            align: e.align,
-          });
-          bytes = r.bytes;
-          baked = r.bbox;
-        } else {
-          const r = await drawText(bytes, e.page, {
-            x: e.xPt,
-            y: e.yPt,
-            size: e.size,
-            text: e.text,
-            font: e.fontName as Parameters<typeof drawText>[2]["font"],
-            bold: e.bold,
-            italic: e.italic,
-          });
-          bytes = r.bytes;
-          baked = r.bbox;
-        }
-        retainedTextEdits.push(baked ? { ...e, whiteout: baked } : e);
-        if (baked) {
-          persistedTextEdits.push({
-            page: e.page,
-            xPt: e.xPt,
-            yPt: e.yPt,
-            size: e.size,
-            text: e.text,
-            widthPt: e.widthPt,
-            bold: e.bold,
-            italic: e.italic,
-            align: e.align,
-            fontName: e.fontName,
-            whiteout: baked,
-          });
-        }
-      }
-
-      bytes = await embedWeaveMetadata(bytes, {
-        version: 2,
-        textEdits: persistedTextEdits,
-        imageEdits: imageEdits.map((e) => ({
-          page: e.page,
-          xPt: e.xPt,
-          yPt: e.yPt,
-          widthPt: e.widthPt,
-          heightPt: e.heightPt,
-          mime: e.mime,
-          dataBase64: bytesToBase64(e.bytes),
-          // V1.0091: persist the V1.0090 image-format options + V1.0091
-          // border / drop shadow. Pre-V1.0091 these were silently lost
-          // on save+reopen because the schema didn't carry them.
-          rotation: e.rotation,
-          opacity: e.opacity,
-          flipH: e.flipH,
-          flipV: e.flipV,
-          border: e.border,
-          dropShadow: e.dropShadow,
-        })),
-        shapeEdits: shapeEdits.map(shapeForMetadata),
-      });
-
+      const { bytes, baked } = await buildOutputBytes(tab, { editable: false, pages });
       const newPdf = await loadPdf(bytes);
       void tab.pdf?.destroy();
-      // V1.0111: baking pending edits re-serializes the PDF, which breaks a
-      // PKCS#7 signature's ByteRange. Warn (once) and drop the signed flag.
+      // V1.0111: baking re-serializes the PDF, which breaks a PKCS#7
+      // signature's ByteRange. Warn (once) and drop the signed flag.
       if (tab.signed) {
         useUIStore.getState().showToast(
           "Saving these edits invalidated the document's digital signature.",
@@ -1556,14 +1689,20 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
             pdf: newPdf,
             numPages: newPdf.numPages,
             sizeBytes: bytes.byteLength,
-            pendingTextEdits: retainedTextEdits,
-            pendingImageEdits: imageEdits,
-            pendingShapeEdits: shapeEdits,
+            pendingTextEdits: t.pendingTextEdits.filter((e) => !baked.has(e.id)),
+            pendingImageEdits: t.pendingImageEdits.filter((e) => !baked.has(e.id)),
+            pendingShapeEdits: t.pendingShapeEdits.filter((e) => !baked.has(e.id)),
             history: capHistory([...t.history, prevBytes]),
             redoStack: [],
             pendingRedoStack: [],
-            pendingHistory: [],
+            // V1.0126: one undo step brings back the page AND the elements.
+            pendingHistory: [
+              ...t.pendingHistory,
+              { text: t.pendingTextEdits, image: t.pendingImageEdits, shape: t.pendingShapeEdits },
+            ].slice(-30),
             pendingFuture: [],
+            ...stepFields(t, "both"),
+            redoOrder: [],
             dirty: true,
             signed: false,
             version: t.version + 1,
@@ -1582,6 +1721,33 @@ export const useDocumentStore = create<DocumentStore>((set, get) => ({
   // `yPt = 36`. Text width is approximated as `0.55 × fontSize × length`
   // (same heuristic SearchBar's pending-edit measurement uses pre-V1.0049);
   // close enough for Helvetica-family standard fonts at typical sizes.
+  moveLayer: (tabId, editId, op) => {
+    const tab = get().tabs.find((t) => t.id === tabId);
+    if (!tab) return;
+    const arrays = { text: tab.pendingTextEdits, image: tab.pendingImageEdits, shape: tab.pendingShapeEdits };
+    const patches = computeLayerMove(arrays, editId, op, op === "front" ? nextPendingEditOrder() : 0);
+    if (patches.size === 0) return;
+    get().pushUndoStep(tabId);
+    const apply = <T extends { id: string; z?: number }>(list: T[]): T[] =>
+      list.some((e) => patches.has(e.id))
+        ? list.map((e) => (patches.has(e.id) ? { ...e, z: patches.get(e.id) } : e))
+        : list;
+    set((s) => ({
+      tabs: s.tabs.map((t) =>
+        t.id === tabId
+          ? {
+              ...t,
+              pendingTextEdits: apply(t.pendingTextEdits),
+              pendingImageEdits: apply(t.pendingImageEdits),
+              pendingShapeEdits: apply(t.pendingShapeEdits),
+              pendingFuture: [],
+              dirty: true,
+            }
+          : t,
+      ),
+    }));
+  },
+
   alignPendingElement: async (tabId, kind, editId, alignment, bboxOverride) => {
     const tab = get().tabs.find((t) => t.id === tabId);
     if (!tab?.pdf) return;

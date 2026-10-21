@@ -2,6 +2,7 @@ import { useState } from "react";
 import { X, FileText } from "lucide-react";
 import { useDocumentStore } from "../../stores/document";
 import { drawHeaderFooter } from "../../lib/pdf-ops";
+import { useEscapeClose } from "../../hooks/useEscapeClose";
 
 type Props = { open: boolean; onClose: () => void };
 
@@ -53,6 +54,8 @@ export function HeaderFooterModal({ open, onClose }: Props) {
       setBusy(false);
     }
   };
+
+  useEscapeClose(open, onClose);
 
   return (
     <div
